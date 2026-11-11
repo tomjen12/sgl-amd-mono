@@ -19,6 +19,7 @@ scratch.
 """
 
 import argparse
+import os
 
 import torch
 from check_common import (
@@ -42,6 +43,26 @@ from sgl_amd_mono.kimi_k3.spec import NUMERICS
 
 # A wait's deadline here: long enough that only a real stall trips it.
 DEADLINE_S = 30.0
+
+
+def a16_moe_reference(x, w, rank):
+    """The established unfused reference for K2's internally quantized MoE.
+
+    Production loads gate/up-interleaved weights for A8W4, while K2 performs
+    its own MXFP4 activation quantization.  Use the equivalent separated
+    logical weights and force AITER's BF16-activation reference just for this
+    call; changing the server environment would test a different deployment.
+    """
+    saved = {
+        name: os.environ.pop(name, None)
+        for name in ("AITER_SITUV2_A8W4", "AITER_SITUV2_A4W4")
+    }
+    try:
+        return moe_reference(x, w, rank)
+    finally:
+        for name, value in saved.items():
+            if value is not None:
+                os.environ[name] = value
 
 
 def seam_reference(core, w_o, prefix_in, blocks, nvb, w, *, reset):
@@ -158,6 +179,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--replays", type=int, default=50)
     args = ap.parse_args()
+    # Match SGLang's Mxfp4MoEMethod layout precedence. Kimi-K3.1 production
+    # sets A8W4 and therefore uses gate/up-interleaved weights.
+    a8w4 = os.environ.get("AITER_SITUV2_A8W4", "0") == "1"
+    a4w4 = os.environ.get("AITER_SITUV2_A4W4", "0") == "1"
+    guint = a8w4 or not a4w4
 
     rank, dev, cpu = setup()
     import torch.distributed as dist
@@ -182,15 +208,25 @@ def main():
     epoch[guard.GUARD_DEADLINE] = lo - (1 << 32) if lo >= 1 << 31 else lo
     epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
     scratch = torch.zeros(k2.scratch_alloc_bytes(), dtype=torch.uint8, device=dev)
-    w = moe_weights(rank, dev, guint=False)
+    w = moe_weights(rank, dev, guint=guint)
     w.update(layer_weights(rank, dev))
+    # Same logical expert weights in the separated layout accepted by AITER's
+    # A16W4 reference.  The identical generator seed makes this a layout-only
+    # conversion, not another random fixture.
+    w_ref = moe_weights(rank, dev, guint=False)
+    w_ref.update(layer_weights(rank, dev))
+    if rank == 0:
+        print(
+            f"K2 expert weight layout: {'gate/up interleaved' if guint else 'separated'}",
+            flush=True,
+        )
 
     fails, seen, first = [], {}, {}
     for tag, reset in (("accumulate", False), ("reset", True)):
         epoch[0].add_(1)
         out, prefix, key = run(
             k2, w, scratch, reset=reset, peers=peers, epoch=epoch,
-            rank=rank, layer=1, guint=False,
+            rank=rank, layer=1, guint=guint,
         )  # fmt: skip
         torch.cuda.synchronize()
         # the seam output the kernel wrote, out of its own scratch
@@ -200,7 +236,7 @@ def main():
         ref_prefix, ref_x = seam_reference(
             w["core"], w["w_o"], w["prefix"], w["blocks"], NVB, w, reset=reset
         )
-        ref_moe = moe_reference(xrow, w, rank)
+        ref_moe = a16_moe_reference(xrow, w_ref, rank)
         gathered = [torch.empty_like(out) for _ in range(TP)]
         dist.all_gather(gathered, out.contiguous())
         checks = {
@@ -236,13 +272,13 @@ def main():
         epoch[0].add_(1)
         plain, plain_prefix, _ = run(
             k2, w, scratch, reset=reset, peers=peers, epoch=epoch,
-            rank=rank, layer=1, guint=False,
+            rank=rank, layer=1, guint=guint,
         )  # fmt: skip
         want, plain_prefix = (plain + plain_prefix).clone(), plain_prefix.clone()
         epoch[0].add_(1)
         folded, folded_prefix, _ = run(
             k2, w, scratch, reset=reset, peers=peers, epoch=epoch,
-            rank=rank, layer=1, guint=False, fold=True,
+            rank=rank, layer=1, guint=guint, fold=True,
         )  # fmt: skip
         torch.cuda.synchronize()
         ok = {
@@ -260,7 +296,7 @@ def main():
     # The OPT_* bits, each alone and all together, against opt=0 on the served
     # form: bit for bit. A sentinel word is pushed again only two launches
     # later, so consecutive launches take layers of alternating parity.
-    served = dict(fold=True, guint=False)
+    served = dict(fold=True, guint=guint)
     bits = [
         k2.OPT_SENT, k2.OPT_PRELOAD, k2.OPT_TAG_X, k2.OPT_SENT_LATR,
         k2.OPT_SENT_FINAL, k2.OPT_SDOWN_FIRST, k2.OPT_RLOG_PARTS, k2.OPT_BATCH,
@@ -323,7 +359,7 @@ def main():
     epoch[0].add_(1)
     eager_out, eager_prefix, _ = run(
         k2, w, scratch, reset=False, peers=peers, epoch=epoch,
-        rank=rank, layer=1, guint=False,
+        rank=rank, layer=1, guint=guint,
     )  # fmt: skip
     torch.cuda.synchronize()
     eager_out, eager_prefix = eager_out.clone(), eager_prefix.clone()
@@ -332,7 +368,7 @@ def main():
     with torch.cuda.graph(graph):
         graph_out, graph_prefix, _ = run(
             k2, w, scratch, reset=False, peers=peers, epoch=epoch,
-            rank=rank, layer=1, guint=False,
+            rank=rank, layer=1, guint=guint,
         )  # fmt: skip
     for i in range(args.replays):
         epoch[0].add_(1)
