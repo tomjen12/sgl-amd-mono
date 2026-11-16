@@ -5,6 +5,8 @@ import os
 
 HIDDEN = 8192
 HEAD_DIM = 64
+TP = 8
+EP = 8
 LOCAL_Q_HEADS = 16  # 128 / TP8
 LOCAL_KV_HEADS = 2  # 16 / TP8
 Q_K = LOCAL_Q_HEADS * HEAD_DIM  # 1024: the q, o_gate and attention-output widths

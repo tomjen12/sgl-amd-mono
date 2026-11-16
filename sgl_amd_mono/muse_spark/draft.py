@@ -25,6 +25,7 @@ each layer's cosines (attn_out, the residual, the MLP output).
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 
@@ -46,6 +47,9 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     )
 
 from sgl_amd_mono.common.plan import BLOCKS
+from sgl_amd_mono.muse_spark.gfx1250.config import (
+    RESIDENT_BLOCKS as GFX1250_RESIDENT_BLOCKS,
+)
 from sgl_amd_mono.muse_spark import DRAFT_TOKENS, TP
 from sgl_amd_mono.muse_spark import spec as target
 from sgl_amd_mono.muse_spark.gfx950.config import WIDTHS
@@ -131,6 +135,25 @@ SKIP_LAYERS = os.environ.get("SGLANG_AMD_MONO_DRAFT_SKIP", "0") == "1"
 SHARD_FC = os.environ.get("SGLANG_AMD_MONO_DRAFT_FC_SHARD", "1") == "1"
 
 
+def _gfx1250() -> bool:
+    return bool(
+        torch.cuda.is_available()
+        and "gfx1250"
+        in torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName
+    )
+
+
+def _use_kernels() -> bool:
+    """Draft kernels are not ported to gfx1250 yet; keep its attached stage 0."""
+    return USE_KERNELS and not _gfx1250()
+
+
+def _draft_module(name: str):
+    """Load the draft implementation for the active GPU architecture."""
+    arch = "gfx1250" if _gfx1250() else "gfx950"
+    return importlib.import_module(f"sgl_amd_mono.muse_spark.{arch}.{name}")
+
+
 def _mlp_views(layer) -> dict:
     """A draft layer's MLP-half weights as the D-MLP launch reads them, in place."""
     conv = layer.mlp_conv
@@ -159,8 +182,8 @@ def _attn_views(layer) -> dict:
 
 
 def _attn_view_reasons(i: int, views: dict) -> list[str]:
-    from sgl_amd_mono.muse_spark.gfx950 import draft_attn_half as DH
-    from sgl_amd_mono.muse_spark.gfx950 import draft_mlp as D
+    DH = _draft_module("draft_attn_half")
+    D = _draft_module("draft_mlp")
 
     shapes = {
         "w_in": (D.H,), "w_kpa": (D.COEF_ROWS, D.H), "base_a": (2, D.TAPS, D.H), "w_qkv": (DH.QKV_ROWS, D.H),
@@ -189,7 +212,7 @@ def _attn_view_reasons(i: int, views: dict) -> list[str]:
 
 
 def _mlp_view_reasons(i: int, views: dict) -> list[str]:
-    from sgl_amd_mono.muse_spark.gfx950 import draft_mlp as D
+    D = _draft_module("draft_mlp")
 
     shapes = {
         "w_post": (D.H,), "w_kp": (D.COEF_ROWS, D.H), "base": (2, D.TAPS, D.H), "w_gu": (D.GU_ROWS, D.H), "w_down": (D.H, D.I),
@@ -213,18 +236,21 @@ class DraftRunner:
     def __init__(self, layers, rank: int, npes: int, cpu_group, device):
         from sgl_amd_mono.common import guard
         from sgl_amd_mono.common.peer import PeerBuffer
-        from sgl_amd_mono.muse_spark.gfx950 import draft_mlp as D
-        from sgl_amd_mono.muse_spark.gfx950.config import MAX_TOKENS
-        from sgl_amd_mono.muse_spark.gfx950.layout import scratch_bytes
         from sgl_amd_mono.muse_spark.gfx950.runner import _ensure_writable_flydsl_cache
 
+        D = _draft_module("draft_mlp")
+        C = _draft_module("draft_config") if _gfx1250() else _draft_module("config")
+        L = _draft_module("layout")
+        MAX_TOKENS = C.MAX_TOKENS
         _ensure_writable_flydsl_cache()
         self.views = [_mlp_views(layer) for layer in layers]
         self.rank, self.npes, self.device = rank, npes, torch.device(device)
+        self.gfx1250 = _gfx1250()
+        self.resident_blocks = C.RESIDENT_BLOCKS if self.gfx1250 else BLOCKS
         dev = self.device
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=dev)
         self.scratch = torch.zeros(
-            scratch_bytes(D.dm_scratch_layout()), dtype=torch.uint8, device=dev
+            L.scratch_bytes(D.dm_scratch_layout()), dtype=torch.uint8, device=dev
         )
         # the peer handshake is collective: every rank gets here (attach agreed first)
         self.peers = PeerBuffer(
@@ -236,16 +262,26 @@ class DraftRunner:
         self._launch: dict = {}
         self.layers = list(layers)
         if STAGE >= 2:
-            from sgl_amd_mono.muse_spark.gfx950 import draft_attn as DA
-            from sgl_amd_mono.muse_spark.gfx950 import draft_attn_half as DH
+            DA = _draft_module("draft_attn")
+            DH = _draft_module("draft_attn_half")
 
             self.aviews = [_attn_views(layer) for layer in layers]
             self.scratch_pre = torch.zeros(
-                scratch_bytes(DH.dp_scratch_layout()), dtype=torch.uint8, device=dev
+                L.scratch_bytes(DH.dp_scratch_layout()), dtype=torch.uint8, device=dev
             )
-            self.scratch_attn = torch.zeros(scratch_bytes(DA.dattn_scratch_layout(MAX_TOKENS, DRAFT_TOKENS)), dtype=torch.uint8, device=dev)  # fmt: skip
+            self.scratch_attn = (
+                None
+                if self.gfx1250
+                else torch.zeros(
+                    L.scratch_bytes(
+                        DA.dattn_scratch_layout(MAX_TOKENS, DRAFT_TOKENS)
+                    ),
+                    dtype=torch.uint8,
+                    device=dev,
+                )
+            )
             self.scratch_post = torch.zeros(
-                scratch_bytes(DH.do_scratch_layout()), dtype=torch.uint8, device=dev
+                L.scratch_bytes(DH.do_scratch_layout()), dtype=torch.uint8, device=dev
             )
             self.peers_post = PeerBuffer(
                 DH.do_sym_bytes(npes) + guard.FLAG_BYTES, cpu_group, rank, npes, dev
@@ -277,19 +313,27 @@ class DraftRunner:
 
     def kernel(self, rows: int):
         if rows not in self._launch:
-            from sgl_amd_mono.muse_spark.gfx950 import draft_mlp as D
+            D = _draft_module("draft_mlp")
 
             self._launch[rows] = D.build_dmlp(D.DMLPBuild(tokens=rows, npes=self.npes))
         return self._launch[rows]
 
     def attn_kernels(self, rows: int):
-        from sgl_amd_mono.muse_spark.gfx950 import draft_attn as DA
-        from sgl_amd_mono.muse_spark.gfx950 import draft_attn_half as DH
+        DA = _draft_module("draft_attn")
+        DH = _draft_module("draft_attn_half")
 
         if rows not in self._pre:
             self._pre[rows] = DH.build_dpre(DH.DPreBuild(tokens=rows))
             self._attn[rows] = DA.build_dattn(
-                DA.DAttnBuild(tokens=rows, q_len=DRAFT_TOKENS)
+                DA.DAttnBuild(
+                    tokens=rows,
+                    q_len=DRAFT_TOKENS,
+                    **(
+                        {"resident_blocks": self.resident_blocks}
+                        if self.gfx1250
+                        else {}
+                    ),
+                )
             )
             self._post[rows] = DH.build_dpost(
                 DH.DPostBuild(tokens=rows, npes=self.npes)
@@ -312,8 +356,8 @@ class DraftRunner:
         return get_attn_backend()
 
     def _check_cache(self, backend) -> None:
-        """D-pre / D-attn read the draft's fp8 [slots, 1, 128] caches and its int32 page table once."""
-        from sgl_amd_mono.muse_spark.gfx950 import draft_attn as DA
+        """Validate the rank-local fp8 caches and int32 page table once."""
+        DA = _draft_module("draft_attn")
 
         pool = backend.token_to_kv_pool
         for i, layer in enumerate(self.layers):
@@ -389,11 +433,23 @@ class DraftRunner:
         # the draft batch is a TARGET_VERIFY batch: seq_lens is the (compact) prefix, the
         # block's DRAFT_TOKENS keys follow it; the compact cache holds the window, so no
         # window mask (the window is the cache)
-        dattn(
-            _ptr(q), _ptr(o), _ptr(k_cache), _ptr(v_cache), _ptr(table), table.shape[1], table.numel() * 4, _ptr(rpi),
-            int(rpi.dtype == torch.int64), _ptr(lens), int(lens.dtype == torch.int64), DRAFT_TOKENS, 0, 0,
-            _f32_bits(float(attn.scaling)), _ptr(self.scratch_attn), _ptr(self.epoch), i, stream=stream,
-        )  # fmt: skip
+        if self.gfx1250:
+            dattn(
+                _ptr(q), _ptr(o), _ptr(k_cache), _ptr(v_cache), _ptr(table),
+                table.shape[1], table.numel() * 4, _ptr(rpi),
+                int(rpi.dtype == torch.int64), _ptr(lens),
+                int(lens.dtype == torch.int64), DRAFT_CONFIG["sliding_window"],
+                _f32_bits(float(attn.scaling)), _ptr(self.epoch), stream=stream,
+            )  # fmt: skip
+        else:
+            dattn(
+                _ptr(q), _ptr(o), _ptr(k_cache), _ptr(v_cache), _ptr(table),
+                table.shape[1], table.numel() * 4, _ptr(rpi),
+                int(rpi.dtype == torch.int64), _ptr(lens),
+                int(lens.dtype == torch.int64), DRAFT_TOKENS, 0, 0,
+                _f32_bits(float(attn.scaling)), _ptr(self.scratch_attn),
+                _ptr(self.epoch), i, stream=stream,
+            )  # fmt: skip
         mark("D-attn")
         post(
             _ptr(o), _ptr(v["w_o"]), _ptr(coef), _ptr(v["base_a"]), _ptr(attn_out), _ptr(self.scratch_post),
@@ -449,15 +505,18 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     from sglang.srt.runtime_context import get_parallel
 
     reasons = []
-    if get_parallel().tp_size != TP:
-        reasons.append(f"draft TP {get_parallel().tp_size}: the kernels take TP {TP}")
-    if USE_KERNELS:
+    target_tp = 4 if _gfx1250() else TP
+    if get_parallel().tp_size != target_tp:
+        reasons.append(
+            f"draft TP {get_parallel().tp_size}: this target takes TP {target_tp}"
+        )
+    if _use_kernels():
         for i, layer in enumerate(model.layers):
             if layer.mlp_conv is not None and layer.attention_conv is not None:
                 reasons += _mlp_view_reasons(i, _mlp_views(layer))
                 if STAGE >= 2:
                     reasons += _attn_view_reasons(i, _attn_views(layer))
-    if STAGE >= 2:
+    if _use_kernels() and STAGE >= 2:
         from sglang.srt.runtime_context import get_spec
 
         if get_spec().speculative_draft_window_size is None:
@@ -476,7 +535,7 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         if layer.attention_conv is None or layer.mlp_conv is None:
             reasons.append(f"draft layer {i}: no grouped convolutions")
         a = layer.self_attn
-        if a.num_heads * TP != DRAFT_CONFIG["num_attention_heads"] or a.num_kv_heads * TP != DRAFT_CONFIG["num_key_value_heads"]:  # fmt: skip
+        if a.num_heads * target_tp != DRAFT_CONFIG["num_attention_heads"] or a.num_kv_heads * target_tp != DRAFT_CONFIG["num_key_value_heads"]:  # fmt: skip
             reasons.append(
                 f"draft layer {i}: heads {a.num_heads} / {a.num_kv_heads} a rank"
             )
@@ -649,7 +708,7 @@ def _shard_fc(model) -> bool:
 
 def _build(model, hf_config, ctx) -> _Draft:
     original = type(model).forward.__get__(model, type(model))
-    if not USE_KERNELS:
+    if not _use_kernels():
         logger.info(
             "monokernel: muse_spark DFlash2 draft attached at stage 0 (the model's own forward)"
         )
@@ -678,7 +737,12 @@ def _build(model, hf_config, ctx) -> _Draft:
 SPEC = MonoSpec(
     name="muse_spark_dflash2_draft_hip",
     devices={
-        "gfx950": DeviceLimits(widths=WIDTHS, tp_sizes=(TP,), resident_blocks=BLOCKS)
+        "gfx950": DeviceLimits(widths=WIDTHS, tp_sizes=(TP,), resident_blocks=BLOCKS),
+        "gfx1250": DeviceLimits(
+            widths=(8,),
+            tp_sizes=(4,),
+            resident_blocks=GFX1250_RESIDENT_BLOCKS,
+        ),
     },
     features=frozenset({Feature.SPECULATIVE_DECODING}),
     # the launcher checks the target's requirements; the draft's attention backend is

@@ -32,7 +32,7 @@ QUANT_BF16 = os.environ.get("SGLANG_AMD_MONO_MUSE_QUANT_BF16", "0") == "1"
 # 0.958 / 0.967 over two seeds; the same build with them off 0.950): long reasoning cannot afford them
 FP8_DENSE = os.environ.get("SGLANG_AMD_MONO_MUSE_FP8_DENSE", "0") == "1"
 
-from sgl_amd_mono.muse_spark import TP
+from sgl_amd_mono.muse_spark.gfx950 import config as DEFAULT_CONFIG
 from sgl_amd_mono.muse_spark.gfx950.config import (
     EXPERTS,
     GATE_TEMPERATURE,
@@ -184,11 +184,12 @@ def _gate_reasons(module, what: str) -> list[str]:
     return []
 
 
-def _attention_reasons(attn, i: int) -> list[str]:
+def _attention_reasons(attn, i: int, config) -> list[str]:
     why = []
     shape = (attn.num_heads, attn.num_kv_heads, attn.head_dim)
-    if shape != (LOCAL_Q_HEADS, LOCAL_KV_HEADS, HEAD_DIM):
-        why.append(f"layer {i}: heads / dims {shape} a rank, built for {(LOCAL_Q_HEADS, LOCAL_KV_HEADS, HEAD_DIM)}")  # fmt: skip
+    want_heads = (config.LOCAL_Q_HEADS, config.LOCAL_KV_HEADS, config.HEAD_DIM)
+    if shape != want_heads:
+        why.append(f"layer {i}: heads / dims {shape} a rank, built for {want_heads}")  # fmt: skip
     if not (attn.use_qk_norm and attn.use_o_gate and attn.use_o_norm):
         why.append(
             f"layer {i}: the kernels apply the q / k norms, the o norm and the o gate"
@@ -204,10 +205,16 @@ def _attention_reasons(attn, i: int) -> list[str]:
             f"layer {i}: q / k / o norm eps {attn.norm_eps}, built for {RMS_EPS}"
         )
     why += _tensor_reasons(
-        attn.qkv_proj.weight, torch.bfloat16, (QKVG_ROWS, HIDDEN), f"layer {i} qkv_proj"
+        attn.qkv_proj.weight,
+        torch.bfloat16,
+        (config.QKVG_ROWS, HIDDEN),
+        f"layer {i} qkv_proj",
     )
     why += _tensor_reasons(
-        attn.o_proj.weight, torch.bfloat16, (HIDDEN, Q_K), f"layer {i} o_proj"
+        attn.o_proj.weight,
+        torch.bfloat16,
+        (HIDDEN, config.Q_K),
+        f"layer {i} o_proj",
     )
     rope = attn.rotary_emb
     if rope is not None:
@@ -238,13 +245,13 @@ def _attention_reasons(attn, i: int) -> list[str]:
     return why
 
 
-def _experts_reasons(experts, i: int) -> list[str]:
+def _experts_reasons(experts, i: int, config) -> list[str]:
     kind = type(experts).__name__
     if kind not in EXPERT_TYPES:
         return [
             f"layer {i}: experts {kind}, the kernels read Quark MXFP4 or bf16 experts"
         ]
-    E, what = LOCAL_EXPERTS, f"layer {i} experts"
+    E, what = config.LOCAL_EXPERTS, f"layer {i} experts"
     if kind == "MuseSpark1xNativeExperts":
         return _tensor_reasons(
             experts.w13_weight,
@@ -265,11 +272,12 @@ def _experts_reasons(experts, i: int) -> list[str]:
     return why
 
 
-def _moe_reasons(moe, i: int) -> list[str]:
+def _moe_reasons(moe, i: int, config) -> list[str]:
     why = []
-    if (moe.tp_size, moe.ep_size) != (TP, TP):
+    if (moe.tp_size, moe.ep_size) != (config.TP, config.EP):
         why.append(
-            f"layer {i}: MoE TP {moe.tp_size} / EP {moe.ep_size}, the kernels shard experts over EP {TP}"
+            f"layer {i}: MoE TP {moe.tp_size} / EP {moe.ep_size}, "
+            f"the kernels are built for TP {config.TP} / EP {config.EP}"
         )
     shape = (
         moe.num_local_experts,
@@ -277,8 +285,9 @@ def _moe_reasons(moe, i: int) -> list[str]:
         moe.expert_hidden_size,
         moe.intermediate_size,
     )
-    if shape != (LOCAL_EXPERTS, TOP_K, MOE_HIDDEN, INTER):
-        why.append(f"layer {i}: experts / top-k / pooled / inter {shape}, built for {(LOCAL_EXPERTS, TOP_K, MOE_HIDDEN, INTER)}")  # fmt: skip
+    want_shape = (config.LOCAL_EXPERTS, TOP_K, MOE_HIDDEN, INTER)
+    if shape != want_shape:
+        why.append(f"layer {i}: experts / top-k / pooled / inter {shape}, built for {want_shape}")  # fmt: skip
     for got, want, what in ((moe.route_scale, ROUTE_SCALE, "route scale"), (moe.route_eps, ROUTE_EPS, "route eps"),
                             (moe.router_multiplier, ROUTER_MULT, "router multiplier")):  # fmt: skip
         if not _close(got, want):
@@ -312,14 +321,14 @@ def _moe_reasons(moe, i: int) -> list[str]:
         eps=POST_EPS,
         weighted=True,
     )
-    return why + _experts_reasons(moe.experts, i)
+    return why + _experts_reasons(moe.experts, i, config)
 
 
-def layer_reasons(layer, i: int) -> list[str]:
+def layer_reasons(layer, i: int, config=DEFAULT_CONFIG) -> list[str]:
     """Every reason the kernels cannot read decoder layer ``i`` (empty: they can)."""
     if not layer.is_moe_layer:
         return [f"layer {i}: a dense MLP layer; the kernels run routed experts"]
-    why = _attention_reasons(layer.self_attn, i)
+    why = _attention_reasons(layer.self_attn, i, config)
     why += _norm_reasons(
         layer.post_attn_norm,
         HIDDEN,
@@ -336,7 +345,7 @@ def layer_reasons(layer, i: int) -> list[str]:
         layer.post_feedforward_residual_gate,
         f"layer {i} post_feedforward_residual_gate",
     )
-    return why + _moe_reasons(layer.mlp, i)
+    return why + _moe_reasons(layer.mlp, i, config)
 
 
 def expert_kind(layer) -> str:

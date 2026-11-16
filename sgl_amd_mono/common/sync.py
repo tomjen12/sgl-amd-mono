@@ -35,7 +35,7 @@ def _first_load(load_all, first):
 
 
 @flyc.jit
-def _spin(load_all, pending, guarded=True, first=None):
+def _spin(load_all, pending, guarded=True, first=None, active_guard=None):
     """Re-issue ``load_all`` until ``pending`` clears (``first``: the first load's
     words, issued already).
 
@@ -44,7 +44,7 @@ def _spin(load_all, pending, guarded=True, first=None):
     peers' flags, a failure seen elsewhere sets the ``peer`` word, and then the
     launch stops (``guard.stop_launch``): it never runs on with words that did not
     come. ``guarded=False``: a wait the guard need not bound"""
-    g = guard.current()
+    g = guard.current() if active_guard is None else active_guard
     if const_expr(g is None or not guarded):
         v = _first_load(load_all, first)
         while pending(v):
@@ -52,6 +52,7 @@ def _spin(load_all, pending, guarded=True, first=None):
             v = load_all()
         return v
     site = g.next_site()
+    clock_now = g.clock_fn
     # bound before the traced loops: a local whose method a loop calls becomes loop state
     deadline_of, stopped, fail, note_peer = g.deadline, g.stopped, g.fail, g.note_peer
     v = _first_load(load_all, first)
@@ -66,7 +67,7 @@ def _spin(load_all, pending, guarded=True, first=None):
             v = load_all()
             polls = uniform(polls + 1)
             if (polls & (CHECK_POLLS - 1)) == 0:
-                now = guard.clock()
+                now = clock_now()
                 t0 = (polls == CHECK_POLLS).select(now, t0)
                 if fx.Int32((now - t0) >> guard.TICK_SHIFT) > scalar_deadline():
                     fail(site)
@@ -79,12 +80,12 @@ def _spin(load_all, pending, guarded=True, first=None):
     if const_expr(g.fault_site == site):
         # SGLANG_AMD_MONO_FAULT_INJECT: once armed, this rank stalls here until the deadline
         armed = g.armed()
-        t0 = guard.clock()
+        t0 = clock_now()
         deadline = deadline_of()
         while armed & (stop == 0):
             rocdl.s_sleep(1)
             v = load_all()
-            late = (guard.clock() - t0) > deadline
+            late = (clock_now() - t0) > deadline
             stop = late.select(fx.Int32(1), stopped().select(fx.Int32(2), fx.Int32(0)))
     # a wait the data reaches within CHECK_POLLS polls checks nothing; the deadline
     # runs from the first check
@@ -95,7 +96,7 @@ def _spin(load_all, pending, guarded=True, first=None):
         v = load_all()
         polls = polls + 1
         if (polls & (CHECK_POLLS - 1)) == 0:
-            now = guard.clock()
+            now = clock_now()
             t0 = (polls == CHECK_POLLS).select(now, t0)
             late = (now - t0) > deadline_of()
             stop = late.select(fx.Int32(1), stopped().select(fx.Int32(2), fx.Int32(0)))
@@ -141,8 +142,9 @@ _SCOPE_CM = {Space.SCRATCH: CM_DEV, Space.PEER: CM_SYS}
 class Mailbox:
     """Tagged-pair hand-off between CTAs or GPUs: each value is stored next to the launch tag."""
 
-    def __init__(self, tag):
+    def __init__(self, tag, active_guard=None):
         self.tag = tag
+        self.active_guard = active_guard
 
     def put(self, a, i, v):
         bits = v.bitcast(fx.Int32) if isinstance(v, fx.Float32) else fx.Int32(v)
@@ -184,7 +186,9 @@ class Mailbox:
         if const_expr(len(specs) > batch):
             return self.poll(specs[:batch], batch) + self.poll(specs[batch:], batch)
         load_all, pending, unpack = self._batch(specs)
-        return unpack(_spin(load_all, pending))
+        return unpack(
+            _spin(load_all, pending, active_guard=self.active_guard)
+        )
 
     def poll_issue(self, specs):
         """Issue the first loads of ``poll(specs)`` (at most ``POLL_MAX``) now, ahead of
@@ -196,7 +200,14 @@ class Mailbox:
     def poll_wait(self, specs, first):
         """``poll(specs)`` from the words ``poll_issue(specs)`` returned."""
         load_all, pending, unpack = self._batch(specs)
-        return unpack(_spin(load_all, pending, first=first))
+        return unpack(
+            _spin(
+                load_all,
+                pending,
+                first=first,
+                active_guard=self.active_guard,
+            )
+        )
 
     def _batch(self, specs):
         spaces = {a.space for a, _, _ in specs}

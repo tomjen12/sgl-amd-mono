@@ -22,6 +22,7 @@ import sgl_amd_mono
 from sgl_amd_mono.muse_spark import HF_CONFIG
 from sgl_amd_mono.muse_spark import spec as muse
 from sgl_amd_mono.muse_spark import weights as muse_weights
+from sgl_amd_mono.muse_spark.gfx1250 import config as GFX1250
 from sgl_amd_mono.muse_spark.gfx950.config import (
     EXPERTS,
     GATE_TEMPERATURE,
@@ -82,6 +83,12 @@ def test_the_plugin_registers_the_architecture():
         isa="gfx950",
     )
     assert found is muse.SPEC, why
+    found, why = registry.find_spec(
+        backend=sgl_amd_mono.BACKEND,
+        architectures=["MuseSparkForConditionalGeneration"],
+        isa="gfx1250",
+    )
+    assert found is muse.SPEC, why
     # the DFlash2 draft's spec, by its architecture
     from sgl_amd_mono.muse_spark import draft
 
@@ -89,9 +96,16 @@ def test_the_plugin_registers_the_architecture():
         backend=sgl_amd_mono.BACKEND, architectures=["DFlash2DraftModel"], isa="gfx950"
     )
     assert found is draft.SPEC, why
+    found, why = registry.find_spec(
+        backend=sgl_amd_mono.BACKEND,
+        architectures=["DFlash2DraftModel"],
+        isa="gfx1250",
+    )
+    assert found is draft.SPEC, why
     assert draft.SPEC.tokens_per_request is not None and draft.SPEC.widths(
         "gfx950"
     ) == muse.SPEC.widths("gfx950")
+    assert draft.SPEC.widths("gfx1250") == muse.SPEC.widths("gfx1250") == (8,)
 
 
 def test_the_draft_config_is_accepted():
@@ -126,6 +140,20 @@ def test_the_recipe_is_accepted():
     assert _config_reasons(hf_config=_replace(OMNI, text_config=rounded)) == []
 
 
+def test_attention_backend_is_narrowed_by_architecture():
+    assert muse.SPEC.requires.attention_backends == {"aiter", "triton"}
+    with mock.patch.object(muse, "_device_arch", return_value="gfx1250"):
+        assert _config_reasons(cfg=_replace(CFG, attention_backend="triton")) == []
+        assert "require 'triton'" in _config_reasons(
+            cfg=_replace(CFG, attention_backend="aiter")
+        )[0]
+    with mock.patch.object(muse, "_device_arch", return_value="gfx950"):
+        assert _config_reasons(cfg=_replace(CFG, attention_backend="aiter")) == []
+        assert "require 'aiter'" in _config_reasons(
+            cfg=_replace(CFG, attention_backend="triton")
+        )[0]
+
+
 @pytest.mark.parametrize(
     "cfg, text",
     [
@@ -149,6 +177,7 @@ def test_the_recipe_routes_verify_batches_of_one_to_eight():
     from sgl_amd_mono.muse_spark.gfx950.config import WIDTHS
 
     assert muse.SPEC.widths("gfx950") == WIDTHS and 8 in WIDTHS
+    assert muse.SPEC.widths("gfx1250") == (8,)
     # 8 verify rows a request: with every width served, the 8-, 16-, 32- and 64-row
     # launches route batch sizes 1, 2, 4 and 8, captured besides the configured sizes
     assert covered_capture_sizes(
@@ -213,8 +242,8 @@ def _gate():
     return _Gate()
 
 
-def _mxfp4_experts():
-    E = LOCAL_EXPERTS
+def _mxfp4_experts(config=None):
+    E = LOCAL_EXPERTS if config is None else config.LOCAL_EXPERTS
     return MuseSpark1xMxfp4Experts(
         w13_weight=_meta(E, 2 * INTER, MOE_HIDDEN // 2, dtype=torch.uint8),
         w2_weight=_meta(E, MOE_HIDDEN, INTER // 2, dtype=torch.uint8),
@@ -223,19 +252,26 @@ def _mxfp4_experts():
     )
 
 
-def _bf16_experts():
-    E = LOCAL_EXPERTS
+def _bf16_experts(config=None):
+    E = LOCAL_EXPERTS if config is None else config.LOCAL_EXPERTS
     return MuseSpark1xNativeExperts(
         w13_weight=_meta(E, 2 * INTER, MOE_HIDDEN),
         w2_weight=_meta(E, MOE_HIDDEN, INTER),
     )
 
 
-def _layer(sliding=True, experts=None, **changes):
+def _layer(sliding=True, experts=None, config=None, **changes):
     """A Muse Spark decoder layer at TP8 / EP8, its tensors on the meta device."""
+    local_q_heads = LOCAL_Q_HEADS if config is None else config.LOCAL_Q_HEADS
+    local_kv_heads = LOCAL_KV_HEADS if config is None else config.LOCAL_KV_HEADS
+    local_experts = LOCAL_EXPERTS if config is None else config.LOCAL_EXPERTS
+    q_k = Q_K if config is None else config.Q_K
+    qkvg_rows = QKVG_ROWS if config is None else config.QKVG_ROWS
+    tp = 8 if config is None else config.TP
+    ep = 8 if config is None else config.EP
     attn = SimpleNamespace(
-        num_heads=LOCAL_Q_HEADS,
-        num_kv_heads=LOCAL_KV_HEADS,
+        num_heads=local_q_heads,
+        num_kv_heads=local_kv_heads,
         head_dim=HEAD_DIM,
         use_qk_norm=True,
         use_o_gate=True,
@@ -243,8 +279,8 @@ def _layer(sliding=True, experts=None, **changes):
         scaling=SOFTMAX_SCALE,
         scale_query_by=QK_SCALE,
         norm_eps=RMS_EPS,
-        qkv_proj=SimpleNamespace(weight=_meta(QKVG_ROWS, HIDDEN)),
-        o_proj=SimpleNamespace(weight=_meta(HIDDEN, Q_K)),
+        qkv_proj=SimpleNamespace(weight=_meta(qkvg_rows, HIDDEN)),
+        o_proj=SimpleNamespace(weight=_meta(HIDDEN, q_k)),
         rotary_emb=SimpleNamespace(
             cos_sin_cache=_meta(1 << 20, HEAD_DIM, dtype=torch.float32),
             is_neox_style=False,
@@ -258,9 +294,9 @@ def _layer(sliding=True, experts=None, **changes):
         pre_attn_norm=MuseSpark1xRMSNorm(HIDDEN, RMS_EPS),
     )
     mlp = SimpleNamespace(
-        tp_size=8,
-        ep_size=8,
-        num_local_experts=LOCAL_EXPERTS,
+        tp_size=tp,
+        ep_size=ep,
+        num_local_experts=local_experts,
         top_k=TOP_K,
         expert_hidden_size=MOE_HIDDEN,
         intermediate_size=INTER,
@@ -273,7 +309,7 @@ def _layer(sliding=True, experts=None, **changes):
         post_expert_proj=SimpleNamespace(weight=_meta(HIDDEN, MOE_HIDDEN)),
         pre_expert_norm=MuseSpark1xRMSNorm(MOE_HIDDEN, RMS_EPS),
         post_expert_norm=MuseSpark1xRMSNormWithInputScale(MOE_HIDDEN, POST_EPS),
-        experts=experts or _mxfp4_experts(),
+        experts=experts or _mxfp4_experts(config),
     )
     layer = SimpleNamespace(
         is_moe_layer=True,
@@ -300,6 +336,10 @@ def test_the_checks_accept_every_layer_kind():
     bf16 = _layer(experts=_bf16_experts())
     assert layer_reasons(bf16, 0) == []
     assert (expert_kind(_layer()), expert_kind(bf16)) == ("mxfp4", "bf16")
+
+
+def test_the_checks_accept_the_gfx1250_tp4_layer_shape():
+    assert layer_reasons(_layer(config=GFX1250), 3, config=GFX1250) == []
 
 
 @pytest.mark.parametrize(

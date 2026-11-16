@@ -118,6 +118,9 @@ class Guard:
         fault_site=None,
         fault_after=0,
         stop=True,
+        clock_fn=None,
+        deadline_scale=1,
+        wait_stores_fn=None,
     ):
         assert (own is None) == (peers is None), (
             "own and peers come together: a rank reads the flags its peers write"
@@ -132,7 +135,15 @@ class Guard:
         self.fault_site = fault_site
         self.fault_after = fault_after
         self.stop = stop
+        self.clock_fn = clock if clock_fn is None else clock_fn
+        self.deadline_scale = int(deadline_scale)
+        self.wait_stores_fn = wait_stores_fn
+        assert self.deadline_scale >= 1
         self._sites = 0
+
+    def now(self):
+        """Read this architecture's monotonic per-wait clock."""
+        return self.clock_fn()
 
     def armed(self):
         """The fault injection's stall is on: ``fault_after`` launches have run."""
@@ -156,7 +167,10 @@ class Guard:
                 r, GUARD_DEADLINE + 1, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV
             )
         )
-        return (fx.Int64(hi) << 32) | (fx.Int64(lo) & fx.Int64(0xFFFFFFFF))
+        ticks = (fx.Int64(hi) << 32) | (
+            fx.Int64(lo) & fx.Int64(0xFFFFFFFF)
+        )
+        return ticks * fx.Int64(self.deadline_scale)
 
     def scalar_deadline(self):
         """The deadline >> ``TICK_SHIFT`` in an SGPR, so a wait's check needs no VGPRs.
@@ -167,7 +181,7 @@ class Guard:
         dl = (fx.Int64(w[GUARD_DEADLINE + 1]) << 32) | (
             fx.Int64(w[GUARD_DEADLINE]) & fx.Int64(0xFFFFFFFF)
         )
-        return fx.Int32(dl >> TICK_SHIFT)
+        return fx.Int32(dl >> TICK_SHIFT) * fx.Int32(self.deadline_scale)
 
     def next_site(self) -> int:
         self._sites += 1
@@ -222,7 +236,10 @@ class Guard:
                     self.rank,
                     cache_modifier=CM_SYS,
                 )
-        rocdl.s_waitcnt(vmcnt=0)
+        if self.wait_stores_fn is None:
+            rocdl.s_waitcnt(vmcnt=0)
+        else:
+            self.wait_stores_fn()
         if const_expr(self.stop):
             stop_launch()
 

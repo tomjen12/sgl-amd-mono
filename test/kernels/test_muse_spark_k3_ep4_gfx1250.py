@@ -1,0 +1,218 @@
+"""Four-rank gfx1250 EP4 K3 test with exact per-rank BF16 partial rounding."""
+
+import os
+import sys
+
+import pytest
+import torch
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+NP = 4
+LAYER = 13
+
+
+def _worker(rank, port, queue):
+    import torch.distributed as dist
+
+    from test_muse_spark_k3_gfx1250 import (
+        TABLE_EXPERTS,
+        _boundary,
+        _epoch,
+        _local_partial,
+        _native_weight,
+    )
+
+    from sgl_amd_mono.common import guard
+    from sgl_amd_mono.common.peer import PeerBuffer
+    from sgl_amd_mono.muse_spark.gfx1250.build_k3 import (
+        K3Build,
+        build_k3,
+        k3_scratch_bytes,
+        k3_sym_bytes,
+    )
+    from sgl_amd_mono.muse_spark.gfx1250.config import (
+        HIDDEN,
+        INTER,
+        MOE_HIDDEN,
+        TOP_K,
+    )
+
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
+    torch.cuda.set_device(rank)
+    dist.init_process_group("gloo", rank=rank, world_size=NP)
+    device, bf16 = torch.device("cuda", rank), torch.bfloat16
+    peers = None
+    try:
+        # Replicated inputs and boundary weights use the same seed on every rank.
+        common = torch.Generator(device=device).manual_seed(125040)
+        xin = (torch.randn(8, MOE_HIDDEN, device=device, generator=common) * 0.25).to(bf16)
+        ids = torch.empty(8, TOP_K, dtype=torch.int32, device=device)
+        for token in range(8):
+            ids[token] = torch.tensor(
+                [
+                    token % 2,
+                    64 + (token + 1) % 2,
+                    128 + token % 2,
+                    192 + (token + 1) % 2,
+                    (token + 1) % 2,
+                    64 + token % 2,
+                    128 + (token + 1) % 2,
+                    192 + token % 2,
+                ],
+                dtype=torch.int32,
+                device=device,
+            )
+        scores = torch.rand(8, TOP_K, device=device, generator=common) * 0.25
+        base_stream = torch.randn(8, HIDDEN, device=device, generator=common)
+        weights = {
+            "pen_w": (
+                1 + 0.05 * torch.randn(MOE_HIDDEN, device=device, generator=common)
+            ).to(bf16),
+            "pfw": (
+                1 + 0.05 * torch.randn(HIDDEN, device=device, generator=common)
+            ).to(bf16),
+            "alpha": torch.rand(HIDDEN, device=device, generator=common) * 0.5
+            + 0.5,
+            "beta": torch.rand(HIDDEN, device=device, generator=common) * 0.5,
+            "npw": (
+                1 + 0.05 * torch.randn(HIDDEN, device=device, generator=common)
+            ).to(bf16),
+            "w_unpool": (
+                torch.randn(
+                    HIDDEN, MOE_HIDDEN, device=device, generator=common
+                )
+                * 0.01
+            ).to(bf16),
+        }
+
+        # Only local IDs 0/1 are represented, preserving local_start indexing
+        # without allocating the other 62 enormous expert tables.
+        local_gen = torch.Generator(device=device).manual_seed(125100 + rank)
+        w13, s13, d13 = _native_weight(
+            TABLE_EXPERTS, 2 * INTER, MOE_HIDDEN, device, local_gen
+        )
+        w2, s2, d2 = _native_weight(
+            TABLE_EXPERTS, MOE_HIDDEN, INTER, device, local_gen
+        )
+        partial = _local_partial(
+            xin,
+            ids,
+            scores,
+            64 * rank,
+            d13,
+            d2,
+            weights["pen_w"],
+        )
+        gathered = [None for _ in range(NP)]
+        dist.all_gather_object(gathered, partial.cpu())
+        # This is the important EP reference rule: each rank rounded its local
+        # slot sum to BF16 before these tensors are added in rank order.
+        rank_partials = [value.to(device) for value in gathered]
+        ref_stream, ref_attn = _boundary(
+            rank_partials, weights, base_stream, False
+        )
+
+        scratch = torch.zeros(
+            k3_scratch_bytes(), dtype=torch.uint8, device=device
+        )
+        peers = PeerBuffer(
+            k3_sym_bytes(NP) + guard.FLAG_BYTES,
+            dist.group.WORLD,
+            rank,
+            NP,
+            device,
+        )
+        peers.bytes.zero_()
+        torch.cuda.synchronize()
+        dist.barrier()
+        epoch = _epoch(device)
+        attn = torch.full(
+            (8, HIDDEN), float("nan"), dtype=bf16, device=device
+        )
+        got = base_stream.clone()
+        launch = build_k3(K3Build(npes=NP))
+        for _ in range(2):
+            got.copy_(base_stream)
+            torch.cuda.synchronize()
+            dist.barrier()
+            launch(
+                xin.data_ptr(),
+                ids.data_ptr(),
+                scores.data_ptr(),
+                64 * rank,
+                w13.data_ptr(),
+                s13.data_ptr(),
+                w2.data_ptr(),
+                s2.data_ptr(),
+                weights["pen_w"].data_ptr(),
+                got.data_ptr(),
+                weights["pfw"].data_ptr(),
+                weights["alpha"].data_ptr(),
+                weights["beta"].data_ptr(),
+                weights["npw"].data_ptr(),
+                weights["w_unpool"].data_ptr(),
+                attn.data_ptr(),
+                scratch.data_ptr(),
+                peers.local,
+                peers.addresses.data_ptr(),
+                rank,
+                epoch.data_ptr(),
+                LAYER,
+                0,
+                stream=torch.cuda.current_stream(),
+            )
+            epoch[0] += 1
+        torch.cuda.synchronize()
+        stream_ok = torch.allclose(
+            got, ref_stream, rtol=1 / 32, atol=2e-2
+        )
+        attn_ok = torch.allclose(
+            attn, ref_attn, rtol=1 / 32, atol=2e-2
+        )
+        errors = epoch[
+            guard.ERR_DEADLINE : guard.ERR_FAULT + 1
+        ].tolist()
+        queue.put((rank, stream_ok, attn_ok, errors))
+    except Exception as exc:
+        queue.put((rank, False, False, [repr(exc)]))
+    finally:
+        if peers is not None:
+            peers.close()
+        dist.destroy_process_group()
+
+
+def _run():
+    import torch.multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    port = 29500 + os.getpid() % 2000
+    processes = [
+        ctx.Process(target=_worker, args=(rank, port, queue))
+        for rank in range(NP)
+    ]
+    for process in processes:
+        process.start()
+    results = [queue.get(timeout=1200) for _ in range(NP)]
+    for process in processes:
+        process.join(timeout=120)
+    return sorted(results)
+
+
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and torch.cuda.device_count() >= NP
+        and "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+    ),
+    reason="needs four gfx1250 GPUs",
+)
+def test_k3_ep4_models_rank_partial_rounding():
+    for rank, stream_ok, attn_ok, errors in _run():
+        assert stream_ok and attn_ok, f"rank {rank}: output mismatch"
+        assert errors == [0, 0, 0], f"rank {rank}: mailbox errors {errors}"
+
+
+if __name__ == "__main__":
+    print(_run())

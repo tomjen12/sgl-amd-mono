@@ -47,9 +47,31 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
 
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.muse_spark import DRAFT_TOKENS, HF_CONFIG, TP
+from sgl_amd_mono.muse_spark.gfx1250.config import (
+    RESIDENT_BLOCKS as GFX1250_RESIDENT_BLOCKS,
+)
 from sgl_amd_mono.muse_spark.gfx950.config import WIDTHS
 
 logger = logging.getLogger(__name__)
+
+
+def _device_arch() -> str:
+    if not torch.cuda.is_available():
+        return ""
+    return torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName
+
+
+def _target():
+    """Return this process's architecture-specific config and runner."""
+    if "gfx1250" in _device_arch():
+        from sgl_amd_mono.muse_spark.gfx1250 import config
+        from sgl_amd_mono.muse_spark.gfx1250.runner import MuseMonoRunner
+
+        return config, MuseMonoRunner
+    from sgl_amd_mono.muse_spark.gfx950 import config
+    from sgl_amd_mono.muse_spark.gfx950.runner import MuseMonoRunner
+
+    return config, MuseMonoRunner
 
 # The SGLang names this glue reads, by file under the sglang package (``f(p)``: a
 # parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
@@ -78,7 +100,6 @@ SGLANG_READS = {
         "expert_distribution_recorder_mode",
     ),
     "srt/environ.py": (
-        "SGLANG_USE_AITER",
         "SGLANG_SIMULATE_UNIFORM_EXPERTS",
         "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS",
     ),
@@ -158,7 +179,7 @@ def _same(got, want) -> bool:
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     """What ``SPEC.requires`` cannot state: the nested text config, the layer
-    kinds, the draft block, FlyDSL."""
+    kinds, the draft block, architecture-specific attention backend, FlyDSL."""
     t = _text(hf_config)
     reasons = [
         f"config {k}={getattr(t, k, None)!r}, the kernels are built for {v!r}"
@@ -178,6 +199,18 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         and cfg.speculative_num_draft_tokens != DRAFT_TOKENS
     ):
         reasons.append(f"{cfg.speculative_num_draft_tokens} draft tokens; the widths are built for {DRAFT_TOKENS} a request")  # fmt: skip
+    # One spec serves both devices, while Requirements is intentionally
+    # architecture-independent. gfx950 consumes Aiter's unified page tables;
+    # gfx1250 reconstructs page tables from Triton's request-to-token table.
+    backend = getattr(cfg, "decode_attention_backend", None) or getattr(
+        cfg, "attention_backend", None
+    )
+    arch = _device_arch()
+    wanted = "triton" if "gfx1250" in arch else "aiter" if "gfx950" in arch else None
+    if wanted is not None and backend is not None and backend != wanted:
+        reasons.append(
+            f"attention backend {backend!r} on {arch}; the kernels require {wanted!r}"
+        )
     if not _has_flydsl():
         reasons.append("needs FlyDSL")
     return reasons
@@ -190,6 +223,7 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     from sgl_amd_mono.muse_spark.weights import layer_reasons
 
     lm = model.model.language_model
+    config, _ = _target()
     if not isinstance(lm, MuseSpark1xModel):
         return [f"{type(lm).__name__}; the kernels mirror the ROCm Muse Spark model"]
     reasons = []
@@ -200,17 +234,21 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     if model.nvfp4_checkpoint:
         reasons.append("NVFP4 experts; the kernels read Quark MXFP4 or bf16 experts")
     p = get_parallel()
-    if (p.attn_tp_size, p.moe_tp_size, p.moe_ep_size) != (TP, 1, TP):
+    if (p.attn_tp_size, p.moe_tp_size, p.moe_ep_size) != (
+        config.TP,
+        1,
+        config.EP,
+    ):
         reasons.append(
             f"attention TP {p.attn_tp_size} / MoE TP {p.moe_tp_size} / EP {p.moe_ep_size}: "
-            f"the kernels shard attention over TP {TP} and experts over EP {TP}"
+            f"the kernels shard attention over TP {config.TP} and experts over EP {config.EP}"
         )
     if len(lm.layers) != HF_CONFIG["num_hidden_layers"]:
         reasons.append(
             f"{len(lm.layers)} layers, built for {HF_CONFIG['num_hidden_layers']}"
         )
     for i, layer in enumerate(lm.layers):
-        reasons += layer_reasons(layer, i)
+        reasons += layer_reasons(layer, i, config=config)
     return reasons
 
 
@@ -463,9 +501,9 @@ def _log_kv_check(lid: int, live: torch.Tensor, got, ref) -> None:
 def _build(model, hf_config, ctx) -> _Built:
     from sglang.srt.runtime_context import get_parallel, get_spec
 
-    from sgl_amd_mono.muse_spark.gfx950.runner import MuseMonoRunner
     from sgl_amd_mono.muse_spark.weights import LayerViews
 
+    _, MuseMonoRunner = _target()
     lm = model.model.language_model
     layers = list(lm.layers)
     next_norms = [layer.self_attn.pre_attn_norm for layer in layers[1:]] + [lm.norm]
@@ -505,23 +543,28 @@ def _build(model, hf_config, ctx) -> _Built:
 SPEC = MonoSpec(
     name="muse_spark_hip",
     devices={
-        "gfx950": DeviceLimits(widths=WIDTHS, tp_sizes=(TP,), resident_blocks=BLOCKS)
+        "gfx950": DeviceLimits(widths=WIDTHS, tp_sizes=(TP,), resident_blocks=BLOCKS),
+        "gfx1250": DeviceLimits(
+            widths=(8,),
+            tp_sizes=(4,),
+            resident_blocks=GFX1250_RESIDENT_BLOCKS,
+        ),
     },
     features=frozenset({Feature.SPECULATIVE_DECODING, Feature.EXPERT_PARALLEL}),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
-        attention_backends=frozenset({"aiter"}),
+        # config_disable_reasons narrows this by architecture.
+        attention_backends=frozenset({"aiter", "triton"}),
         server_args={
             "kv_cache_dtype": frozenset({"fp8_e4m3"}),
             "page_size": frozenset({16}),
-            "ep_size": frozenset({TP}),
+            "ep_size": frozenset({4, TP}),
             "speculative_algorithm": frozenset({None, "DFLASH"}),
             # the launches record no expert distribution
             "expert_distribution_recorder_mode": frozenset({None}),
         },
         hf_config={"model_type": "muse_spark"},
         env={
-            "SGLANG_USE_AITER": True,
             # benchmark routing overrides: the kernels route with the model's own router
             "SGLANG_SIMULATE_UNIFORM_EXPERTS": False,
             "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS": False,
