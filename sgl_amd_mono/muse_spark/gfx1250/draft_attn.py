@@ -33,6 +33,7 @@ from sgl_amd_mono.muse_spark.gfx1250.draft_config import (
     MAX_TOKENS,
     Q_K,
     RESIDENT_BLOCKS,
+    SUPPORTED_TOKENS,
 )
 from sgl_amd_mono.muse_spark.gfx1250.draft_layout import THREADS, WAVE_SIZE, WAVES
 
@@ -339,15 +340,14 @@ SPLIT_ROWS = 16
 SPLIT_COUNT = 12
 ROW_TILES = LOCAL_KV_HEADS * (BLOCK // 2)
 SPLIT_TASKS = ROW_TILES * SPLIT_COUNT
+MAX_REQUESTS = MAX_TOKENS // BLOCK
+MAX_ROW_TILES = MAX_REQUESTS * ROW_TILES
+MAX_SPLIT_TASKS = MAX_REQUESTS * SPLIT_TASKS
 WMMA_K = 32
 WMMA_ACC = 8
 KEY_TILE = 16
 PV_KEYS = 32
 DIM_TILES = HEAD_DIM // SPLIT_ROWS
-
-STAT_FLOATS = ROW_TILES * SPLIT_COUNT * SPLIT_ROWS * 2
-GLOBAL_FLOATS = ROW_TILES * SPLIT_ROWS * 2
-PV_PART_FLOATS = ROW_TILES * SPLIT_COUNT * SPLIT_ROWS * HEAD_DIM
 
 assert (LOCAL_Q_HEADS, LOCAL_KV_HEADS, GQA) == (16, 2, 8)
 assert (ROW_TILES, SPLIT_TASKS) == (8, 96)
@@ -360,19 +360,25 @@ def _align(value, alignment=256):
 
 def dattn_scratch_layout(tokens: int = BLOCK, q_len: int = BLOCK) -> dict:
     """Plain payloads followed by tagged phase flags."""
-    if (tokens, q_len) != (BLOCK, BLOCK):
+    if tokens not in SUPPORTED_TOKENS or q_len != BLOCK:
         raise ValueError(
-            f"gfx1250 D-attn supports tokens=q_len={BLOCK}, "
+            f"gfx1250 D-attn supports rows {SUPPORTED_TOKENS}, q_len={BLOCK}; "
             f"got {(tokens, q_len)}"
         )
+    requests = tokens // BLOCK
+    row_tiles = requests * ROW_TILES
+    split_tasks = requests * SPLIT_TASKS
+    stat_floats = row_tiles * SPLIT_COUNT * SPLIT_ROWS * 2
+    global_floats = row_tiles * SPLIT_ROWS * 2
+    pv_part_floats = row_tiles * SPLIT_COUNT * SPLIT_ROWS * HEAD_DIM
     layout, offset = {}, 0
     for name, size in (
-        ("dattn_stats", STAT_FLOATS * 4),
-        ("dattn_global", GLOBAL_FLOATS * 4),
-        ("dattn_part", PV_PART_FLOATS * 4),
-        ("dattn_sflag", SPLIT_TASKS * 8),
-        ("dattn_gflag", ROW_TILES * 8),
-        ("dattn_pflag", SPLIT_TASKS * 8),
+        ("dattn_stats", stat_floats * 4),
+        ("dattn_global", global_floats * 4),
+        ("dattn_part", pv_part_floats * 4),
+        ("dattn_sflag", split_tasks * 8),
+        ("dattn_gflag", row_tiles * 8),
+        ("dattn_pflag", split_tasks * 8),
     ):
         offset = _align(offset)
         layout[name] = (offset, size)
@@ -380,9 +386,10 @@ def dattn_scratch_layout(tokens: int = BLOCK, q_len: int = BLOCK) -> dict:
     return layout
 
 
-def dattn_scratch_bytes() -> int:
+def dattn_scratch_bytes(tokens: int = MAX_TOKENS) -> int:
     return max(
-        offset + size for offset, size in dattn_scratch_layout().values()
+        offset + size
+        for offset, size in dattn_scratch_layout(tokens, BLOCK).values()
     )
 
 
@@ -421,10 +428,12 @@ def _split_slot(args, request_row, key):
 
 def _split_row_coords(tile, row):
     """The required tile -> KV head, logical row -> token/query-head map."""
-    kv_head = tile // (BLOCK // 2)
-    row_tile = tile % (BLOCK // 2)
+    request = tile // ROW_TILES
+    request_tile = tile % ROW_TILES
+    kv_head = request_tile // (BLOCK // 2)
+    row_tile = request_tile % (BLOCK // 2)
     logical = row_tile * SPLIT_ROWS + row
-    token = logical // GQA
+    token = request * BLOCK + logical // GQA
     query_head = kv_head * GQA + logical % GQA
     return token, query_head, kv_head
 
@@ -548,9 +557,10 @@ def run_split_dattn(c):
     stats, glob, part = c["stats"], c["global"], c["part"]
     wave_stats, row_stats = c["wave_stats"], c["row_stats"]
 
-    prefix = _i32_at(args["seq_lens"], 0, args["lens64"])
+    request = tile // ROW_TILES
+    prefix = _i32_at(args["seq_lens"], request, args["lens64"])
     keys = prefix + BLOCK
-    request_row = _i32_at(args["req_pool"], 0, args["rpi64"])
+    request_row = _i32_at(args["req_pool"], request, args["rpi64"])
     begin = fx.Int32(0)
     if args["window"] > 0:
         begin = fx.max(prefix - args["window"], fx.Int32(0))
@@ -849,10 +859,10 @@ class DAttnBuild(msgspec.Struct, frozen=True):
 
 
 def build_dattn(key: DAttnBuild):
-    """Build the width-eight cu96 split-key WMMA attention launch."""
-    if (key.tokens, key.q_len) != (MAX_TOKENS, BLOCK):
+    """Build variable-request cu96 split-key WMMA attention."""
+    if key.tokens not in SUPPORTED_TOKENS or key.q_len != BLOCK:
         raise ValueError(
-            f"gfx1250 D-attn supports tokens=q_len={BLOCK}, "
+            f"gfx1250 D-attn supports rows {SUPPORTED_TOKENS}, q_len={BLOCK}; "
             f"got {(key.tokens, key.q_len)}"
         )
     if key.resident_blocks != SPLIT_TASKS:
@@ -869,7 +879,7 @@ def build_dattn(key: DAttnBuild):
         f=key.fault_site,
     )
     keyed = key_tuple(key, SOURCES)
-    layout = dattn_scratch_layout()
+    layout = dattn_scratch_layout(key.tokens, key.q_len)
     Lds = split_dattn_lds()
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -911,36 +921,43 @@ def build_dattn(key: DAttnBuild):
                     "dattn_pflag",
                 )
             }
-            run_split_dattn(
-                {
-                    "tid": tid,
-                    "lane": tid % WAVE_SIZE,
-                    "wave": tid // WAVE_SIZE,
-                    "tile": bid // SPLIT_COUNT,
-                    "split": bid % SPLIT_COUNT,
-                    "mb": mb,
-                    "wave_stats": lds.wave_stats.ptr,
-                    "row_stats": lds.row_stats.ptr,
-                    "probabilities": lds.probabilities.ptr,
-                    "pv": lds.pv.ptr,
-                    **regions,
-                    "args": {
-                        "q": q,
-                        "out": out,
-                        "k_cache": k_cache,
-                        "v_cache": v_cache,
-                        "req_to_token": req_to_token,
-                        "table_stride": table_stride,
-                        "table_bytes": table_bytes,
-                        "req_pool": req_pool,
-                        "rpi64": rpi64,
-                        "seq_lens": seq_lens,
-                        "lens64": lens64,
-                        "window": window,
-                        "scale_bits": scale_bits,
-                    },
-                }
-            )
+            args = {
+                "q": q,
+                "out": out,
+                "k_cache": k_cache,
+                "v_cache": v_cache,
+                "req_to_token": req_to_token,
+                "table_stride": table_stride,
+                "table_bytes": table_bytes,
+                "req_pool": req_pool,
+                "rpi64": rpi64,
+                "seq_lens": seq_lens,
+                "lens64": lens64,
+                "window": window,
+                "scale_bits": scale_bits,
+            }
+            task = bid
+            while task < (key.tokens // BLOCK) * SPLIT_TASKS:
+                local_task = task % SPLIT_TASKS
+                request = task // SPLIT_TASKS
+                run_split_dattn(
+                    {
+                        "tid": tid,
+                        "lane": tid % WAVE_SIZE,
+                        "wave": tid // WAVE_SIZE,
+                        "tile": request * ROW_TILES
+                        + local_task // SPLIT_COUNT,
+                        "split": local_task % SPLIT_COUNT,
+                        "mb": mb,
+                        "wave_stats": lds.wave_stats.ptr,
+                        "row_stats": lds.row_stats.ptr,
+                        "probabilities": lds.probabilities.ptr,
+                        "pv": lds.pv.ptr,
+                        **regions,
+                        "args": args,
+                    }
+                )
+                task = task + SPLIT_TASKS
 
     @flyc.jit
     def launch(

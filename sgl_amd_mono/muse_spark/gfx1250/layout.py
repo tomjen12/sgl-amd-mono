@@ -19,7 +19,7 @@ from sgl_amd_mono.muse_spark.gfx1250.config import (
 from sgl_amd_mono.common.plan import pair_layout
 
 # Keep the proven gfx950 split-K decomposition initially.  TP4 produces 512
-# projection tasks.  The 192 resident CTAs consume them in grid-stride order
+# projection tasks.  The resident CTAs consume them in grid-stride order
 # before any CTA enters its optional polling head/gate stage.
 THREADS = 256
 WAVE_SIZE = 32
@@ -97,7 +97,7 @@ def k1_lds_bytes() -> int:
     return GEMV_ROW_TILES * RED_FLOATS * 4
 
 
-# ---------------------------------------------------------------- K-attn V1
+# ---------------------------------------------------------------- K-attn
 GQA = LOCAL_Q_HEADS // LOCAL_KV_HEADS
 KATTN_TASKS = MAX_TOKENS * LOCAL_Q_HEADS
 KATTN_TASK_ROUNDS = (KATTN_TASKS + RESIDENT_BLOCKS - 1) // RESIDENT_BLOCKS
@@ -129,5 +129,25 @@ FUSED_GLOBAL_FLOATS = FUSED_TILES * FUSED_ROWS * 2
 FUSED_PART_FLOATS = FUSED_TASKS * FUSED_ROWS * HEAD_DIM
 
 assert (LOCAL_Q_HEADS, LOCAL_KV_HEADS, GQA) == (32, 4, 8)
-assert (FUSED_TILES, FUSED_TASKS) == (16, 96)
+assert (FUSED_TILES, FUSED_TASKS) == (128, 768)
 assert HEAD_DIM == 2 * FUSED_WMMA_K
+
+
+def kattn_tasks(tokens: int) -> int:
+    if not 1 <= tokens <= MAX_TOKENS:
+        raise ValueError(f"tokens {tokens}, want [1, {MAX_TOKENS}]")
+    return tokens * LOCAL_Q_HEADS
+
+
+def fused_tiles(tokens: int) -> int:
+    if tokens % 2 or not 1 <= tokens <= MAX_TOKENS:
+        raise ValueError(f"fused attention tokens {tokens}, want an even width <= {MAX_TOKENS}")
+    return LOCAL_KV_HEADS * (tokens // 2)
+
+
+def fused_tasks(tokens: int) -> int:
+    return fused_tiles(tokens) * FUSED_SPLITS
+
+
+def resident_rounds(tasks: int) -> int:
+    return (tasks + RESIDENT_BLOCKS - 1) // RESIDENT_BLOCKS

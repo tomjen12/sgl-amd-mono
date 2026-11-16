@@ -20,7 +20,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 NP = 4
 LAYERS = 5
 PREFIX = 3000
-KEYS = PREFIX + 8
 SLOTS = 4096
 TABLE_STRIDE = 4096
 MAX_POS = 8192
@@ -197,7 +196,7 @@ def _close(got, expected, what, rtol=1 / 16, atol=0.04, cosine=0.997):
     )
 
 
-def _worker(rank, port, queue, checkpoint=None):
+def _worker(rank, port, queue, rows, checkpoint=None):
     import torch.distributed as dist
 
     from test_muse_spark_dattn_gfx1250_tp4 import _reference as attn_reference
@@ -221,7 +220,6 @@ def _worker(rank, port, queue, checkpoint=None):
         HEAD_DIM,
         HIDDEN,
         LOCAL_KV_HEADS,
-        MAX_TOKENS,
         Q_K,
         RESIDENT_BLOCKS,
         WINDOW,
@@ -254,37 +252,55 @@ def _worker(rank, port, queue, checkpoint=None):
         hidden = (
             0.3
             * torch.randn(
-                MAX_TOKENS, HIDDEN, device=device, generator=generator
+                rows, HIDDEN, device=device, generator=generator
             )
         ).to(torch.bfloat16)
         residual = hidden
         first = True
+        requests = rows // 8
+        keys = PREFIX + 8
         positions = torch.arange(
-            PREFIX, KEYS, dtype=torch.int32, device=device
-        )
+            PREFIX, keys, dtype=torch.int32, device=device
+        ).repeat(requests)
         cos_sin = _cos_sin(device)
-        token_slots = (
-            torch.randperm(SLOTS - 1, device=device, generator=generator)[:KEYS]
+        request_slots = [
+            torch.randperm(
+                SLOTS - 1, device=device, generator=generator
+            )[:keys]
             + 1
+            for _ in range(requests)
+        ]
+        current_slots = torch.cat(
+            [slots[PREFIX:] for slots in request_slots]
+        ).to(torch.int32)
+        table = torch.zeros(
+            requests, TABLE_STRIDE, dtype=torch.int32, device=device
         )
-        current_slots = token_slots[PREFIX:].to(torch.int32)
-        table = torch.zeros(1, TABLE_STRIDE, dtype=torch.int32, device=device)
-        table[0, :KEYS] = token_slots.to(torch.int32)
-        request_pool = torch.zeros(1, dtype=torch.int64, device=device)
-        prefix_lens = torch.tensor([PREFIX], dtype=torch.int32, device=device)
+        for request, slots in enumerate(request_slots):
+            table[request, :keys] = slots.to(torch.int32)
+        request_pool = torch.arange(
+            requests, dtype=torch.int64, device=device
+        )
+        prefix_lens = torch.full(
+            (requests,), PREFIX, dtype=torch.int32, device=device
+        )
         epoch = _epoch(device)
 
         dpre = DH.build_dpre(
-            DH.DPreBuild(resident_blocks=RESIDENT_BLOCKS)
+            DH.DPreBuild(tokens=rows, resident_blocks=RESIDENT_BLOCKS)
         )
         dattn = DA.build_dattn(
-            DA.DAttnBuild(resident_blocks=RESIDENT_BLOCKS)
+            DA.DAttnBuild(tokens=rows, resident_blocks=RESIDENT_BLOCKS)
         )
         dpost = DH.build_dpost(
-            DH.DPostBuild(npes=NP, resident_blocks=RESIDENT_BLOCKS)
+            DH.DPostBuild(
+                tokens=rows, npes=NP, resident_blocks=RESIDENT_BLOCKS
+            )
         )
         dmlp = DM.build_dmlp(
-            DM.DMLPBuild(npes=NP, resident_blocks=RESIDENT_BLOCKS)
+            DM.DMLPBuild(
+                tokens=rows, npes=NP, resident_blocks=RESIDENT_BLOCKS
+            )
         )
         pre_scratch = torch.zeros(
             DH.dp_scratch_bytes(), dtype=torch.uint8, device=device
@@ -338,10 +354,10 @@ def _worker(rank, port, queue, checkpoint=None):
 
             res_pre = torch.empty_like(hidden)
             q = torch.empty(
-                MAX_TOKENS, Q_K, dtype=torch.bfloat16, device=device
+                rows, Q_K, dtype=torch.bfloat16, device=device
             )
             coef = torch.empty(
-                MAX_TOKENS, COEF_ROWS, dtype=torch.float32, device=device
+                rows, COEF_ROWS, dtype=torch.float32, device=device
             )
             dpre(
                 hidden.data_ptr(), residual.data_ptr(), int(first),
@@ -362,7 +378,9 @@ def _worker(rank, port, queue, checkpoint=None):
             _close(coef, coef_ref, f"layer {layer} D-pre coef", rtol=1 / 32)
             _close(
                 k_cache[current_slots.long()],
-                k_ref.reshape(MAX_TOKENS, LOCAL_KV_HEADS, HEAD_DIM),
+                k_ref.reshape(rows, LOCAL_KV_HEADS, HEAD_DIM)
+                .clamp(-448.0, 448.0)
+                .to(torch.float8_e4m3fn),
                 f"layer {layer} D-pre K cache",
                 rtol=1 / 8,
                 atol=0.06,
@@ -370,21 +388,28 @@ def _worker(rank, port, queue, checkpoint=None):
             )
             _close(
                 v_cache[current_slots.long()],
-                v_ref.reshape(MAX_TOKENS, LOCAL_KV_HEADS, HEAD_DIM),
+                v_ref.reshape(rows, LOCAL_KV_HEADS, HEAD_DIM)
+                .clamp(-448.0, 448.0)
+                .to(torch.float8_e4m3fn),
                 f"layer {layer} D-pre V cache",
                 rtol=1 / 8,
                 atol=0.06,
                 cosine=0.994,
             )
 
-            o_ref = attn_reference(
-                q,
-                k_cache,
-                v_cache,
-                token_slots,
-                PREFIX,
-                WINDOW,
-                scale,
+            o_ref = torch.cat(
+                [
+                    attn_reference(
+                        q[request * 8 : (request + 1) * 8],
+                        k_cache,
+                        v_cache,
+                        request_slots[request],
+                        PREFIX,
+                        WINDOW,
+                        scale,
+                    )
+                    for request in range(requests)
+                ]
             )
             o = torch.empty_like(q)
             dattn(
@@ -403,7 +428,7 @@ def _worker(rank, port, queue, checkpoint=None):
             ).to(torch.bfloat16)
             reduced_post = _rank_ordered_sum(local_post, dist.group.WORLD)
             post_delta = coef.reshape(
-                MAX_TOKENS, 2, 2, COEF_ROWS // 4
+                rows, 2, 2, COEF_ROWS // 4
             )
             attn_out_ref = attn_conv(
                 reduced_post, post_delta[:, 1], aw["base"][1]
@@ -474,7 +499,7 @@ GPU_READY = (
 )
 
 
-def _run_processes(checkpoint=None):
+def _run_processes(rows, checkpoint=None):
     import torch.multiprocessing as mp
 
     context = mp.get_context("spawn")
@@ -482,7 +507,7 @@ def _run_processes(checkpoint=None):
     port = 34000 + os.getpid() % 1000
     processes = [
         context.Process(
-            target=_worker, args=(rank, port, queue, checkpoint)
+            target=_worker, args=(rank, port, queue, rows, checkpoint)
         )
         for rank in range(NP)
     ]
@@ -492,12 +517,16 @@ def _run_processes(checkpoint=None):
     for process in processes:
         process.join(timeout=120)
         assert process.exitcode == 0
-    assert not [(rank, error) for rank, error in results if error], results
+    failures = [(rank, error) for rank, error in results if error]
+    for rank, error in failures:
+        print(f"rank {rank} failed:\n{error}")
+    assert not failures, failures
 
 
 @pytest.mark.skipif(not GPU_READY, reason="needs four idle gfx1250 GPUs")
-def test_gfx1250_dflash2_tp4_five_checkpoint_layers_match_torch():
-    _run_processes()
+@pytest.mark.parametrize("rows", [8, 16, 32, 64])
+def test_gfx1250_dflash2_tp4_five_checkpoint_layers_match_torch(rows):
+    _run_processes(rows)
 
 
 CHECKPOINT = os.environ.get(
@@ -511,5 +540,6 @@ CHECKPOINT = os.environ.get(
     reason="DFlash2 model.safetensors is not installed",
 )
 @pytest.mark.skipif(not GPU_READY, reason="needs four idle gfx1250 GPUs")
-def test_gfx1250_dflash2_real_checkpoint_five_layer_smoke():
-    _run_processes(CHECKPOINT)
+@pytest.mark.parametrize("rows", [8, 16, 32, 64])
+def test_gfx1250_dflash2_real_checkpoint_five_layer_smoke(rows):
+    _run_processes(rows, CHECKPOINT)

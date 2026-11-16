@@ -11,10 +11,12 @@ from sgl_amd_mono.common.ops import peer_bases
 from sgl_amd_mono.common.plan import kernel_sources, key_tuple
 from sgl_amd_mono.common.sync import Mailbox, preg, sreg
 from sgl_amd_mono.muse_spark.gfx1250.config import (
+    DRAFT_TOKENS,
     HIDDEN,
     MAX_TOKENS,
     MOE_HIDDEN,
     TOP_K,
+    WIDTHS,
 )
 from sgl_amd_mono.muse_spark.gfx1250.device import mailbox_guard, step_tag
 from sgl_amd_mono.muse_spark.gfx1250.stages import ffn
@@ -25,9 +27,9 @@ THREADS = 256
 
 
 class K3Build(msgspec.Struct, frozen=True):
-    """One fixed ``S=8`` EP K3 build."""
+    """One fixed-width EP K3 build."""
 
-    tokens: int = MAX_TOKENS
+    tokens: int = DRAFT_TOKENS
     npes: int = 4
     last: bool = False
     fault_site: int = 0
@@ -120,7 +122,7 @@ def build_k3(key: K3Build):
     epoch, layer and runtime ``last``.
     """
 
-    assert key.tokens == MAX_TOKENS == 8, key.tokens
+    assert key.tokens in WIDTHS, (key.tokens, WIDTHS)
     assert key.npes in (1, 4), key.npes
     Lds = ffn.k3_lds()
     keyed = key_tuple(key, SOURCES)

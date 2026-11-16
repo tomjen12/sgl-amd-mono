@@ -10,6 +10,7 @@ from sgl_amd_mono.muse_spark.gfx1250.draft_config import (
     QKV_ROWS,
     Q_K,
     RESIDENT_BLOCKS,
+    SUPPORTED_TOKENS,
 )
 
 THREADS = 256
@@ -44,6 +45,18 @@ O_GROUPS = HIDDEN // O_ROWS_PER_GROUP
 O_TASKS = O_GROUPS
 
 ATTENTION_TASKS = MAX_TOKENS * (Q_K // 128)
+
+
+def request_count(tokens: int) -> int:
+    if tokens not in SUPPORTED_TOKENS:
+        raise ValueError(
+            f"gfx1250 Draft supports total rows {SUPPORTED_TOKENS}, got {tokens}"
+        )
+    return tokens // 8
+
+
+def attention_tasks(tokens: int) -> int:
+    return request_count(tokens) * 96
 
 
 def rounds(tasks: int) -> int:

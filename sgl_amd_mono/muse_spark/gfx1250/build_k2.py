@@ -18,6 +18,7 @@ from sgl_amd_mono.muse_spark.gfx1250.config import (
     MOE_HIDDEN,
     Q_K,
     RESIDENT_BLOCKS,
+    WIDTHS,
 )
 from sgl_amd_mono.muse_spark.gfx1250.device import mailbox_guard, step_tag
 from sgl_amd_mono.muse_spark.gfx1250.stages import post_attn
@@ -72,11 +73,9 @@ class K2Build(msgspec.Struct, frozen=True):
 
 
 def build_k2(key: K2Build):
-    """Build fixed-S=8 K2 for a local rank or a four-rank TP group."""
-    if key.tokens != MAX_TOKENS:
-        raise ValueError(
-            f"gfx1250 K2 V1 supports {MAX_TOKENS} rows, got {key.tokens}"
-        )
+    """Build K2 for a supported Target width."""
+    if key.tokens not in WIDTHS:
+        raise ValueError(f"gfx1250 K2 supports widths {WIDTHS}, got {key.tokens}")
     if key.npes not in (1, 4):
         raise ValueError(f"gfx1250 K2 V1 supports TP1 or TP4, got {key.npes}")
 
@@ -139,6 +138,7 @@ def build_k2(key: K2Build):
         post_attn.stage_o_projection(
             {
                 "W": W,
+                "S": key.tokens,
                 "B": RESIDENT_BLOCKS,
                 "bid": fx.block_idx.x,
                 "tid": tid,
@@ -191,6 +191,7 @@ def build_k2(key: K2Build):
             {
                 "W": W,
                 "bid": fx.block_idx.x,
+                "S": key.tokens,
                 "tid": tid,
                 "lane": tid % 32,
                 "wave": tid // 32,
@@ -214,6 +215,7 @@ def build_k2(key: K2Build):
         post_attn.stage_router_pool(
             {
                 "bid": fx.block_idx.x,
+                "S": key.tokens,
                 "B": EXPERTS // post_attn.ROWS,
                 "tid": tid,
                 "lane": tid % 32,
@@ -235,6 +237,7 @@ def build_k2(key: K2Build):
         post_attn.stage_router_pool(
             {
                 "bid": fx.block_idx.x,
+                "S": key.tokens,
                 "B": RESIDENT_BLOCKS,
                 "tid": tid,
                 "lane": tid % 32,
@@ -314,7 +317,7 @@ def build_k2(key: K2Build):
     ):
         _ = keyed
         norm_gate(o, g, scratch).launch(
-            grid=(MAX_TOKENS * (Q_K // HEAD_DIM),),
+            grid=(key.tokens * (Q_K // HEAD_DIM),),
             block=(32,),
             stream=stream,
         )
@@ -325,7 +328,7 @@ def build_k2(key: K2Build):
         )
         boundary(
             res, alpha, beta, pre_w, scratch, sym, peers, rank, epoch, layer
-        ).launch(grid=(MAX_TOKENS,), block=(THREADS,), stream=stream)
+        ).launch(grid=(key.tokens,), block=(THREADS,), stream=stream)
         router(w_hi, w_lo, scratch).launch(
             grid=(EXPERTS // (post_attn.ROWS * post_attn.WAVES),),
             block=(THREADS,),
@@ -337,10 +340,10 @@ def build_k2(key: K2Build):
             stream=stream,
         )
         top8(bias, ids, scores, scratch).launch(
-            grid=(MAX_TOKENS,), block=(THREADS,), stream=stream
+            grid=(key.tokens,), block=(THREADS,), stream=stream
         )
         pooled_norm(xn_w, xin, scratch).launch(
-            grid=(MAX_TOKENS,), block=(THREADS,), stream=stream
+            grid=(key.tokens,), block=(THREADS,), stream=stream
         )
 
     return launch

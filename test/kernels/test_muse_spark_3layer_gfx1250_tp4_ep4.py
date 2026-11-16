@@ -129,10 +129,10 @@ def _local_expert_reference(xin, ids, scores, local_start, layer):
     return _bf(out)
 
 
-def _layer_outputs(device):
+def _layer_outputs(device, rows=8):
     from test_muse_spark_layer_gfx1250 import _outputs
 
-    return _outputs(device)
+    return _outputs(device, rows)
 
 
 def _snapshot(outputs, q, k, v, gate):
@@ -141,13 +141,20 @@ def _snapshot(outputs, q, k, v, gate):
     return result
 
 
-def _make_page_layout(device, generator):
-    """Build one logical page sequence with full-pool and ring-like SWA views."""
+def _make_page_layout(device, generator, rows):
+    """Build one logical page sequence per eight-row verify request."""
+    requests = rows // 8
     pages = (KEYS + 15) // 16
-    full_table = torch.zeros(MAX_BLOCKS, dtype=torch.int32, device=device)
-    full_table[:pages] = torch.randperm(
+    prefix_pages = PREFIX // 16
+    base_pages = torch.randperm(
         FULL_PAGES, device=device, generator=generator
-    )[:pages].to(torch.int32)
+    )
+    current_pages = base_pages[prefix_pages : prefix_pages + requests]
+    full_table = torch.zeros(
+        requests, MAX_BLOCKS, dtype=torch.int32, device=device
+    )
+    full_table[:, :prefix_pages] = base_pages[:prefix_pages].to(torch.int32)
+    full_table[:, prefix_pages] = current_pages.to(torch.int32)
 
     # Real deployments map a full-cache physical page into a smaller SWA pool.
     # A random page permutation followed by modulo gives a ring-like mapping;
@@ -161,18 +168,20 @@ def _make_page_layout(device, generator):
         generator=generator,
     )
     active_count = min(129, pages)
-    active_pages = full_table[pages - active_count : pages].long()
+    active_pages = torch.unique(full_table[:, pages - active_count : pages]).long()
     page_map[active_pages] = torch.randperm(
         SWA_PAGES, device=device, generator=generator
-    )[:active_count]
+    )[: active_pages.numel()]
     swa_map = (
         page_map[:, None] * 16
         + torch.arange(16, dtype=torch.int64, device=device)[None, :]
     ).reshape(-1)
     swa_table = torch.zeros_like(full_table)
-    swa_table[:pages] = page_map[full_table[:pages].long()].to(torch.int32)
+    swa_table[:, :pages] = page_map[full_table[:, :pages].long()].to(torch.int32)
     offsets = torch.arange(8, dtype=torch.int64, device=device)
-    slots = full_table[PREFIX // 16].long() * 16 + offsets
+    slots = (
+        full_table[:, PREFIX // 16].long()[:, None] * 16 + offsets[None, :]
+    ).reshape(-1)
     return full_table, swa_table, swa_map, slots
 
 
@@ -334,8 +343,8 @@ def _distributed_layer_reference(
         if layer["sliding"]
         else layer["slots"]
     )
-    k_cache[write_slots] = _fp8(k.reshape(8, -1, 64))
-    v_cache[write_slots] = _fp8(v.reshape(8, -1, 64))
+    k_cache[write_slots] = _fp8(k.reshape(attn_input.shape[0], -1, 64))
+    v_cache[write_slots] = _fp8(v.reshape(attn_input.shape[0], -1, 64))
     o = _attention_reference(
         q,
         k_cache,
@@ -426,18 +435,15 @@ def _distributed_post_reference(layer, o, gate, stream):
     }
 
 
-def _worker(rank, port, queue):
+def _worker(rank, port, queue, rows):
     import torch.distributed as dist
 
     from test_muse_spark_k1_gfx1250 import (
         _close as k1_close,
         _fp8,
-        _reference as k1_reference,
     )
     from test_muse_spark_layer_gfx1250 import (
-        _attention_reference,
         _assert_close,
-        _check_outputs,
         _reset,
     )
 
@@ -463,7 +469,6 @@ def _worker(rank, port, queue):
     )
     from sgl_amd_mono.muse_spark.gfx1250.config import (
         KV_K,
-        MAX_TOKENS,
         Q_K,
         SOFTMAX_SCALE,
     )
@@ -517,7 +522,7 @@ def _worker(rank, port, queue):
 
         shared_generator = torch.Generator(device=device).manual_seed(125030)
         local_generator = torch.Generator(device=device).manual_seed(125100 + rank)
-        layout = _make_page_layout(device, shared_generator)
+        layout = _make_page_layout(device, shared_generator, rows)
         layers = [
             _make_layer(
                 rank,
@@ -532,13 +537,15 @@ def _worker(rank, port, queue):
         cos_sin = _cos_sin(device)
         positions = torch.arange(
             PREFIX, KEYS, dtype=torch.int64, device=device
+        ).repeat(rows // 8)
+        prefix = torch.full(
+            (rows // 8,), PREFIX, dtype=torch.int32, device=device
         )
-        prefix = torch.tensor([PREFIX], dtype=torch.int32, device=device)
         scale_bits = torch.tensor(
             [SOFTMAX_SCALE], dtype=torch.float32
         ).view(torch.int32).item()
         initial_stream = torch.randn(
-            MAX_TOKENS,
+            rows,
             8192,
             device=device,
             generator=shared_generator,
@@ -564,19 +571,19 @@ def _worker(rank, port, queue):
             )
             oracle_layers.append(reference)
 
-        k1 = build_k1(K1Build(tokens=MAX_TOKENS))
+        k1 = build_k1(K1Build(tokens=rows))
         kattn = build_kattn(
-            KAttnBuild(tokens=MAX_TOKENS, q_len=MAX_TOKENS)
+            KAttnBuild(tokens=rows, q_len=8)
         )
-        k2 = build_k2(K2Build(tokens=MAX_TOKENS, npes=NP))
+        k2 = build_k2(K2Build(tokens=rows, npes=NP))
         k3_variants = {
-            False: build_k3(K3Build(npes=NP, last=False)),
-            True: build_k3(K3Build(npes=NP, last=True)),
+            False: build_k3(K3Build(tokens=rows, npes=NP, last=False)),
+            True: build_k3(K3Build(tokens=rows, npes=NP, last=True)),
         }
         layer_v2 = build_layer(
             LayerBuild(
-                tokens=MAX_TOKENS,
-                q_len=MAX_TOKENS,
+                tokens=rows,
+                q_len=8,
                 npes=NP,
                 next_k1=True,
                 last=False,
@@ -584,8 +591,8 @@ def _worker(rank, port, queue):
         )
         layer_v1_last = build_layer(
             LayerBuild(
-                tokens=MAX_TOKENS,
-                q_len=MAX_TOKENS,
+                tokens=rows,
+                q_len=8,
                 npes=NP,
                 next_k1=False,
                 last=True,
@@ -607,14 +614,18 @@ def _worker(rank, port, queue):
             layer_scratch_bytes(), dtype=torch.uint8, device=device
         )
         split_epoch, fused_epoch = _epoch(device), _epoch(device)
+        oracle_epoch = _epoch(device)
+        oracle_k_cache = torch.empty_like(layers[0]["k_initial"])
+        oracle_v_cache = torch.empty_like(layers[0]["v_initial"])
+        oracle_k1_scratch = torch.zeros_like(split_k1_scratch)
         stream = torch.cuda.current_stream()
 
         def empty_qkvg():
             q = torch.empty(
-                MAX_TOKENS, Q_K, dtype=torch.bfloat16, device=device
+                rows, Q_K, dtype=torch.bfloat16, device=device
             )
             k = torch.empty(
-                MAX_TOKENS, KV_K, dtype=torch.bfloat16, device=device
+                rows, KV_K, dtype=torch.bfloat16, device=device
             )
             return q, k, torch.empty_like(k), torch.empty_like(q)
 
@@ -627,7 +638,7 @@ def _worker(rank, port, queue):
         torch.cuda.synchronize()
         dist.barrier()
         for layer_index, layer in enumerate(layers):
-            outputs = _layer_outputs(device)
+            outputs = _layer_outputs(device, rows)
             _reset(outputs, split_stream)
             base_stream = split_stream.clone()
             base_attn_input = split_attn_input.clone()
@@ -649,7 +660,8 @@ def _worker(rank, port, queue):
                 q.data_ptr(), outputs["o"].data_ptr(),
                 split_k_cache[layer_index].data_ptr(),
                 split_v_cache[layer_index].data_ptr(), layer["table"].data_ptr(),
-                prefix.data_ptr(), layer["window"], scale_bits, stream=stream,
+                layer["table"].stride(0), prefix.data_ptr(), layer["window"],
+                scale_bits, stream=stream,
             )  # fmt: skip
             torch.cuda.synchronize()
             dist.barrier()
@@ -715,7 +727,7 @@ def _worker(rank, port, queue):
         dist.barrier()
 
         for layer_index, layer in enumerate(layers):
-            outputs = _layer_outputs(device)
+            outputs = _layer_outputs(device, rows)
             _reset(outputs, fused_stream)
             base_stream = fused_stream.clone()
             base_attn_input = fused_attn_input.clone()
@@ -754,7 +766,8 @@ def _worker(rank, port, queue):
                 q.data_ptr(), outputs["o"].data_ptr(),
                 fused_k_cache[layer_index].data_ptr(),
                 fused_v_cache[layer_index].data_ptr(), layer["table"].data_ptr(),
-                prefix.data_ptr(), layer["window"], scale_bits, gate.data_ptr(),
+                layer["table"].stride(0), prefix.data_ptr(), layer["window"],
+                scale_bits, gate.data_ptr(),
                 outputs["res"].data_ptr(), weights["w_o"].data_ptr(),
                 weights["attn_alpha"].data_ptr(), weights["attn_beta"].data_ptr(),
                 weights["pre_w"].data_ptr(), weights["w_hi"].data_ptr(),
@@ -795,13 +808,35 @@ def _worker(rank, port, queue):
                 ("split", split, split_k_cache, split_v_cache),
                 ("fused", fused, fused_k_cache, fused_v_cache),
             ):
-                q_ref, k_ref, v_ref, g_ref = k1_reference(
-                    path["base_attn_input"],
-                    layer["qkvg"],
-                    cos_sin,
-                    positions,
-                    layer["rope"],
+                # Standalone K1 is the arithmetic-order oracle for the fused
+                # chained K1 stage.  Its all-width tests independently compare
+                # against PyTorch, while this catches integration corruption
+                # without depending on a different GEMV reduction order.
+                q_ref, k_ref, v_ref, g_ref = empty_qkvg()
+                k1(
+                    path["base_attn_input"].data_ptr(),
+                    layer["qkvg"].data_ptr(),
+                    cos_sin.data_ptr(),
+                    positions.data_ptr(),
+                    layer["slots"].data_ptr(),
+                    layer["swa_map"].data_ptr(),
+                    oracle_k_cache.data_ptr(),
+                    oracle_v_cache.data_ptr(),
+                    q_ref.data_ptr(),
+                    k_ref.data_ptr(),
+                    v_ref.data_ptr(),
+                    g_ref.data_ptr(),
+                    oracle_k1_scratch.data_ptr(),
+                    oracle_epoch.data_ptr(),
+                    layer["index"],
+                    int(layer["rope"]),
+                    int(layer["sliding"]),
+                    1,
+                    1,
+                    stream=stream,
                 )
+                torch.cuda.synchronize()
+                oracle_epoch[0] += 1
                 for name, expected, tolerance in (
                     ("q", q_ref, 1 / 32),
                     ("k", k_ref, 1 / 32),
@@ -814,18 +849,28 @@ def _worker(rank, port, queue):
                         tolerance,
                         f"{path_name} layer {layer_index} {name}",
                     )
-                attention_ref = _attention_reference(
-                    q_ref,
-                    k_cache[layer_offset],
-                    v_cache[layer_offset],
-                    layer["table"],
-                    KEYS,
+                # Use the standalone K-attn kernel as the arithmetic-order
+                # oracle for this integration check.  Its all-width tests
+                # independently compare it with paged PyTorch attention.
+                # Unlike comparing the split/fused paths directly, this
+                # remains valid after their hidden states have diverged.
+                attention_oracle = torch.empty_like(path["o"])
+                kattn(
+                    path["q"].data_ptr(),
+                    attention_oracle.data_ptr(),
+                    k_cache[layer_offset].data_ptr(),
+                    v_cache[layer_offset].data_ptr(),
+                    layer["table"].data_ptr(),
+                    layer["table"].stride(0),
+                    prefix.data_ptr(),
                     layer["window"],
-                    SOFTMAX_SCALE,
+                    scale_bits,
+                    stream=stream,
                 )
+                torch.cuda.synchronize()
                 _assert_close(
                     path["o"],
-                    attention_ref,
+                    attention_oracle,
                     1 / 32,
                     2e-2,
                     f"rank {rank} {path_name} layer {layer_index} o",
@@ -871,10 +916,10 @@ def _worker(rank, port, queue):
                     else layer["slots"]
                 )
                 expected_k[write_slots] = _fp8(
-                    path["k"].reshape(8, -1, 64)
+                    path["k"].reshape(rows, -1, 64)
                 )
                 expected_v[write_slots] = _fp8(
-                    path["v"].reshape(8, -1, 64)
+                    path["v"].reshape(rows, -1, 64)
                 )
                 torch.testing.assert_close(
                     k_cache[layer_offset].float(),
@@ -936,7 +981,7 @@ def _worker(rank, port, queue):
             dist.destroy_process_group()
 
 
-def _run_tp4_ep4():
+def _run_tp4_ep4(rows):
     import queue as queue_module
     import torch.multiprocessing as mp
 
@@ -944,7 +989,7 @@ def _run_tp4_ep4():
     queue = context.Queue()
     port = 33000 + os.getpid() % 1000
     processes = [
-        context.Process(target=_worker, args=(rank, port, queue))
+        context.Process(target=_worker, args=(rank, port, queue, rows))
         for rank in range(NP)
     ]
     started = time.monotonic()
@@ -985,8 +1030,9 @@ def _run_tp4_ep4():
     ),
     reason="needs four idle gfx1250 GPUs",
 )
-def test_gfx1250_tp4_ep4_three_checkpoint_layers_match_all_paths():
-    results = _run_tp4_ep4()
+@pytest.mark.parametrize("rows", [8, 16, 32, 64])
+def test_gfx1250_tp4_ep4_three_checkpoint_layers_match_all_paths(rows):
+    results = _run_tp4_ep4(rows)
     failures = [
         (rank, error, elapsed)
         for rank, error, elapsed in results
@@ -996,3 +1042,45 @@ def test_gfx1250_tp4_ep4_three_checkpoint_layers_match_all_paths():
         print(f"rank {rank} failed after {elapsed:.2f}s:\n{error}")
     assert not failures, failures
     assert max(elapsed for _, _, elapsed in results) < HOST_CEILING_S
+
+
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and torch.version.hip
+        and "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+    ),
+    reason="needs a gfx1250 GPU",
+)
+def test_gfx1250_tp4_three_layer_synthetic_widths_compile():
+    """Compile first K1, merged middle, and final layer at every Target width."""
+    from sgl_amd_mono.muse_spark.gfx1250.build_layer import LayerBuild, build_layer
+    from sgl_amd_mono.muse_spark.gfx1250.config import DRAFT_TOKENS, WIDTHS
+    from sgl_amd_mono.muse_spark.gfx1250.layer import K1Build, build_k1
+    from sgl_amd_mono.muse_spark.gfx1250.runner import compile_only
+
+    assert WIDTHS == (8, 16, 32, 64)
+    for width in WIDTHS:
+        compile_only(build_k1(K1Build(tokens=width)))
+        compile_only(
+            build_layer(
+                LayerBuild(
+                    tokens=width,
+                    q_len=DRAFT_TOKENS,
+                    npes=NP,
+                    next_k1=True,
+                    last=False,
+                )
+            )
+        )
+        compile_only(
+            build_layer(
+                LayerBuild(
+                    tokens=width,
+                    q_len=DRAFT_TOKENS,
+                    npes=NP,
+                    next_k1=False,
+                    last=True,
+                )
+            )
+        )

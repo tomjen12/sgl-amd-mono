@@ -19,6 +19,7 @@ from sgl_amd_mono.muse_spark.gfx1250.build_layer import (
     layer_sym_bytes,
 )
 from sgl_amd_mono.muse_spark.gfx1250.config import (
+    DRAFT_TOKENS,
     HEAD_DIM,
     HIDDEN,
     KV_K,
@@ -30,6 +31,7 @@ from sgl_amd_mono.muse_spark.gfx1250.config import (
     Q_K,
     TOP_K,
     WINDOW,
+    WIDTHS,
 )
 from sgl_amd_mono.muse_spark.gfx1250.layout import (
     k1_scratch_layout,
@@ -38,6 +40,12 @@ from sgl_amd_mono.muse_spark.gfx1250.layout import (
 
 FP8_CACHE = torch.float8_e4m3fn
 USE_KERNELS = os.environ.get("SGLANG_AMD_MONO_MUSE_KERNELS", "1") == "1"
+
+# SGLang classes imported lazily by cache validation and page-table binding.
+SGLANG_READS = {
+    "srt/layers/attention/aiter_backend.py": ("AiterAttnBackend",),
+    "srt/layers/attention/triton_backend.py": ("TritonAttnBackend",),
+}
 
 
 def _ptr(value) -> int:
@@ -131,7 +139,9 @@ class MuseMonoRunner:
             MAX_TOKENS, MOE_HIDDEN, dtype=bf16, device=dev
         )
         self.attn_in = torch.empty(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev)
-        self.prefix = torch.empty(1, dtype=torch.int32, device=dev)
+        self.prefix = torch.empty(
+            MAX_TOKENS // DRAFT_TOKENS, dtype=torch.int32, device=dev
+        )
         tables = [view.cos_sin for view in self.views if view.cos_sin is not None]
         if not tables:
             raise RuntimeError("Muse Spark gfx1250: no rotary table")
@@ -146,22 +156,22 @@ class MuseMonoRunner:
         )
         self.epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
 
-    def k1_kernel(self):
-        if "k1" not in self._k1:
+    def k1_kernel(self, rows: int):
+        if rows not in self._k1:
             from sgl_amd_mono.muse_spark.gfx1250.layer import K1Build, build_k1
 
             no_capture("K1 first reached")
-            self._k1["k1"] = build_k1(
+            self._k1[rows] = build_k1(
                 K1Build(
-                    tokens=MAX_TOKENS,
+                    tokens=rows,
                     fault_site=self.fault_site,
                     fault_after=self.fault_after,
                 )
             )
-        return self._k1["k1"]
+        return self._k1[rows]
 
-    def layer_kernel(self, next_k1: bool, last: bool):
-        key = next_k1, last
+    def layer_kernel(self, rows: int, q_len: int, next_k1: bool, last: bool):
+        key = rows, q_len, next_k1, last
         if key not in self._layer:
             from sgl_amd_mono.muse_spark.gfx1250.build_layer import (
                 LayerBuild,
@@ -171,8 +181,8 @@ class MuseMonoRunner:
             no_capture(f"Layer V{2 if next_k1 else 1} first reached")
             self._layer[key] = build_layer(
                 LayerBuild(
-                    tokens=MAX_TOKENS,
-                    q_len=MAX_TOKENS,
+                    tokens=rows,
+                    q_len=q_len,
                     npes=self.npes,
                     next_k1=next_k1,
                     last=last,
@@ -188,21 +198,22 @@ class MuseMonoRunner:
             and self.views[index + 1].kind == "mxfp4"
         )
 
-    def precompile(self, rows: int, q_len: int = MAX_TOKENS) -> None:
+    def precompile(self, rows: int, q_len: int = DRAFT_TOKENS) -> None:
         if not self.use_kernels:
             return
-        if (rows, q_len) != (MAX_TOKENS, MAX_TOKENS):
+        if rows not in WIDTHS or q_len != DRAFT_TOKENS or rows % q_len:
             raise ValueError(
-                f"gfx1250 Muse Spark supports rows=q_len=8, got {(rows, q_len)}"
+                f"gfx1250 Muse Spark supports rows in {WIDTHS}, q_len={DRAFT_TOKENS}; "
+                f"got {(rows, q_len)}"
             )
-        compile_only(self.k1_kernel())
+        compile_only(self.k1_kernel(rows))
         variants = {
             (self._next_k1(i), i == len(self.views) - 1)
             for i, view in enumerate(self.views)
             if view.kind == "mxfp4"
         }
         for next_k1, last in variants:
-            compile_only(self.layer_kernel(next_k1, last))
+            compile_only(self.layer_kernel(rows, q_len, next_k1, last))
 
     def cache_reasons(self, backend, pool) -> list[str]:
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
@@ -283,47 +294,57 @@ class MuseMonoRunner:
             # by captured torch ops before each layer launch.
             request_table = backend.req_to_token
             pages = (request_table.shape[1] + PAGE - 1) // PAGE
+            max_requests = MAX_TOKENS // DRAFT_TOKENS
             self.slot_row = torch.empty(
-                (1, request_table.shape[1]),
+                (max_requests, request_table.shape[1]),
                 dtype=request_table.dtype,
                 device=request_table.device,
             )
             self.full_page_table = torch.empty(
-                (1, pages), dtype=torch.int32, device=request_table.device
+                (max_requests, pages), dtype=torch.int32, device=request_table.device
             )
             self.swa_page_starts = torch.empty(
-                (pages,), dtype=self.swa_map.dtype, device=request_table.device
+                (max_requests * pages,),
+                dtype=self.swa_map.dtype,
+                device=request_table.device,
             )
             self.swa_page_table = torch.empty_like(self.full_page_table)
         self.backend, self.pool = backend, pool
 
-    def _triton_page_table(self, is_swa: bool, forward_batch) -> torch.Tensor:
+    def _triton_page_table(
+        self, is_swa: bool, forward_batch, requests: int
+    ) -> torch.Tensor:
         """Build the absolute page table from Triton's graph-stable request table."""
-        request = forward_batch.req_pool_indices[:1]
+        request = forward_batch.req_pool_indices[:requests]
         torch.index_select(
-            self.backend.req_to_token, 0, request, out=self.slot_row
+            self.backend.req_to_token, 0, request, out=self.slot_row[:requests]
         )
-        page_starts = self.slot_row[:, ::PAGE]
-        table = self.full_page_table
+        page_starts = self.slot_row[:requests, ::PAGE]
+        table = self.full_page_table[:requests]
         if is_swa:
             torch.index_select(
                 self.swa_map,
                 0,
                 page_starts.reshape(-1),
-                out=self.swa_page_starts,
+                out=self.swa_page_starts[: page_starts.numel()],
             )
-            page_starts = self.swa_page_starts.reshape(1, -1)
-            table = self.swa_page_table
+            page_starts = self.swa_page_starts[: page_starts.numel()].reshape(
+                requests, -1
+            )
+            table = self.swa_page_table[:requests]
         torch.div(page_starts, PAGE, rounding_mode="floor", out=table)
         return table
 
-    def _attention_args(self, index: int, forward_batch) -> tuple:
+    def _attention_args(
+        self, index: int, rows: int, q_len: int, forward_batch
+    ) -> tuple:
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
         metadata = self.backend.forward_metadata
         _, _, is_swa = self.caches[index]
+        requests = rows // q_len
         table = (
-            self._triton_page_table(is_swa, forward_batch)
+            self._triton_page_table(is_swa, forward_batch, requests)
             if isinstance(self.backend, TritonAttnBackend)
             else metadata.swa_page_table
             if is_swa
@@ -339,11 +360,20 @@ class MuseMonoRunner:
                 f"gfx1250 K-attn page table: "
                 f"{None if table is None else (table.dtype, tuple(table.shape))}"
             )
-        if forward_batch.seq_lens.numel() != 1:
-            raise RuntimeError("gfx1250 width 8 currently supports one request")
-        self.prefix.copy_(forward_batch.seq_lens[:1])
+        if forward_batch.seq_lens.numel() < requests or table.shape[0] < requests:
+            raise RuntimeError(
+                f"gfx1250 attention needs {requests} requests, got "
+                f"{forward_batch.seq_lens.numel()} lengths and table {tuple(table.shape)}"
+            )
+        self.prefix[:requests].copy_(forward_batch.seq_lens[:requests])
         scale = float(self.modules[index].self_attn.attn.scaling)
-        return _ptr(table), _ptr(self.prefix), self.windows[index], _f32_bits(scale)
+        return (
+            _ptr(table),
+            table.stride(0),
+            _ptr(self.prefix),
+            self.windows[index],
+            _f32_bits(scale),
+        )
 
     def launch(
         self,
@@ -361,7 +391,9 @@ class MuseMonoRunner:
         if (
             not self.use_kernels
             or view.kind != "mxfp4"
-            or (rows, q_len) != (MAX_TOKENS, MAX_TOKENS)
+            or rows not in WIDTHS
+            or q_len != DRAFT_TOKENS
+            or rows % q_len
         ):
             result = self.modules[i](
                 positions,
@@ -397,7 +429,7 @@ class MuseMonoRunner:
         mapping = self.swa_map
         cos_sin = view.cos_sin if view.cos_sin is not None else self.any_cos_sin
         if self._k1_done != i:
-            self.k1_kernel()(
+            self.k1_kernel(rows)(
                 _ptr(attn_input),
                 _ptr(view.w_qkvg),
                 _ptr(cos_sin),
@@ -431,14 +463,17 @@ class MuseMonoRunner:
             if next_view.cos_sin is not None
             else self.any_cos_sin
         )
-        table, prefix, window, scale_bits = self._attention_args(i, forward_batch)
+        table, table_stride, prefix, window, scale_bits = self._attention_args(
+            i, rows, q_len, forward_batch
+        )
         last = i == len(self.modules) - 1
-        self.layer_kernel(next_k1, last)(
+        self.layer_kernel(rows, q_len, next_k1, last)(
             _ptr(self.q),
             _ptr(self.o),
             k_cache,
             v_cache,
             table,
+            table_stride,
             prefix,
             window,
             scale_bits,

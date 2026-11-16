@@ -33,7 +33,7 @@ def _worker(rank, port, queue):
     from sgl_amd_mono.muse_spark.gfx1250.config import (
         HEAD_DIM,
         HIDDEN,
-        MAX_TOKENS,
+        DRAFT_TOKENS as MAX_TOKENS,
         MOE_HIDDEN,
         Q_K,
         RMS_EPS,

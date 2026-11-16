@@ -10,14 +10,14 @@ from flydsl.expr.typing import Int32, Int64
 from sgl_amd_mono.common.epoch import kernel_symbol
 from sgl_amd_mono.common.plan import kernel_sources, key_tuple
 from sgl_amd_mono.common.sync import Mailbox, sreg
-from sgl_amd_mono.muse_spark.gfx1250.config import MAX_TOKENS
+from sgl_amd_mono.muse_spark.gfx1250.config import DRAFT_TOKENS, MAX_TOKENS, WIDTHS
 from sgl_amd_mono.muse_spark.gfx1250.device import mailbox_guard, step_tag
 from sgl_amd_mono.muse_spark.gfx1250.layout import (
-    KATTN_TASK_ROUNDS,
-    KATTN_TASKS,
     RESIDENT_BLOCKS,
     THREADS,
+    kattn_tasks,
     k1_scratch_layout,
+    resident_rounds,
 )
 from sgl_amd_mono.muse_spark.gfx1250.stages import attention, pre_attn
 
@@ -33,9 +33,9 @@ class K1Build(msgspec.Struct, frozen=True):
 
 
 def build_k1(key: K1Build):
-    """Build the eight-row gfx1250 TP4 K1 launcher."""
-    if key.tokens != MAX_TOKENS:
-        raise ValueError(f"gfx1250 K1 V1 supports {MAX_TOKENS} rows, got {key.tokens}")
+    """Build a gfx1250 TP4 K1 launcher."""
+    if key.tokens not in WIDTHS:
+        raise ValueError(f"gfx1250 K1 supports widths {WIDTHS}, got {key.tokens}")
     if key.resident_blocks != RESIDENT_BLOCKS:
         raise ValueError(
             f"K1 profile has {RESIDENT_BLOCKS} resident blocks, "
@@ -169,15 +169,15 @@ def build_k1(key: K1Build):
 
 class KAttnBuild(msgspec.Struct, frozen=True):
     tokens: int
-    q_len: int = 8
+    q_len: int = DRAFT_TOKENS
     resident_blocks: int = RESIDENT_BLOCKS
 
 
 def build_kattn(key: KAttnBuild):
-    """Build the correctness-first eight-row gfx1250 TP4 K-attn launcher."""
-    if (key.tokens, key.q_len) != (MAX_TOKENS, MAX_TOKENS):
+    """Build the correctness-first gfx1250 TP4 K-attn launcher."""
+    if key.tokens not in WIDTHS or key.q_len != DRAFT_TOKENS or key.tokens % key.q_len:
         raise ValueError(
-            f"gfx1250 K-attn V1 supports tokens=q_len={MAX_TOKENS}, "
+            f"gfx1250 K-attn supports tokens in {WIDTHS}, q_len={DRAFT_TOKENS}; "
             f"got {(key.tokens, key.q_len)}"
         )
     if key.resident_blocks != RESIDENT_BLOCKS:
@@ -201,6 +201,7 @@ def build_kattn(key: KAttnBuild):
         k_cache: Int64,
         v_cache: Int64,
         table: Int64,
+        table_stride: Int32,
         prefix_lens: Int64,
         window: Int32,
         scale_bits: Int32,
@@ -214,15 +215,19 @@ def build_kattn(key: KAttnBuild):
             "k_cache": k_cache,
             "v_cache": v_cache,
             "table": table,
+            "table_stride": table_stride,
             "prefix_lens": prefix_lens,
             "window": window,
             "scale_bits": scale_bits,
         }
-        for task_round in range_constexpr(KATTN_TASK_ROUNDS):
+        for task_round in range_constexpr(
+            resident_rounds(kattn_tasks(key.tokens))
+        ):
             task = bid + task_round * RESIDENT_BLOCKS
-            if task < KATTN_TASKS:
+            if task < kattn_tasks(key.tokens):
                 attention.run_kattn(
                     {
+                        "QL": key.q_len,
                         "tid": tid,
                         "bid": task,
                         "lane": tid % 32,
@@ -240,6 +245,7 @@ def build_kattn(key: KAttnBuild):
         k_cache: Int64,
         v_cache: Int64,
         table: Int64,
+        table_stride: Int32,
         prefix_lens: Int64,
         window: Int32,
         scale_bits: Int32,
@@ -252,6 +258,7 @@ def build_kattn(key: KAttnBuild):
             k_cache,
             v_cache,
             table,
+            table_stride,
             prefix_lens,
             window,
             scale_bits,

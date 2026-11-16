@@ -123,51 +123,61 @@ def stage_gemv(c, task):
     S, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     red, put, part, args = c["red"], c["put"], c["part"], c["args"]
     row_group, kpart = task // K_PARTS, task % K_PARTS
-    outputs = GEMV_ROWS_PER_TASK_GROUP * S
     r_w, r_x = rsrc(args["w"], QKVG_ROWS * HIDDEN * 2), rsrc(args["x"])
-    token = fx.min(lane % 16, S - 1)
 
-    b_fragments = [
-        _fragment(
-            r_x,
-            token * HIDDEN,
-            kpart * K_PART + wave * K_PER_WAVE + step * WMMA_K,
-            lane,
-        )
-        for step in range(K_STEPS)
-    ]
-    for tile in range_constexpr(GEMV_ROW_TILES):
-        model_row = row_group * GEMV_ROWS_PER_TASK_GROUP + tile * ROWS + lane % 16
-        acc = fx.Vector.filled(WMMA_ACCUMULATORS, 0.0, fx.Float32)
-        for step in range_constexpr(K_STEPS):
-            a = _fragment(
-                r_w,
-                model_row * HIDDEN,
+    for token_tile in range_constexpr((S + ROWS - 1) // ROWS):
+        tile_start = token_tile * ROWS
+        tile_rows = min(ROWS, S - tile_start)
+        token_local = fx.min(lane % ROWS, tile_rows - 1)
+        token = tile_start + token_local
+        b_fragments = [
+            _fragment(
+                r_x,
+                token * HIDDEN,
                 kpart * K_PART + wave * K_PER_WAVE + step * WMMA_K,
                 lane,
-                cache_modifier=2,
             )
-            acc = _wmma(a, b_fragments[step], acc)
-        fx.ptr_store(
-            acc,
-            red
-            + tile * RED_FLOATS
-            + (wave * 32 + lane) * WMMA_ACCUMULATORS,
-        )
-    gpu.barrier()
-    for batch in range_constexpr((outputs + THREADS - 1) // THREADS):
-        out = tid + batch * THREADS
-        if out < outputs:
-            row, token = out % GEMV_ROWS_PER_TASK_GROUP, out // GEMV_ROWS_PER_TASK_GROUP
-            value = _row_sum_w32(red, row, token)
-            put(
-                part,
-                (kpart * MAX_TOKENS + token) * QKVG_ROWS
-                + row_group * GEMV_ROWS_PER_TASK_GROUP
-                + row,
-                value,
+            for step in range(K_STEPS)
+        ]
+        for tile in range_constexpr(GEMV_ROW_TILES):
+            model_row = (
+                row_group * GEMV_ROWS_PER_TASK_GROUP
+                + tile * ROWS
+                + lane % ROWS
             )
-    gpu.barrier()
+            acc = fx.Vector.filled(WMMA_ACCUMULATORS, 0.0, fx.Float32)
+            for step in range_constexpr(K_STEPS):
+                a = _fragment(
+                    r_w,
+                    model_row * HIDDEN,
+                    kpart * K_PART + wave * K_PER_WAVE + step * WMMA_K,
+                    lane,
+                    cache_modifier=2,
+                )
+                acc = _wmma(a, b_fragments[step], acc)
+            fx.ptr_store(
+                acc,
+                red
+                + tile * RED_FLOATS
+                + (wave * 32 + lane) * WMMA_ACCUMULATORS,
+            )
+        gpu.barrier()
+        outputs = GEMV_ROWS_PER_TASK_GROUP * tile_rows
+        for batch in range_constexpr((outputs + THREADS - 1) // THREADS):
+            out = tid + batch * THREADS
+            if out < outputs:
+                row = out % GEMV_ROWS_PER_TASK_GROUP
+                local_token = out // GEMV_ROWS_PER_TASK_GROUP
+                value = _row_sum_w32(red, row, local_token)
+                put(
+                    part,
+                    (kpart * MAX_TOKENS + tile_start + local_token)
+                    * QKVG_ROWS
+                    + row_group * GEMV_ROWS_PER_TASK_GROUP
+                    + row,
+                    value,
+                )
+        gpu.barrier()
 
 
 def _four_partials(poll, part, token, row):
@@ -192,11 +202,12 @@ def _four_partials(poll, part, token, row):
 
 
 @flyc.jit
-def stage_head(c, head):
+def stage_head(c, head, token_offset):
     """Reduce one q/k/v head, normalize q/k, apply RoPE, and write K/V cache."""
     S, tid = c["S"], c["tid"]
     poll, part, args = c["poll"], c["part"], c["args"]
-    token, lane16 = tid // TOKEN_LANES, tid % TOKEN_LANES
+    token = token_offset + tid // TOKEN_LANES
+    lane16 = tid % TOKEN_LANES
     if token < S:
         is_q = head < LOCAL_Q_HEADS
         is_k = (head >= LOCAL_Q_HEADS) & (
@@ -313,10 +324,11 @@ def stage_head(c, head):
 
 
 @flyc.jit
-def stage_gate(c, gate):
+def stage_gate(c, gate, token_offset):
     """Reduce one 64-row output-gate head."""
     S, tid = c["S"], c["tid"]
-    token, lane16 = tid // TOKEN_LANES, tid % TOKEN_LANES
+    token = token_offset + tid // TOKEN_LANES
+    lane16 = tid % TOKEN_LANES
     if token < S:
         dim = lane16 * ELEMS
         values = _four_partials(
@@ -337,10 +349,17 @@ def run_k1(c, block):
         task = block + task_round * RESIDENT_BLOCKS
         if task < GEMV_TASKS:
             stage_gemv(c, task)
-    if block < HEAD_TASKS:
-        stage_head(c, block - HEAD_TASK_BASE)
-    if (block >= GATE_TASK_BASE) & (block < GATE_TASK_BASE + GATE_TASKS):
-        stage_gate(c, block - GATE_TASK_BASE)
+    tokens_per_round = THREADS // TOKEN_LANES
+    for token_round in range_constexpr(
+        (c["S"] + tokens_per_round - 1) // tokens_per_round
+    ):
+        token_offset = token_round * tokens_per_round
+        if block < HEAD_TASKS:
+            stage_head(c, block - HEAD_TASK_BASE, token_offset)
+        if (block >= GATE_TASK_BASE) & (
+            block < GATE_TASK_BASE + GATE_TASKS
+        ):
+            stage_gate(c, block - GATE_TASK_BASE, token_offset)
 
 
 def k1_lds():

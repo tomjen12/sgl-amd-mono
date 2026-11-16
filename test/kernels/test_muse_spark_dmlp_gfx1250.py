@@ -107,17 +107,17 @@ def _close(got, expected, what):
     assert cosine.min().item() > 0.998, f"{what}: cosine {cosine.min().item():.6f}"
 
 
-def _run_rank(rank, npes, group=None):
+def _run_rank(rank, npes, rows, group=None):
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
     from sgl_amd_mono.muse_spark.gfx1250 import draft_mlp as D
-    from sgl_amd_mono.muse_spark.gfx1250.draft_config import HIDDEN, MAX_TOKENS
+    from sgl_amd_mono.muse_spark.gfx1250.draft_config import HIDDEN
 
     device = torch.device("cuda", rank)
     torch.cuda.set_device(rank)
     generator = torch.Generator(device=device).manual_seed(1251)
-    res = torch.randn(MAX_TOKENS, HIDDEN, device=device, generator=generator).to(torch.bfloat16)
-    attn = (0.5 * torch.randn(MAX_TOKENS, HIDDEN, device=device, generator=generator)).to(torch.bfloat16)
+    res = torch.randn(rows, HIDDEN, device=device, generator=generator).to(torch.bfloat16)
+    attn = (0.5 * torch.randn(rows, HIDDEN, device=device, generator=generator)).to(torch.bfloat16)
     shared, local = _weights(device, rank)
     if group is not None:
         # Make the replicated TP inputs explicit; device RNG streams are not an
@@ -143,7 +143,7 @@ def _run_rank(rank, npes, group=None):
     res_out = torch.empty_like(res)
     out = torch.empty_like(res)
     epoch = _epoch(device)
-    launch = D.build_dmlp(D.DMLPBuild(npes=npes))
+    launch = D.build_dmlp(D.DMLPBuild(tokens=rows, npes=npes))
     try:
         if group is not None:
             torch.distributed.barrier()
@@ -171,17 +171,18 @@ def _run_rank(rank, npes, group=None):
     ),
     reason="needs a gfx1250 GPU",
 )
-def test_gfx1250_dmlp_width8_tp1():
-    _run_rank(0, 1)
+@pytest.mark.parametrize("rows", [8, 16, 32, 64])
+def test_gfx1250_dmlp_tp1(rows):
+    _run_rank(0, 1, rows)
 
 
-def _worker(rank, port, queue):
+def _worker(rank, port, queue, rows):
     import torch.distributed as dist
 
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
     try:
         dist.init_process_group("gloo", rank=rank, world_size=NP)
-        _run_rank(rank, NP, dist.group.WORLD)
+        _run_rank(rank, NP, rows, dist.group.WORLD)
         queue.put((rank, None))
     except Exception as error:
         queue.put((rank, repr(error)))
@@ -198,13 +199,17 @@ def _worker(rank, port, queue):
     ),
     reason="needs four gfx1250 GPUs",
 )
-def test_gfx1250_dmlp_width8_tp4_rank_ordered_reduction():
+@pytest.mark.parametrize("rows", [8, 16, 32, 64])
+def test_gfx1250_dmlp_tp4_rank_ordered_reduction(rows):
     import torch.multiprocessing as mp
 
     context = mp.get_context("spawn")
     queue = context.Queue()
     port = 32000 + os.getpid() % 1000
-    processes = [context.Process(target=_worker, args=(rank, port, queue)) for rank in range(NP)]
+    processes = [
+        context.Process(target=_worker, args=(rank, port, queue, rows))
+        for rank in range(NP)
+    ]
     for process in processes:
         process.start()
     results = [queue.get(timeout=1800) for _ in processes]

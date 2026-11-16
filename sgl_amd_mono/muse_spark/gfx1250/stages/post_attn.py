@@ -148,40 +148,43 @@ def stage_norm_gate(c):
 def stage_o_projection(c):
     """Eight full-K O tiles per CTA: one independent tile per wave."""
     lane, wave = c["lane"], c["wave"]
-    token = fx.min(lane % ROWS, MAX_TOKENS - 1)
     r_w, r_x = rsrc(c["w_o"]), rsrc(c["og"])
     tile = c["bid"] * WAVES + wave
     row0 = tile * ROWS
     row = row0 + lane % ROWS
-    acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
-    for step in range_constexpr(Q_K // WMMA_K):
-        k0 = step * WMMA_K
-        acc = _wmma(
-            _fragment(r_w, row * Q_K, k0, lane, cache_modifier=2),
-            _fragment(r_x, token * Q_K, k0, lane),
-            acc,
-        )
-    fx.ptr_store(acc, c["red"] + (wave * 32 + lane) * WMMA_ACC)
-    gpu.barrier()
-    for p in range_constexpr(2):
-        out = c["tid"] + p * THREADS
-        tile_wave = out // (MAX_TOKENS * (ROWS // 2))
-        within = out % (MAX_TOKENS * (ROWS // 2))
-        out_token = within // (ROWS // 2)
-        dim = 2 * (within % (ROWS // 2))
-        element = (c["bid"] * WAVES + tile_wave) * ROWS + dim
-        a0 = bf16_round(_wave_value(c["red"], tile_wave, dim, out_token))
-        a1 = bf16_round(
-            _wave_value(c["red"], tile_wave, dim + 1, out_token)
-        )
-        peer_element = (
-            c["rank"] * MAX_TOKENS + out_token
-        ) * HIDDEN + element
-        for peer in range_constexpr(c["W"]):
-            c["put_bf"](
-                c["peer_attn"][peer], peer_element, [a0, a1]
+    for token0 in range_constexpr((c["S"] + ROWS - 1) // ROWS):
+        token = fx.min(token0 * ROWS + lane % ROWS, c["S"] - 1)
+        acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+        for step in range_constexpr(Q_K // WMMA_K):
+            k0 = step * WMMA_K
+            acc = _wmma(
+                _fragment(r_w, row * Q_K, k0, lane, cache_modifier=2),
+                _fragment(r_x, token * Q_K, k0, lane),
+                acc,
             )
-    gpu.barrier()
+        fx.ptr_store(acc, c["red"] + (wave * 32 + lane) * WMMA_ACC)
+        gpu.barrier()
+        batch = min(ROWS, c["S"] - token0 * ROWS)
+        for p in range_constexpr(4):
+            out = c["tid"] + p * THREADS
+            if out < batch * WAVES * (ROWS // 2):
+                tile_wave = out // (batch * (ROWS // 2))
+                within = out % (batch * (ROWS // 2))
+                out_token = token0 * ROWS + within // (ROWS // 2)
+                dim = 2 * (within % (ROWS // 2))
+                element = (c["bid"] * WAVES + tile_wave) * ROWS + dim
+                a0 = bf16_round(_wave_value(c["red"], tile_wave, dim, within // (ROWS // 2)))
+                a1 = bf16_round(
+                    _wave_value(c["red"], tile_wave, dim + 1, within // (ROWS // 2))
+                )
+                peer_element = (
+                    c["rank"] * MAX_TOKENS + out_token
+                ) * HIDDEN + element
+                for peer in range_constexpr(c["W"]):
+                    c["put_bf"](
+                        c["peer_attn"][peer], peer_element, [a0, a1]
+                    )
+        gpu.barrier()
 
 
 @flyc.jit
@@ -242,58 +245,63 @@ def stage_boundary(c):
 def stage_router_pool(c):
     """Eight full-K router/pooler tiles per CTA, one per wave."""
     lane, wave = c["lane"], c["wave"]
-    token = fx.min(lane % ROWS, MAX_TOKENS - 1)
     r_x, r_w0 = rsrc(c["x"]), rsrc(c["w0"])
     r_w1 = rsrc(c["w1"]) if c["router"] else r_w0
     tile = c["bid"] * WAVES + wave
     row0 = tile * ROWS
     row = row0 + lane % ROWS
-    vacc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
-    for step in range_constexpr(HIDDEN // WMMA_K):
-        k0 = step * WMMA_K
-        x = _fragment(r_x, token * HIDDEN, k0, lane)
-        vacc = _wmma(
-            _fragment(r_w0, row * HIDDEN, k0, lane, cache_modifier=2),
-            x,
-            vacc,
-        )
-        if c["router"]:
+    for token0 in range_constexpr((c["S"] + ROWS - 1) // ROWS):
+        token = fx.min(token0 * ROWS + lane % ROWS, c["S"] - 1)
+        vacc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+        for step in range_constexpr(HIDDEN // WMMA_K):
+            k0 = step * WMMA_K
+            x = _fragment(r_x, token * HIDDEN, k0, lane)
             vacc = _wmma(
-                _fragment(r_w1, row * HIDDEN, k0, lane, cache_modifier=2),
+                _fragment(r_w0, row * HIDDEN, k0, lane, cache_modifier=2),
                 x,
                 vacc,
             )
-    fx.ptr_store(vacc, c["red"] + (wave * 32 + lane) * WMMA_ACC)
-    gpu.barrier()
-    if c["router"]:
-        for p in range_constexpr(4):
-            out = c["tid"] + p * THREADS
-            tile_wave = out // (MAX_TOKENS * ROWS)
-            within = out % (MAX_TOKENS * ROWS)
-            out_token, dim = within // ROWS, within % ROWS
-            value = _wave_value(c["red"], tile_wave, dim, out_token)
-            bo.buffer_store(
-                value,
-                rsrc(c["out"]),
-                out_token * EXPERTS
-                + (c["bid"] * WAVES + tile_wave) * ROWS
-                + dim,
-            )
-    else:
-        for p in range_constexpr(2):
-            out = c["tid"] + p * THREADS
-            tile_wave = out // (MAX_TOKENS * (ROWS // 2))
-            within = out % (MAX_TOKENS * (ROWS // 2))
-            out_token = within // (ROWS // 2)
-            dim = 2 * (within % (ROWS // 2))
-            row = (c["bid"] * WAVES + tile_wave) * ROWS + dim
-            _st_bf2(
-                c["out"],
-                (out_token * MOE_HIDDEN + row) // 2,
-                _wave_value(c["red"], tile_wave, dim, out_token),
-                _wave_value(c["red"], tile_wave, dim + 1, out_token),
-            )
-    gpu.barrier()
+            if c["router"]:
+                vacc = _wmma(
+                    _fragment(r_w1, row * HIDDEN, k0, lane, cache_modifier=2),
+                    x,
+                    vacc,
+                )
+        fx.ptr_store(vacc, c["red"] + (wave * 32 + lane) * WMMA_ACC)
+        gpu.barrier()
+        batch = min(ROWS, c["S"] - token0 * ROWS)
+        if c["router"]:
+            for p in range_constexpr(8):
+                out = c["tid"] + p * THREADS
+                if out < batch * WAVES * ROWS:
+                    tile_wave = out // (batch * ROWS)
+                    within = out % (batch * ROWS)
+                    out_token, dim = token0 * ROWS + within // ROWS, within % ROWS
+                    value = _wave_value(c["red"], tile_wave, dim, within // ROWS)
+                    bo.buffer_store(
+                        value,
+                        rsrc(c["out"]),
+                        out_token * EXPERTS
+                        + (c["bid"] * WAVES + tile_wave) * ROWS
+                        + dim,
+                    )
+        else:
+            for p in range_constexpr(4):
+                out = c["tid"] + p * THREADS
+                if out < batch * WAVES * (ROWS // 2):
+                    tile_wave = out // (batch * (ROWS // 2))
+                    within = out % (batch * (ROWS // 2))
+                    local_token = within // (ROWS // 2)
+                    out_token = token0 * ROWS + local_token
+                    dim = 2 * (within % (ROWS // 2))
+                    output_row = (c["bid"] * WAVES + tile_wave) * ROWS + dim
+                    _st_bf2(
+                        c["out"],
+                        (out_token * MOE_HIDDEN + output_row) // 2,
+                        _wave_value(c["red"], tile_wave, dim, local_token),
+                        _wave_value(c["red"], tile_wave, dim + 1, local_token),
+                    )
+        gpu.barrier()
 
 
 @flyc.jit

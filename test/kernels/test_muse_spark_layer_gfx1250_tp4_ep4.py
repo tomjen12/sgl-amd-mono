@@ -59,7 +59,7 @@ def _worker(rank, port, queue):
         INTER,
         KV_K,
         LOCAL_KV_HEADS,
-        MAX_TOKENS,
+        DRAFT_TOKENS as MAX_TOKENS,
         MOE_HIDDEN,
         Q_K,
         QKVG_ROWS,
@@ -229,7 +229,8 @@ def _worker(rank, port, queue):
                 kattn(
                     case["q"].data_ptr(), split["o"].data_ptr(),
                     case["k_cache"].data_ptr(), case["v_cache"].data_ptr(),
-                    case["table"].data_ptr(), case["prefix"].data_ptr(), window,
+                    case["table"].data_ptr(), case["table"].stride(0),
+                    case["prefix"].data_ptr(), window,
                     case["scale_bits"], stream=stream,
                 )  # fmt: skip
                 torch.cuda.synchronize()
@@ -273,7 +274,8 @@ def _worker(rank, port, queue):
                 fused_launch(
                     fused_q.data_ptr(), fused["o"].data_ptr(),
                     case["k_cache"].data_ptr(), case["v_cache"].data_ptr(),
-                    case["table"].data_ptr(), case["prefix"].data_ptr(), window,
+                    case["table"].data_ptr(), case["table"].stride(0),
+                    case["prefix"].data_ptr(), window,
                     case["scale_bits"], fused_g.data_ptr(), fused["res"].data_ptr(),
                     weights["w_o"].data_ptr(), weights["attn_alpha"].data_ptr(),
                     weights["attn_beta"].data_ptr(), weights["pre_w"].data_ptr(),

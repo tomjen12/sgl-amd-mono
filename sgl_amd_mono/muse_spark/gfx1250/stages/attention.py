@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Correctness-first gfx1250 wave32 K-attn for one eight-row TP4 request."""
+"""Correctness-first gfx1250 wave32 Target attention."""
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -20,7 +20,6 @@ from sgl_amd_mono.muse_spark.gfx1250.config import (
     LOCAL_KV_HEADS,
     LOCAL_Q_HEADS,
     LOG2E,
-    MAX_TOKENS,
     Q_K,
 )
 from sgl_amd_mono.muse_spark.gfx1250.layout import (
@@ -69,10 +68,13 @@ def _load_fp8x8(resource, byte):
     return fx.Vector.from_elements(values, fx.Float32)
 
 
-def _score(args, qv, key, kv_head, lane8, scale):
+def _score(args, qv, request, key, kv_head, lane8, scale):
     page = fx.Int32(
         bo.buffer_load(
-            rsrc(args["table"]), key // 16, vec_width=1, dtype=T.i32
+            rsrc(args["table"]),
+            request * args["table_stride"] + key // 16,
+            vec_width=1,
+            dtype=T.i32,
         )
     )
     slot = page * 16 + key % 16
@@ -89,13 +91,17 @@ def run_kattn(c):
     """One CTA computes one (verify token, local query head) attention row."""
     tid, lane, wave = c["tid"], c["lane"], c["wave"]
     args, stats, partial = c["args"], c["stats"], c["partial"]
-    query_token = c["bid"] // LOCAL_Q_HEADS
+    token = c["bid"] // LOCAL_Q_HEADS
     query_head = c["bid"] % LOCAL_Q_HEADS
     kv_head = query_head // GQA
     lane8 = lane % 8
+    request = token // c["QL"]
+    query_token = token % c["QL"]
 
     prefix = fx.Int32(
-        bo.buffer_load(rsrc(args["prefix_lens"]), 0, vec_width=1, dtype=T.i32)
+        bo.buffer_load(
+            rsrc(args["prefix_lens"]), request, vec_width=1, dtype=T.i32
+        )
     )
     end = prefix + query_token + 1
     begin = fx.Int32(0)
@@ -105,14 +111,14 @@ def run_kattn(c):
     scale = fx.Int32(args["scale_bits"]).bitcast(fx.Float32)
     qv = _load_bf16x8(
         rsrc(args["q"]),
-        query_token * Q_K + query_head * HEAD_DIM + lane8 * 8,
+        token * Q_K + query_head * HEAD_DIM + lane8 * 8,
     )
 
     # Pass 1: a maximum per wave, then one block maximum.
     local_max = fx.Float32(NEG)
     key = begin + wave
     while key < end:
-        score, _ = _score(args, qv, key, kv_head, lane8, scale)
+        score, _ = _score(args, qv, request, key, kv_head, lane8, scale)
         if lane == 0:
             local_max = (score > local_max).select(score, local_max)
         key = key + WAVES
@@ -132,7 +138,7 @@ def run_kattn(c):
     local_sum = fx.Float32(0.0)
     key = begin + wave
     while key < end:
-        score, _ = _score(args, qv, key, kv_head, lane8, scale)
+        score, _ = _score(args, qv, request, key, kv_head, lane8, scale)
         if lane == 0:
             local_sum = local_sum + hw_exp2((score - block_max) * LOG2E)
         key = key + WAVES
@@ -151,7 +157,7 @@ def run_kattn(c):
     output = fx.Vector.filled(8, 0.0, fx.Float32)
     key = begin + wave
     while key < end:
-        score, slot = _score(args, qv, key, kv_head, lane8, scale)
+        score, slot = _score(args, qv, request, key, kv_head, lane8, scale)
         probability = bf16_round(hw_exp2((score - block_max) * LOG2E) / block_sum)
         byte = (slot * LOCAL_KV_HEADS + kv_head) * HEAD_DIM + lane8 * 8
         value = _load_fp8x8(rsrc(args["v_cache"]), byte)
@@ -171,7 +177,7 @@ def run_kattn(c):
         bo.buffer_store(
             total.to(fx.BFloat16),
             rsrc(args["out"]),
-            query_token * Q_K + query_head * HEAD_DIM + tid * 8,
+            token * Q_K + query_head * HEAD_DIM + tid * 8,
         )
 
 
@@ -211,27 +217,30 @@ def _fused_bf16(address, element):
     return ((element & 1) == 0).select(lo, hi)
 
 
-def _fused_slot(args, key):
+def _fused_slot(args, request, key):
     page = fx.Int32(
         bo.buffer_load(
-            rsrc(args["table"]), key // 16, vec_width=1, dtype=T.i32
+            rsrc(args["table"]),
+            request * args["table_stride"] + key // 16,
+            vec_width=1,
+            dtype=T.i32,
         )
     )
     return page * 16 + key % 16
 
 
-def fused_row_coords(tile, row):
+def fused_row_coords(tile, row, tokens):
     """Map one 16-row tile to its two tokens and eight GQA heads each."""
-    kv_head = tile // (MAX_TOKENS // 2)
-    token_pair = tile % (MAX_TOKENS // 2)
+    kv_head = tile // (tokens // 2)
+    token_pair = tile % (tokens // 2)
     logical = token_pair * FUSED_ROWS + row
     token = logical // GQA
     query_head = kv_head * GQA + logical % GQA
     return token, query_head, kv_head
 
 
-def _fused_q_fragment(args, tile, k0, lane):
-    token, query_head, _ = fused_row_coords(tile, lane % FUSED_ROWS)
+def _fused_q_fragment(args, tile, tokens, k0, lane):
+    token, query_head, _ = fused_row_coords(tile, lane % FUSED_ROWS, tokens)
     kh = (lane // FUSED_ROWS) * 8
     values = []
     for half in range_constexpr(2):
@@ -246,9 +255,9 @@ def _fused_q_fragment(args, tile, k0, lane):
     return fx.Vector.from_elements(values, fx.Float32).to(fx.BFloat16)
 
 
-def _fused_k_fragment(args, kv_head, key0, keys, k0, lane):
+def _fused_k_fragment(args, request, kv_head, key0, keys, k0, lane):
     key = fx.min(key0 + lane % FUSED_ROWS, keys - 1)
-    slot = _fused_slot(args, key)
+    slot = _fused_slot(args, request, key)
     kh = (lane // FUSED_ROWS) * 8
     values = []
     for half in range_constexpr(2):
@@ -271,14 +280,14 @@ def _fused_wmma(a, b, acc):
     return fx.Vector(result)
 
 
-def _fused_qk(args, tile, key0, keys, lane, scale):
-    _, _, kv_head = fused_row_coords(tile, fx.Int32(0))
+def _fused_qk(args, tile, tokens, request, key0, keys, lane, scale):
+    _, _, kv_head = fused_row_coords(tile, fx.Int32(0), tokens)
     acc = fx.Vector.filled(FUSED_WMMA_ACC, 0.0, fx.Float32)
     for step in range_constexpr(HEAD_DIM // FUSED_WMMA_K):
         k0 = step * FUSED_WMMA_K
         acc = _fused_wmma(
-            _fused_q_fragment(args, tile, k0, lane),
-            _fused_k_fragment(args, kv_head, key0, keys, k0, lane),
+            _fused_q_fragment(args, tile, tokens, k0, lane),
+            _fused_k_fragment(args, request, kv_head, key0, keys, k0, lane),
             acc,
         )
     return acc * scale
@@ -353,10 +362,14 @@ def run_fused_attn(c):
     stats, glob, part = c["stats"], c["global"], c["part"]
     wave_stats, row_stats = c["wave_stats"], c["row_stats"]
 
+    token0, _, _ = fused_row_coords(tile, fx.Int32(0), c["S"])
+    request = token0 // c["QL"]
     prefix = fx.Int32(
-        bo.buffer_load(rsrc(args["prefix_lens"]), 0, vec_width=1, dtype=T.i32)
+        bo.buffer_load(
+            rsrc(args["prefix_lens"]), request, vec_width=1, dtype=T.i32
+        )
     )
-    keys = prefix + MAX_TOKENS
+    keys = prefix + c["QL"]
     scale = fx.Int32(args["scale_bits"]).bitcast(fx.Float32)
 
     # Each wave owns block split*8 + wave + iteration*48.  Every block has two
@@ -368,12 +381,14 @@ def run_fused_attn(c):
         block0 = block * FUSED_KEY_BLOCK
         for chunk in range_constexpr(2):
             key0 = block0 + chunk * FUSED_KEY_TILE
-            scores = _fused_qk(args, tile, key0, keys, lane, scale)
+            scores = _fused_qk(
+                args, tile, c["S"], request, key0, keys, lane, scale
+            )
             key = key0 + lane % FUSED_ROWS
             for element in range_constexpr(FUSED_WMMA_ACC):
                 row = (lane // FUSED_ROWS) * 8 + element
-                token, _, _ = fused_row_coords(tile, row)
-                end = prefix + token + 1
+                token, _, _ = fused_row_coords(tile, row, c["S"])
+                end = prefix + token % c["QL"] + 1
                 begin = fx.Int32(0)
                 if args["window"] > 0:
                     begin = fx.max(end - args["window"], fx.Int32(0))
@@ -414,12 +429,14 @@ def run_fused_attn(c):
         block0 = block * FUSED_KEY_BLOCK
         for chunk in range_constexpr(2):
             key0 = block0 + chunk * FUSED_KEY_TILE
-            scores = _fused_qk(args, tile, key0, keys, lane, scale)
+            scores = _fused_qk(
+                args, tile, c["S"], request, key0, keys, lane, scale
+            )
             key = key0 + lane % FUSED_ROWS
             for element in range_constexpr(FUSED_WMMA_ACC):
                 row = (lane // FUSED_ROWS) * 8 + element
-                token, _, _ = fused_row_coords(tile, row)
-                end = prefix + token + 1
+                token, _, _ = fused_row_coords(tile, row, c["S"])
+                end = prefix + token % c["QL"] + 1
                 begin = fx.Int32(0)
                 if args["window"] > 0:
                     begin = fx.max(end - args["window"], fx.Int32(0))
@@ -518,12 +535,14 @@ def run_fused_attn(c):
         block0 = block * FUSED_KEY_BLOCK
         for chunk in range_constexpr(2):
             key0 = block0 + chunk * FUSED_KEY_TILE
-            scores = _fused_qk(args, tile, key0, keys, lane, scale)
+            scores = _fused_qk(
+                args, tile, c["S"], request, key0, keys, lane, scale
+            )
             key = key0 + lane % FUSED_ROWS
             for element in range_constexpr(FUSED_WMMA_ACC):
                 row = (lane // FUSED_ROWS) * 8 + element
-                token, _, _ = fused_row_coords(tile, row)
-                end = prefix + token + 1
+                token, _, _ = fused_row_coords(tile, row, c["S"])
+                end = prefix + token % c["QL"] + 1
                 begin = fx.Int32(0)
                 if args["window"] > 0:
                     begin = fx.max(end - args["window"], fx.Int32(0))
@@ -572,7 +591,7 @@ def run_fused_attn(c):
                 for element in range_constexpr(8)
             ]
         p_fragment = fx.Vector.from_elements(p_values, fx.BFloat16)
-        _, _, kv_head = fused_row_coords(tile, fx.Int32(0))
+        _, _, kv_head = fused_row_coords(tile, fx.Int32(0), c["S"])
         for dim_tile in range_constexpr(FUSED_DIM_TILES):
             v_values = []
             dim = dim_tile * FUSED_ROWS + lane % FUSED_ROWS
@@ -580,7 +599,7 @@ def run_fused_attn(c):
                 for element in range_constexpr(8):
                     key = block0 + half * 16 + kh + element
                     safe_key = fx.min(key, keys - 1)
-                    slot = _fused_slot(args, safe_key)
+                    slot = _fused_slot(args, request, safe_key)
                     byte = (
                         (slot * LOCAL_KV_HEADS + kv_head) * HEAD_DIM + dim
                     )
@@ -652,7 +671,7 @@ def run_fused_attn(c):
                         cache_modifier=2,
                     )
                 )
-            token, query_head, _ = fused_row_coords(tile, row)
+            token, query_head, _ = fused_row_coords(tile, row, c["S"])
             bo.buffer_store(
                 total.to(fx.BFloat16),
                 rsrc(args["out"]),

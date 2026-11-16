@@ -25,6 +25,7 @@ from sgl_amd_mono.common.sync import Mailbox, preg, sreg
 from sgl_amd_mono.muse_spark.gfx1250.build_k2 import k2_scratch_layout
 from sgl_amd_mono.muse_spark.gfx1250.build_k3 import _scratch_layout as k3_scratch_layout
 from sgl_amd_mono.muse_spark.gfx1250.config import (
+    DRAFT_TOKENS,
     EXPERTS,
     HEAD_DIM,
     HIDDEN,
@@ -32,13 +33,17 @@ from sgl_amd_mono.muse_spark.gfx1250.config import (
     MOE_HIDDEN,
     Q_K,
     TOP_K,
+    WIDTHS,
 )
 from sgl_amd_mono.muse_spark.gfx1250.device import mailbox_guard, step_tag
 from sgl_amd_mono.muse_spark.gfx1250.layout import (
     KATTN_TASKS,
     RESIDENT_BLOCKS,
     THREADS,
+    fused_tasks,
+    kattn_tasks,
     k1_scratch_layout,
+    resident_rounds,
 )
 from sgl_amd_mono.muse_spark.gfx1250.stages import (
     attention,
@@ -130,8 +135,8 @@ def layer_sym_bytes(npes):
 
 
 class LayerBuild(msgspec.Struct, frozen=True):
-    tokens: int = MAX_TOKENS
-    q_len: int = MAX_TOKENS
+    tokens: int = DRAFT_TOKENS
+    q_len: int = DRAFT_TOKENS
     npes: int = 4
     next_k1: bool = False
     last: bool = False
@@ -165,7 +170,7 @@ def _finish_attention_tile(c):
         if c["wave"] == 0:
             for row in range_constexpr(attention.FUSED_ROWS):
                 token, query_head, _ = attention.fused_row_coords(
-                    c["tile"], row
+                    c["tile"], row, c["S"]
                 )
                 task = token * (Q_K // HEAD_DIM) + query_head
                 post_attn.stage_norm_gate(
@@ -183,7 +188,7 @@ def _finish_attention_tile(c):
         )
         if c["tid"] < attention.FUSED_ROWS:
             token, query_head, _ = attention.fused_row_coords(
-                c["tile"], c["tid"]
+                c["tile"], c["tid"], c["S"]
             )
             task = token * (Q_K // HEAD_DIM) + query_head
             c["put"](c["attn_done"], task, fx.Int32(1))
@@ -197,9 +202,9 @@ def build_layer(key: LayerBuild):
     rank/epoch controls.  ``o`` is both K-attention output and K2 norm/gate input;
     ``res`` is updated by both boundaries.
     """
-    if (key.tokens, key.q_len) != (MAX_TOKENS, MAX_TOKENS):
+    if key.tokens not in WIDTHS or key.q_len != DRAFT_TOKENS or key.tokens % key.q_len:
         raise ValueError(
-            f"gfx1250 fused layer supports tokens=q_len={MAX_TOKENS}, "
+            f"gfx1250 fused layer supports tokens in {WIDTHS}, q_len={DRAFT_TOKENS}; "
             f"got {(key.tokens, key.q_len)}"
         )
     if key.npes not in (1, 4):
@@ -211,7 +216,7 @@ def build_layer(key: LayerBuild):
             f"Layer profile has {RESIDENT_BLOCKS} resident blocks, "
             f"got {key.resident_blocks}"
         )
-    if RESIDENT_BLOCKS != attention.FUSED_TASKS:
+    if RESIDENT_BLOCKS != 96:
         raise ValueError(
             "gfx1250 fused Target attention supports only cu96_tp4; "
             f"active profile has {RESIDENT_BLOCKS} resident blocks"
@@ -253,6 +258,7 @@ def build_layer(key: LayerBuild):
         k_cache: Int64,
         v_cache: Int64,
         table: Int64,
+        table_stride: Int32,
         prefix_lens: Int64,
         window: Int32,
         scale_bits: Int32,
@@ -348,59 +354,71 @@ def build_layer(key: LayerBuild):
             )
         }
 
-        # All 96 cu96_tp4 CTAs first run one (16-row tile, key split) task.
-        # Split zero merges in fixed order, normalizes/gates its 16 rows, then
-        # publishes the existing 256-row attn_done contract.
+        # The 96 cu96_tp4 CTAs grid-stride all (16-row tile, key split) tasks.
         attn_args = {
             "q": q,
             "out": o,
             "k_cache": k_cache,
             "v_cache": v_cache,
             "table": table,
+            "table_stride": table_stride,
             "prefix_lens": prefix_lens,
             "window": window,
             "scale_bits": scale_bits,
         }
-        tile, split = bid // attention.FUSED_SPLITS, bid % attention.FUSED_SPLITS
-        attention.run_fused_attn(
-            {
-                "tid": tid,
-                "lane": lane,
-                "wave": wave,
-                "tile": tile,
-                "split": split,
-                "mb": mb,
-                "wave_stats": lds.attn.wave_stats.ptr,
-                "row_stats": lds.attn.row_stats.ptr,
-                "probabilities": lds.attn.probabilities.ptr,
-                "pv": lds.attn.pv.ptr,
-                **attn_regions,
-                "args": attn_args,
-            }
-        )
-        _finish_attention_tile(
-            {
-                "tid": tid,
-                "lane": lane,
-                "wave": wave,
-                "tile": tile,
-                "split": split,
-                "o": o,
-                "g": g,
-                "og": addr(scratch, "k2_og"),
-                "put": mb.put,
-                "attn_done": flags["attn_done"],
-            }
-        )
+        for task_round in range_constexpr(
+            resident_rounds(fused_tasks(key.tokens))
+        ):
+            task = bid + task_round * RESIDENT_BLOCKS
+            if task < fused_tasks(key.tokens):
+                tile = task // attention.FUSED_SPLITS
+                split = task % attention.FUSED_SPLITS
+                attention.run_fused_attn(
+                    {
+                        "S": key.tokens,
+                        "QL": key.q_len,
+                        "tid": tid,
+                        "lane": lane,
+                        "wave": wave,
+                        "tile": tile,
+                        "split": split,
+                        "mb": mb,
+                        "wave_stats": lds.attn.wave_stats.ptr,
+                        "row_stats": lds.attn.row_stats.ptr,
+                        "probabilities": lds.attn.probabilities.ptr,
+                        "pv": lds.attn.pv.ptr,
+                        **attn_regions,
+                        "args": attn_args,
+                    }
+                )
+                _finish_attention_tile(
+                    {
+                        "S": key.tokens,
+                        "tid": tid,
+                        "lane": lane,
+                        "wave": wave,
+                        "tile": tile,
+                        "split": split,
+                        "o": o,
+                        "g": g,
+                        "og": addr(scratch, "k2_og"),
+                        "put": mb.put,
+                        "attn_done": flags["attn_done"],
+                    }
+                )
 
         if bid < O_GROUPS:
             _wait(
                 mb.poll,
-                [(flags["attn_done"], task, 1) for task in range(KATTN_TASKS)],
+                [
+                    (flags["attn_done"], task, 1)
+                    for task in range(kattn_tasks(key.tokens))
+                ],
             )
             post_attn.stage_o_projection(
                 {
                     "W": W,
+                    "S": key.tokens,
                     "bid": bid,
                     "tid": tid,
                     "lane": lane,
@@ -417,7 +435,7 @@ def build_layer(key: LayerBuild):
                 }
             )
 
-        if bid < MAX_TOKENS:
+        if bid < key.tokens:
             post_attn.stage_boundary(
                 {
                     "W": W,
@@ -442,12 +460,13 @@ def build_layer(key: LayerBuild):
                 mb.poll,
                 [
                     (flags["boundary_done"], token, 1)
-                    for token in range(MAX_TOKENS)
+                    for token in range(key.tokens)
                 ],
             )
             post_attn.stage_router_pool(
                 {
                     "bid": bid,
+                    "S": key.tokens,
                     "tid": tid,
                     "lane": lane,
                     "wave": wave,
@@ -467,12 +486,13 @@ def build_layer(key: LayerBuild):
                 mb.poll,
                 [
                     (flags["boundary_done"], token, 1)
-                    for token in range(MAX_TOKENS)
+                    for token in range(key.tokens)
                 ],
             )
             post_attn.stage_router_pool(
                 {
                     "bid": bid,
+                    "S": key.tokens,
                     "tid": tid,
                     "lane": lane,
                     "wave": wave,
@@ -487,7 +507,7 @@ def build_layer(key: LayerBuild):
             )
             _publish(mb.put, flags["pool_done"], bid, tid)
 
-        if bid < MAX_TOKENS:
+        if bid < key.tokens:
             _wait(
                 mb.poll,
                 [
@@ -571,19 +591,23 @@ def build_layer(key: LayerBuild):
         for region in ("k3_qx", "k3_qmid", "k3_y", "k3_fbuf", "k3_branch"):
             k3[region[3:]] = sreg(scratch, layout[region][0], region)
 
-        if bid < MAX_TOKENS * TOP_K:
-            expert_token = bid // TOP_K
-            _wait(
-                mb.poll,
-                [
-                    (flags["top_done"], expert_token, 1),
-                    (flags["norm_done"], expert_token, 1),
-                ],
-            )
-            ffn.stage_expert_pick(k3)
-            _publish(mb.put, flags["expert_done"], bid, tid)
+        for expert_round in range_constexpr(
+            resident_rounds(key.tokens * TOP_K)
+        ):
+            expert_task = bid + expert_round * RESIDENT_BLOCKS
+            if expert_task < key.tokens * TOP_K:
+                expert_token = expert_task // TOP_K
+                _wait(
+                    mb.poll,
+                    [
+                        (flags["top_done"], expert_token, 1),
+                        (flags["norm_done"], expert_token, 1),
+                    ],
+                )
+                ffn.stage_expert_pick(k3, expert_task)
+                _publish(mb.put, flags["expert_done"], expert_task, tid)
 
-        if bid < MAX_TOKENS:
+        if bid < key.tokens:
             _wait(
                 mb.poll,
                 [
@@ -602,7 +626,7 @@ def build_layer(key: LayerBuild):
                 mb.poll,
                 [
                     (flags["k3_boundary_done"], token, 1)
-                    for token in range(MAX_TOKENS)
+                    for token in range(key.tokens)
                 ],
             )
             pre_attn.run_k1(
@@ -647,6 +671,7 @@ def build_layer(key: LayerBuild):
         k_cache: Int64,
         v_cache: Int64,
         table: Int64,
+        table_stride: Int32,
         prefix_lens: Int64,
         window: Int32,
         scale_bits: Int32,
@@ -705,6 +730,7 @@ def build_layer(key: LayerBuild):
             k_cache,
             v_cache,
             table,
+            table_stride,
             prefix_lens,
             window,
             scale_bits,

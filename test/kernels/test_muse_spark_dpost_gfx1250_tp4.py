@@ -19,7 +19,7 @@ def _free_port():
         return listener.getsockname()[1]
 
 
-def _worker(rank, port, queue):
+def _worker(rank, port, queue, rows):
     import torch.distributed as dist
 
     from test_muse_spark_dhalf_gfx1250 import (
@@ -34,7 +34,6 @@ def _worker(rank, port, queue):
     from sgl_amd_mono.muse_spark.gfx1250 import draft_attn_half as D
     from sgl_amd_mono.muse_spark.gfx1250.draft_config import (
         COEF_ROWS,
-        MAX_TOKENS,
         Q_K,
     )
 
@@ -49,13 +48,13 @@ def _worker(rank, port, queue):
         for source in range(NP):
             generator = torch.Generator(device=device).manual_seed(1260 + source)
             outputs.append(
-                (0.5 * torch.randn(MAX_TOKENS, Q_K, device=device, generator=generator)).to(torch.bfloat16)
+                (0.5 * torch.randn(rows, Q_K, device=device, generator=generator)).to(torch.bfloat16)
             )
             local = _weights(device, 1300 + source)
             local["base"] = shared["base"]
             weights.append(local)
         generator = torch.Generator(device=device).manual_seed(1270)
-        coef = 0.1 * torch.randn(MAX_TOKENS, COEF_ROWS, device=device, generator=generator)
+        coef = 0.1 * torch.randn(rows, COEF_ROWS, device=device, generator=generator)
         expected = _post_reference(outputs, weights, coef)
         got = torch.empty_like(expected)
         scratch = torch.zeros(D.do_scratch_bytes(), dtype=torch.uint8, device=device)
@@ -68,7 +67,7 @@ def _worker(rank, port, queue):
         )
         peers.bytes.zero_()
         epoch = _epoch(device)
-        launch = D.build_dpost(D.DPostBuild(npes=NP))
+        launch = D.build_dpost(D.DPostBuild(tokens=rows, npes=NP))
         torch.cuda.synchronize()
         dist.barrier()
         launch(
@@ -100,14 +99,15 @@ def _worker(rank, port, queue):
     ),
     reason="needs four gfx1250 GPUs",
 )
-def test_gfx1250_dpost_width8_tp4_rank_ordered_reduction():
+@pytest.mark.parametrize("rows", [8, 16, 32, 64])
+def test_gfx1250_dpost_tp4_rank_ordered_reduction(rows):
     import torch.multiprocessing as mp
 
     context = mp.get_context("spawn")
     queue = context.Queue()
     port = _free_port()
     processes = [
-        context.Process(target=_worker, args=(rank, port, queue))
+        context.Process(target=_worker, args=(rank, port, queue, rows))
         for rank in range(NP)
     ]
     for process in processes:

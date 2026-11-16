@@ -42,6 +42,7 @@ from sgl_amd_mono.muse_spark.gfx1250.draft_config import (
     Q_K,
     RESIDENT_BLOCKS,
     RMS_EPS,
+    SUPPORTED_TOKENS,
 )
 
 THREADS = 256
@@ -129,8 +130,10 @@ class DPostBuild(msgspec.Struct, frozen=True):
 
 
 def _validate(tokens: int, resident_blocks: int):
-    if tokens != MAX_TOKENS:
-        raise ValueError(f"first gfx1250 D-attn half supports width {MAX_TOKENS}, got {tokens}")
+    if tokens not in SUPPORTED_TOKENS:
+        raise ValueError(
+            f"gfx1250 D-attn half supports widths {SUPPORTED_TOKENS}, got {tokens}"
+        )
     if resident_blocks not in (96, 192):
         raise ValueError(f"gfx1250 CU profile must be 96 or 192, got {resident_blocks}")
     if resident_blocks != RESIDENT_BLOCKS:
@@ -214,14 +217,17 @@ def _tile_value(red, row, token):
 
 
 @flyc.jit
-def _stage_lds_input(c, region):
-    """Copy all eight tagged BF16 rows into every CTA's LDS."""
-    pair_groups = c["S"] * H // 4
+def _stage_lds_input(c, region, tile_start, tile_rows):
+    """Copy one at-most-16-row tagged BF16 tile into every CTA's LDS."""
+    pair_groups = tile_rows * H // 4
     for j in range_constexpr(pair_groups // THREADS):
-        pair = 2 * (c["tid"] + j * THREADS)
-        got = c["poll"]([(region, pair, 2)])
+        local_pair = 2 * (c["tid"] + j * THREADS)
+        global_pair = tile_start * H // 2 + local_pair
+        got = c["poll"]([(region, global_pair, 2)])
         words = fx.Vector.from_elements([got[0][0], got[0][1]], fx.Int32)
-        fx.ptr_store(words.bitcast(fx.BFloat16), c["xbuf"] + pair * 2)
+        fx.ptr_store(
+            words.bitcast(fx.BFloat16), c["xbuf"] + local_pair * 2
+        )
     gpu.barrier()
 
 
@@ -267,39 +273,45 @@ def stage_norm_in(c):
 @flyc.jit
 def stage_coef(c):
     """Full-K WMMA kernel projection with fp32 coefficients."""
-    _stage_lds_input(c, c["h"])
     lane, wave = c["lane"], c["wave"]
-    token = fx.min(lane % ROWS, c["S"] - 1)
     r_w = rsrc(c["args"]["w_kp"])
-    task = c["bid"]
-    while task < COEF_TASKS:
-        row0 = task * ROWS
-        row = row0 + lane % ROWS
-        acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
-        for step in range_constexpr(K_STEPS):
-            k0 = wave * K_PER_WAVE + step * WMMA_K
-            acc = _wmma(
-                _weight_fragment(r_w, row * H, k0, lane),
-                _lds_fragment(c["xbuf"], token * H, k0, lane),
-                acc,
+    tile_rows = min(ROWS, c["S"])
+    for token_tile in range_constexpr(c["TOKEN_TILES"]):
+        tile_start = token_tile * ROWS
+        _stage_lds_input(c, c["h"], tile_start, tile_rows)
+        token_local = fx.min(lane % ROWS, tile_rows - 1)
+        task = c["bid"]
+        while task < COEF_TASKS:
+            row0 = task * ROWS
+            row = row0 + lane % ROWS
+            acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+            for step in range_constexpr(K_STEPS):
+                k0 = wave * K_PER_WAVE + step * WMMA_K
+                acc = _wmma(
+                    _weight_fragment(r_w, row * H, k0, lane),
+                    _lds_fragment(c["xbuf"], token_local * H, k0, lane),
+                    acc,
+                )
+            fx.ptr_store(
+                acc, c["wmma_red"] + (wave * WAVE_SIZE + lane) * WMMA_ACC
             )
-        fx.ptr_store(
-            acc, c["wmma_red"] + (wave * WAVE_SIZE + lane) * WMMA_ACC
-        )
-        gpu.barrier()
-        if c["tid"] < c["S"] * ROWS:
-            out_token = c["tid"] // ROWS
-            dim = c["tid"] % ROWS
-            value = _tile_value(c["wmma_red"], dim, out_token)
-            out_row = row0 + dim
-            c["put"](c["coef"], out_token * COEF_ROWS + out_row, value)
-            bo.buffer_store(
-                value,
-                rsrc(c["args"]["coef_out"]),
-                out_token * COEF_ROWS + out_row,
-            )
-        gpu.barrier()
-        task = task + c["B"]
+            gpu.barrier()
+            if c["tid"] < tile_rows * ROWS:
+                local_token = c["tid"] // ROWS
+                dim = c["tid"] % ROWS
+                value = _tile_value(c["wmma_red"], dim, local_token)
+                out_token = tile_start + local_token
+                out_row = row0 + dim
+                c["put"](
+                    c["coef"], out_token * COEF_ROWS + out_row, value
+                )
+                bo.buffer_store(
+                    value,
+                    rsrc(c["args"]["coef_out"]),
+                    out_token * COEF_ROWS + out_row,
+                )
+            gpu.barrier()
+            task = task + c["B"]
 
 
 @flyc.jit
@@ -335,39 +347,47 @@ def stage_conv0(c):
 @flyc.jit
 def stage_qkv(c):
     """Full-K QKV WMMA, rounded to BF16 before per-head processing."""
-    _stage_lds_input(c, c["hc"])
     lane, wave = c["lane"], c["wave"]
-    token = fx.min(lane % ROWS, c["S"] - 1)
     r_w = rsrc(c["args"]["w_qkv"])
-    task = c["bid"]
-    while task < QKV_TASKS:
-        row0 = task * ROWS
-        row = row0 + lane % ROWS
-        acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
-        for step in range_constexpr(K_STEPS):
-            k0 = wave * K_PER_WAVE + step * WMMA_K
-            acc = _wmma(
-                _weight_fragment(r_w, row * H, k0, lane),
-                _lds_fragment(c["xbuf"], token * H, k0, lane),
-                acc,
+    tile_rows = min(ROWS, c["S"])
+    for token_tile in range_constexpr(c["TOKEN_TILES"]):
+        tile_start = token_tile * ROWS
+        _stage_lds_input(c, c["hc"], tile_start, tile_rows)
+        token_local = fx.min(lane % ROWS, tile_rows - 1)
+        task = c["bid"]
+        while task < QKV_TASKS:
+            row0 = task * ROWS
+            row = row0 + lane % ROWS
+            acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+            for step in range_constexpr(K_STEPS):
+                k0 = wave * K_PER_WAVE + step * WMMA_K
+                acc = _wmma(
+                    _weight_fragment(r_w, row * H, k0, lane),
+                    _lds_fragment(c["xbuf"], token_local * H, k0, lane),
+                    acc,
+                )
+            fx.ptr_store(
+                acc, c["wmma_red"] + (wave * WAVE_SIZE + lane) * WMMA_ACC
             )
-        fx.ptr_store(
-            acc, c["wmma_red"] + (wave * WAVE_SIZE + lane) * WMMA_ACC
-        )
-        gpu.barrier()
-        if c["tid"] < c["S"] * (ROWS // 2):
-            out_token = c["tid"] // (ROWS // 2)
-            dim = 2 * (c["tid"] % (ROWS // 2))
-            c["put_bf"](
-                c["qkv"],
-                out_token * QKV_ROWS + row0 + dim,
-                [
-                    bf16_round(_tile_value(c["wmma_red"], dim, out_token)),
-                    bf16_round(_tile_value(c["wmma_red"], dim + 1, out_token)),
-                ],
-            )
-        gpu.barrier()
-        task = task + c["B"]
+            gpu.barrier()
+            if c["tid"] < tile_rows * (ROWS // 2):
+                local_token = c["tid"] // (ROWS // 2)
+                out_token = tile_start + local_token
+                dim = 2 * (c["tid"] % (ROWS // 2))
+                c["put_bf"](
+                    c["qkv"],
+                    out_token * QKV_ROWS + row0 + dim,
+                    [
+                        bf16_round(
+                            _tile_value(c["wmma_red"], dim, local_token)
+                        ),
+                        bf16_round(
+                            _tile_value(c["wmma_red"], dim + 1, local_token)
+                        ),
+                    ],
+                )
+            gpu.barrier()
+            task = task + c["B"]
 
 
 def _cs(ptr, pos, index):
@@ -435,41 +455,52 @@ def run_dpre(c):
 def stage_o(c):
     """Full-K O projection WMMA and BF16 rank-partial publication."""
     lane, wave = c["lane"], c["wave"]
-    token = fx.min(lane % ROWS, c["S"] - 1)
     r_w, r_o = rsrc(c["args"]["w_o"]), rsrc(c["args"]["o"])
-    task = c["bid"]
-    while task < O_TASKS:
-        row0 = task * ROWS
-        row = row0 + lane % ROWS
-        acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
-        for step in range_constexpr(O_STEPS):
-            k0 = wave * O_K_PER_WAVE + step * WMMA_K
-            acc = _wmma(
-                _weight_fragment(r_w, row * Q_K, k0, lane),
-                _weight_fragment(
-                    r_o, token * Q_K, k0, lane, cache_modifier=0
-                ),
-                acc,
-            )
-        fx.ptr_store(
-            acc, c["wmma_red"] + (wave * WAVE_SIZE + lane) * WMMA_ACC
-        )
-        gpu.barrier()
-        if c["tid"] < c["S"] * (ROWS // 2):
-            out_token = c["tid"] // (ROWS // 2)
-            dim = 2 * (c["tid"] % (ROWS // 2))
-            element = row0 + dim
-            d0 = bf16_round(_tile_value(c["wmma_red"], dim, out_token))
-            d1 = bf16_round(_tile_value(c["wmma_red"], dim + 1, out_token))
-            peer_element = (c["rank"] * MAX_TOKENS + out_token) * H + element
-            for peer in range_constexpr(c["W"]):
-                c["put_bf"](
-                    c["peer_do"][peer], peer_element, [d0, d1]
+    tile_rows = min(ROWS, c["S"])
+    for token_tile in range_constexpr(c["TOKEN_TILES"]):
+        tile_start = token_tile * ROWS
+        token_local = fx.min(lane % ROWS, tile_rows - 1)
+        token = tile_start + token_local
+        task = c["bid"]
+        while task < O_TASKS:
+            row0 = task * ROWS
+            row = row0 + lane % ROWS
+            acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+            for step in range_constexpr(O_STEPS):
+                k0 = wave * O_K_PER_WAVE + step * WMMA_K
+                acc = _wmma(
+                    _weight_fragment(r_w, row * Q_K, k0, lane),
+                    _weight_fragment(
+                        r_o, token * Q_K, k0, lane, cache_modifier=0
+                    ),
+                    acc,
                 )
-        gpu.barrier()
-        wait_stores()
-        gpu.barrier()
-        task = task + c["B"]
+            fx.ptr_store(
+                acc, c["wmma_red"] + (wave * WAVE_SIZE + lane) * WMMA_ACC
+            )
+            gpu.barrier()
+            if c["tid"] < tile_rows * (ROWS // 2):
+                local_token = c["tid"] // (ROWS // 2)
+                out_token = tile_start + local_token
+                dim = 2 * (c["tid"] % (ROWS // 2))
+                element = row0 + dim
+                d0 = bf16_round(
+                    _tile_value(c["wmma_red"], dim, local_token)
+                )
+                d1 = bf16_round(
+                    _tile_value(c["wmma_red"], dim + 1, local_token)
+                )
+                peer_element = (
+                    (c["rank"] * MAX_TOKENS + out_token) * H + element
+                )
+                for peer in range_constexpr(c["W"]):
+                    c["put_bf"](
+                        c["peer_do"][peer], peer_element, [d0, d1]
+                    )
+            gpu.barrier()
+            wait_stores()
+            gpu.barrier()
+            task = task + c["B"]
 
 
 @flyc.jit
@@ -521,7 +552,7 @@ def build_dpre(key: DPreBuild):
     @fx.struct
     class Lds:
         red: fx.Array[fx.Float32, RED_FLOATS, 16]
-        xbuf: fx.Array[fx.BFloat16, MAX_TOKENS * H, 16]
+        xbuf: fx.Array[fx.BFloat16, ROWS * H, 16]
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def dpre(
@@ -543,7 +574,8 @@ def build_dpre(key: DPreBuild):
             ),
         )
         c = {
-            "S": key.tokens, "B": key.resident_blocks, "tid": tid, "bid": bid,
+            "S": key.tokens, "TOKEN_TILES": (key.tokens + ROWS - 1) // ROWS,
+            "B": key.resident_blocks, "tid": tid, "bid": bid,
             "lane": tid % WAVE_SIZE, "wave": tid // WAVE_SIZE,
             "red": lds.red.ptr, "wmma_red": lds.red.ptr, "xbuf": lds.xbuf.ptr,
             "put": mb.put, "put_bf": mb.put_bf, "poll": mb.poll,
@@ -614,7 +646,8 @@ def build_dpost(key: DPostBuild):
         mb = Mailbox(step_tag(epoch, layer), active_guard)
         bases = peer_bases(peers, key.npes)
         c = {
-            "S": key.tokens, "W": key.npes, "B": key.resident_blocks,
+            "S": key.tokens, "TOKEN_TILES": (key.tokens + ROWS - 1) // ROWS,
+            "W": key.npes, "B": key.resident_blocks,
             "tid": tid, "bid": bid, "lane": tid % WAVE_SIZE,
             "wave": tid // WAVE_SIZE, "rank": rank,
             "wmma_red": lds.red.ptr, "put_bf": mb.put_bf,

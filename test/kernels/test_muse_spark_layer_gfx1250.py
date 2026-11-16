@@ -43,28 +43,55 @@ def _attention_reference(q, k_cache, v_cache, table, keys, window, scale):
         HEAD_DIM,
         LOCAL_KV_HEADS,
         LOCAL_Q_HEADS,
-        MAX_TOKENS,
         Q_K,
     )
 
+    if table.dim() == 2:
+        return torch.cat(
+            [
+                _attention_reference(
+                    q[start : start + 8],
+                    k_cache,
+                    v_cache,
+                    table[request],
+                    keys,
+                    window,
+                    scale,
+                )
+                for request, start in enumerate(range(0, q.shape[0], 8))
+            ]
+        )
+
+    tokens = q.shape[0]
     slots = (
         table[: (keys + 15) // 16].long()[:, None] * 16
         + torch.arange(16, device=q.device)[None, :]
     ).reshape(-1)[:keys]
     key = k_cache[slots].float()
     value = v_cache[slots].float()
-    out = torch.zeros(MAX_TOKENS, Q_K, device=q.device)
-    prefix = keys - MAX_TOKENS
+    out = torch.zeros(tokens, Q_K, device=q.device)
+    prefix = keys - tokens
     key_index = torch.arange(keys, device=q.device)
     group = LOCAL_Q_HEADS // LOCAL_KV_HEADS
-    for token in range(MAX_TOKENS):
+    for token in range(tokens):
         end = prefix + token + 1
         allowed = key_index < end
         if window:
             allowed &= key_index >= max(0, end - window)
         for head in range(LOCAL_Q_HEADS):
             query = q[token, head * HEAD_DIM : (head + 1) * HEAD_DIM].float()
-            logits = scale * (query @ key[:, head // group].T)
+            products = (
+                key[:, head // group] * query
+            ).reshape(keys, 8, 8)
+            lane_sums = torch.zeros(
+                keys, 8, dtype=torch.float32, device=q.device
+            )
+            for element in range(8):
+                lane_sums += products[:, :, element]
+            lanes = torch.arange(8, device=q.device)
+            for offset in (4, 2, 1):
+                lane_sums = lane_sums + lane_sums[:, lanes ^ offset]
+            logits = scale * lane_sums[:, 0]
             logits = torch.where(
                 allowed, logits, torch.full_like(logits, float("-inf"))
             )
@@ -242,7 +269,7 @@ def _make_case(device, seed, keys):
         HIDDEN,
         INTER,
         LOCAL_KV_HEADS,
-        MAX_TOKENS,
+        DRAFT_TOKENS as MAX_TOKENS,
         MOE_HIDDEN,
         Q_K,
         SOFTMAX_SCALE,
@@ -347,10 +374,9 @@ def _make_case(device, seed, keys):
     }
 
 
-def _outputs(device):
+def _outputs(device, rows=8):
     from sgl_amd_mono.muse_spark.gfx1250.config import (
         HIDDEN,
-        MAX_TOKENS,
         MOE_HIDDEN,
         Q_K,
         TOP_K,
@@ -358,23 +384,23 @@ def _outputs(device):
 
     return {
         "o": torch.full(
-            (MAX_TOKENS, Q_K), float("nan"), dtype=torch.bfloat16, device=device
+            (rows, Q_K), float("nan"), dtype=torch.bfloat16, device=device
         ),
         "ids": torch.full(
-            (MAX_TOKENS, TOP_K), -1, dtype=torch.int32, device=device
+            (rows, TOP_K), -1, dtype=torch.int32, device=device
         ),
         "scores": torch.full(
-            (MAX_TOKENS, TOP_K), float("nan"), device=device
+            (rows, TOP_K), float("nan"), device=device
         ),
         "xin": torch.full(
-            (MAX_TOKENS, MOE_HIDDEN),
+            (rows, MOE_HIDDEN),
             float("nan"),
             dtype=torch.bfloat16,
             device=device,
         ),
-        "res": torch.empty(MAX_TOKENS, HIDDEN, device=device),
+        "res": torch.empty(rows, HIDDEN, device=device),
         "attn_out": torch.full(
-            (MAX_TOKENS, HIDDEN),
+            (rows, HIDDEN),
             float("nan"),
             dtype=torch.bfloat16,
             device=device,
@@ -490,7 +516,7 @@ def test_gfx1250_fused_layer_matches_oracle_and_split(keys, window, last):
         layer_sym_bytes,
     )
     from sgl_amd_mono.muse_spark.gfx1250.config import (
-        MAX_TOKENS,
+        DRAFT_TOKENS as MAX_TOKENS,
         SOFTMAX_SCALE,
     )
     from sgl_amd_mono.muse_spark.gfx1250.layer import KAttnBuild, build_kattn
@@ -548,7 +574,8 @@ def test_gfx1250_fused_layer_matches_oracle_and_split(keys, window, last):
             kattn(
                 case["q"].data_ptr(), split["o"].data_ptr(),
                 case["k_cache"].data_ptr(), case["v_cache"].data_ptr(),
-                case["table"].data_ptr(), case["prefix"].data_ptr(), window,
+                case["table"].data_ptr(), case["table"].stride(0),
+                case["prefix"].data_ptr(), window,
                 case["scale_bits"], stream=stream,
             )  # fmt: skip
             k2_launch(
@@ -578,7 +605,8 @@ def test_gfx1250_fused_layer_matches_oracle_and_split(keys, window, last):
             fused_launch(
                 case["q"].data_ptr(), fused["o"].data_ptr(),
                 case["k_cache"].data_ptr(), case["v_cache"].data_ptr(),
-                case["table"].data_ptr(), case["prefix"].data_ptr(), window,
+                case["table"].data_ptr(), case["table"].stride(0),
+                case["prefix"].data_ptr(), window,
                 case["scale_bits"], case["g"].data_ptr(), fused["res"].data_ptr(),
                 weights["w_o"].data_ptr(), weights["attn_alpha"].data_ptr(),
                 weights["attn_beta"].data_ptr(), weights["pre_w"].data_ptr(),
@@ -637,7 +665,7 @@ def test_gfx1250_layer_v2_matches_layer_v1_plus_k1():
         HIDDEN,
         KV_K,
         LOCAL_KV_HEADS,
-        MAX_TOKENS,
+        DRAFT_TOKENS as MAX_TOKENS,
         Q_K,
         QKVG_ROWS,
     )
@@ -726,7 +754,8 @@ def test_gfx1250_layer_v2_matches_layer_v1_plus_k1():
         launch(
             q.data_ptr(), outputs["o"].data_ptr(),
             case["k_cache"].data_ptr(), case["v_cache"].data_ptr(),
-            case["table"].data_ptr(), case["prefix"].data_ptr(), 0,
+            case["table"].data_ptr(), case["table"].stride(0),
+            case["prefix"].data_ptr(), 0,
             case["scale_bits"], gate.data_ptr(), outputs["res"].data_ptr(),
             weights["w_o"].data_ptr(), weights["attn_alpha"].data_ptr(),
             weights["attn_beta"].data_ptr(), weights["pre_w"].data_ptr(),

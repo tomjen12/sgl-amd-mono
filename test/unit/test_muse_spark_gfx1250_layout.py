@@ -7,7 +7,8 @@ from sgl_amd_mono.muse_spark.gfx1250 import layout as L
 
 
 def test_tp4_profile_shapes():
-    assert (C.TP, C.EP, C.WIDTHS) == (4, 4, (8,))
+    assert (C.TP, C.EP, C.MAX_TOKENS) == (4, 4, 64)
+    assert C.WIDTHS == ((8, 16, 32, 64) if C.PROFILE == "cu96_tp4" else (8,))
     assert (C.LOCAL_Q_HEADS, C.LOCAL_KV_HEADS, C.LOCAL_EXPERTS) == (32, 4, 64)
     assert (C.Q_K, C.KV_K, C.G_OFF, C.QKVG_ROWS) == (2048, 256, 2560, 4608)
     assert C.PROFILE in {"cu96_tp4", "cu192_tp4"}
@@ -59,9 +60,9 @@ def test_k1_post_tasks_cover_tp4_heads_and_gates_once():
     ]
 
 
-def test_kattn_maps_all_bs1_query_heads_over_profile_ctas():
+def test_kattn_capacity_maps_all_query_heads_over_profile_ctas():
     assert L.GQA == 8
-    assert L.KATTN_TASKS == C.MAX_TOKENS * C.LOCAL_Q_HEADS == 256
+    assert L.KATTN_TASKS == C.MAX_TOKENS * C.LOCAL_Q_HEADS == 2048
     assigned = [
         block_id + task_round * C.RESIDENT_BLOCKS
         for block_id in range(C.RESIDENT_BLOCKS)
@@ -74,18 +75,47 @@ def test_kattn_maps_all_bs1_query_heads_over_profile_ctas():
 
 
 def test_fused_target_attention_cu96_geometry_and_scratch():
-    assert (L.FUSED_TILES, L.FUSED_SPLITS, L.FUSED_TASKS) == (16, 6, 96)
+    assert (L.FUSED_TILES, L.FUSED_SPLITS, L.FUSED_TASKS) == (128, 6, 768)
     assert (L.FUSED_ROWS, L.FUSED_KEY_BLOCK, L.FUSED_BLOCK_STRIDE) == (
         16,
         32,
         48,
     )
     assert L.FUSED_DIM_TILES == 4
-    assert L.FUSED_STAT_FLOATS * 4 == 12_288
-    assert L.FUSED_GLOBAL_FLOATS * 4 == 2_048
-    assert L.FUSED_PART_FLOATS * 4 == 393_216
-    assert L.FUSED_TASKS * 8 == 768
-    assert L.FUSED_TILES * 8 == 128
+    assert L.FUSED_STAT_FLOATS * 4 == 98_304
+    assert L.FUSED_GLOBAL_FLOATS * 4 == 16_384
+    assert L.FUSED_PART_FLOATS * 4 == 3_145_728
+    assert L.FUSED_TASKS * 8 == 6_144
+    assert L.FUSED_TILES * 8 == 1_024
+
+
+@pytest.mark.parametrize(
+    "tokens,tiles,tasks,rounds",
+    [(8, 16, 96, 1), (16, 32, 192, 2), (32, 64, 384, 4), (64, 128, 768, 8)],
+)
+def test_fused_target_widths_grid_stride_over_96_ctas(tokens, tiles, tasks, rounds):
+    assert L.fused_tiles(tokens) == tiles
+    assert L.fused_tasks(tokens) == tasks
+    assert L.resident_rounds(tasks) == rounds
+    assigned = [
+        block + task_round * C.RESIDENT_BLOCKS
+        for block in range(C.RESIDENT_BLOCKS)
+        for task_round in range(L.resident_rounds(tasks))
+        if block + task_round * C.RESIDENT_BLOCKS < tasks
+    ]
+    assert sorted(assigned) == list(range(tasks))
+
+
+@pytest.mark.parametrize("tokens", [8, 16, 32, 64])
+def test_k3_expert_picks_grid_stride_over_96_ctas(tokens):
+    tasks = tokens * C.TOP_K
+    assigned = [
+        block + task_round * C.RESIDENT_BLOCKS
+        for block in range(C.RESIDENT_BLOCKS)
+        for task_round in range(L.resident_rounds(tasks))
+        if block + task_round * C.RESIDENT_BLOCKS < tasks
+    ]
+    assert sorted(assigned) == list(range(tasks))
 
 
 @pytest.mark.parametrize("block_id", [-1, C.RESIDENT_BLOCKS])

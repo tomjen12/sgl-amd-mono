@@ -24,6 +24,7 @@ from sgl_amd_mono.muse_spark.gfx1250.draft_config import (
     MAX_TOKENS,
     RMS_EPS,
     RESIDENT_BLOCKS,
+    SUPPORTED_TOKENS,
 )
 
 THREADS = 256
@@ -188,14 +189,17 @@ def _tile_value(red, plane, row, token):
 
 
 @flyc.jit
-def _stage_lds_input(c, region, elements):
-    """Copy tagged BF16 input into every CTA's LDS, two payload words per poll."""
-    pair_groups = c["S"] * elements // 4
+def _stage_lds_input(c, region, elements, tile_start, tile_rows):
+    """Copy one at-most-16-row tagged BF16 tile into every CTA's LDS."""
+    pair_groups = tile_rows * elements // 4
     for j in range_constexpr(pair_groups // THREADS):
-        pair = 2 * (c["tid"] + j * THREADS)
-        got = c["poll"]([(region, pair, 2)])
+        local_pair = 2 * (c["tid"] + j * THREADS)
+        global_pair = tile_start * elements // 2 + local_pair
+        got = c["poll"]([(region, global_pair, 2)])
         words = fx.Vector.from_elements([got[0][0], got[0][1]], fx.Int32)
-        fx.ptr_store(words.bitcast(fx.BFloat16), c["xbuf"] + pair * 2)
+        fx.ptr_store(
+            words.bitcast(fx.BFloat16), c["xbuf"] + local_pair * 2
+        )
     gpu.barrier()
 
 
@@ -280,56 +284,76 @@ def stage_hc(c):
 @flyc.jit
 def stage_act(c):
     """Fused Gate/Up full-K WMMA and BF16 SiLU activation."""
-    _stage_lds_input(c, c["hc"], H)
     lane, wave = c["lane"], c["wave"]
-    token = fx.min(lane % ROWS, c["S"] - 1)
     r_w = rsrc(c["args"]["w_gu"])
-    task = c["bid"]
-    while task < GU_TASKS:
-        row0 = task * ROWS
-        row = row0 + lane % ROWS
-        gate = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
-        up = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
-        for step in range_constexpr(GU_STEPS):
-            k0 = wave * GU_K_PER_WAVE + step * WMMA_K
-            x = _lds_fragment(c["xbuf"], token * H, k0, lane)
-            gate = _wmma(_weight_fragment(r_w, row * H, k0, lane), x, gate)
-            up = _wmma(_weight_fragment(r_w, (I + row) * H, k0, lane), x, up)
-        fx.ptr_store(
-            gate,
-            c["wmma_red"] + (wave * WAVE_SIZE + lane) * WMMA_ACC,
-        )
-        fx.ptr_store(
-            up,
-            c["wmma_red"] + RED_FLOATS + (wave * WAVE_SIZE + lane) * WMMA_ACC,
-        )
-        gpu.barrier()
-        if c["tid"] < c["S"] * (ROWS // 2):
-            out_token = c["tid"] // (ROWS // 2)
-            dim = 2 * (c["tid"] % (ROWS // 2))
-            g0 = bf16_round(_tile_value(c["wmma_red"], 0, dim, out_token))
-            g1 = bf16_round(_tile_value(c["wmma_red"], 0, dim + 1, out_token))
-            u0 = bf16_round(_tile_value(c["wmma_red"], 1, dim, out_token))
-            u1 = bf16_round(_tile_value(c["wmma_red"], 1, dim + 1, out_token))
-            s0 = bf16_round(
-                g0
-                / (
-                    fx.Float32(1.0)
-                    + hw_exp2(g0 * fx.Float32(-1.4426950408889634))
+    tile_rows = min(ROWS, c["S"])
+    for token_tile in range_constexpr(c["TOKEN_TILES"]):
+        tile_start = token_tile * ROWS
+        _stage_lds_input(c, c["hc"], H, tile_start, tile_rows)
+        token_local = fx.min(lane % ROWS, tile_rows - 1)
+        task = c["bid"]
+        while task < GU_TASKS:
+            row0 = task * ROWS
+            row = row0 + lane % ROWS
+            gate = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+            up = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+            for step in range_constexpr(GU_STEPS):
+                k0 = wave * GU_K_PER_WAVE + step * WMMA_K
+                x = _lds_fragment(c["xbuf"], token_local * H, k0, lane)
+                gate = _wmma(
+                    _weight_fragment(r_w, row * H, k0, lane), x, gate
                 )
-            )
-            s1 = bf16_round(
-                g1
-                / (
-                    fx.Float32(1.0)
-                    + hw_exp2(g1 * fx.Float32(-1.4426950408889634))
+                up = _wmma(
+                    _weight_fragment(r_w, (I + row) * H, k0, lane), x, up
                 )
+            fx.ptr_store(
+                gate,
+                c["wmma_red"] + (wave * WAVE_SIZE + lane) * WMMA_ACC,
             )
-            c["put_bf"](
-                c["act"], out_token * I + row0 + dim, [s0 * u0, s1 * u1]
+            fx.ptr_store(
+                up,
+                c["wmma_red"]
+                + RED_FLOATS
+                + (wave * WAVE_SIZE + lane) * WMMA_ACC,
             )
-        gpu.barrier()
-        task = task + c["B"]
+            gpu.barrier()
+            if c["tid"] < tile_rows * (ROWS // 2):
+                local_token = c["tid"] // (ROWS // 2)
+                out_token = tile_start + local_token
+                dim = 2 * (c["tid"] % (ROWS // 2))
+                g0 = bf16_round(
+                    _tile_value(c["wmma_red"], 0, dim, local_token)
+                )
+                g1 = bf16_round(
+                    _tile_value(c["wmma_red"], 0, dim + 1, local_token)
+                )
+                u0 = bf16_round(
+                    _tile_value(c["wmma_red"], 1, dim, local_token)
+                )
+                u1 = bf16_round(
+                    _tile_value(c["wmma_red"], 1, dim + 1, local_token)
+                )
+                s0 = bf16_round(
+                    g0
+                    / (
+                        fx.Float32(1.0)
+                        + hw_exp2(g0 * fx.Float32(-1.4426950408889634))
+                    )
+                )
+                s1 = bf16_round(
+                    g1
+                    / (
+                        fx.Float32(1.0)
+                        + hw_exp2(g1 * fx.Float32(-1.4426950408889634))
+                    )
+                )
+                c["put_bf"](
+                    c["act"],
+                    out_token * I + row0 + dim,
+                    [s0 * u0, s1 * u1],
+                )
+            gpu.barrier()
+            task = task + c["B"]
 
 
 @flyc.jit
@@ -350,78 +374,103 @@ def _rank_sum(c, token, element):
 @flyc.jit
 def stage_down_out(c):
     """Full-K Down WMMA, ordered TP sum, grouped conv1 and output."""
-    _stage_lds_input(c, c["act"], I)
     lane, wave = c["lane"], c["wave"]
-    token = fx.min(lane % ROWS, c["S"] - 1)
     r_w = rsrc(c["args"]["w_down"])
-    task = c["bid"]
-    while task < DOWN_TASKS:
-        row0 = task * ROWS
-        row = row0 + lane % ROWS
-        down = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
-        for step in range_constexpr(DOWN_STEPS):
-            k0 = wave * DOWN_K_PER_WAVE + step * WMMA_K
-            down = _wmma(
-                _weight_fragment(r_w, row * I, k0, lane),
-                _lds_fragment(c["xbuf"], token * I, k0, lane),
+    tile_rows = min(ROWS, c["S"])
+    for token_tile in range_constexpr(c["TOKEN_TILES"]):
+        tile_start = token_tile * ROWS
+        _stage_lds_input(c, c["act"], I, tile_start, tile_rows)
+        token_local = fx.min(lane % ROWS, tile_rows - 1)
+        task = c["bid"]
+        while task < DOWN_TASKS:
+            row0 = task * ROWS
+            row = row0 + lane % ROWS
+            down = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+            for step in range_constexpr(DOWN_STEPS):
+                k0 = wave * DOWN_K_PER_WAVE + step * WMMA_K
+                down = _wmma(
+                    _weight_fragment(r_w, row * I, k0, lane),
+                    _lds_fragment(c["xbuf"], token_local * I, k0, lane),
+                    down,
+                )
+            fx.ptr_store(
                 down,
+                c["wmma_red"] + (wave * WAVE_SIZE + lane) * WMMA_ACC,
             )
-        fx.ptr_store(
-            down,
-            c["wmma_red"] + (wave * WAVE_SIZE + lane) * WMMA_ACC,
-        )
-        gpu.barrier()
-        out_token = c["tid"] // (ROWS // 2)
-        dim = 2 * (c["tid"] % (ROWS // 2))
-        element = row0 + dim
-        active = c["tid"] < c["S"] * (ROWS // 2)
-        if active:
-            d0 = bf16_round(_tile_value(c["wmma_red"], 0, dim, out_token))
-            d1 = bf16_round(_tile_value(c["wmma_red"], 0, dim + 1, out_token))
-            mailbox_element = (c["rank"] * MAX_TOKENS + out_token) * H + element
-            for peer in range_constexpr(c["W"]):
-                c["put_bf"](c["peer_dm"][peer], mailbox_element, [d0, d1])
-        # Only a subset of threads publishes.  The barriers make every wave
-        # retire its stores before any thread polls a peer's tagged payload.
-        gpu.barrier()
-        wait_stores()
-        gpu.barrier()
-        if active:
-            v0, v1 = _rank_sum(c, out_token, element)
-            group = element // GROUP
-            q0 = c["poll"](
-                [(c["coef"], out_token * COEF_ROWS + 2 * GROUPS + group, 1)]
-            )[0][0].bitcast(fx.Float32)
-            b0 = _bf(c["args"]["base"], 2 * H + element)
-            b1 = _bf(c["args"]["base"], 2 * H + element + 1)
-            o0, o1 = (b0 + q0) * v0, (b1 + q0) * v1
-            if (out_token % BLOCK) >= 1:
-                p0, p1 = _rank_sum(c, out_token - 1, element)
-                q1 = c["poll"](
+            gpu.barrier()
+            local_token = c["tid"] // (ROWS // 2)
+            out_token = tile_start + local_token
+            dim = 2 * (c["tid"] % (ROWS // 2))
+            element = row0 + dim
+            active = c["tid"] < tile_rows * (ROWS // 2)
+            if active:
+                d0 = bf16_round(
+                    _tile_value(c["wmma_red"], 0, dim, local_token)
+                )
+                d1 = bf16_round(
+                    _tile_value(c["wmma_red"], 0, dim + 1, local_token)
+                )
+                mailbox_element = (
+                    (c["rank"] * MAX_TOKENS + out_token) * H + element
+                )
+                for peer in range_constexpr(c["W"]):
+                    c["put_bf"](
+                        c["peer_dm"][peer], mailbox_element, [d0, d1]
+                    )
+            gpu.barrier()
+            wait_stores()
+            gpu.barrier()
+            if active:
+                v0, v1 = _rank_sum(c, out_token, element)
+                group = element // GROUP
+                q0 = c["poll"](
                     [
                         (
                             c["coef"],
-                            out_token * COEF_ROWS + 3 * GROUPS + group,
+                            out_token * COEF_ROWS
+                            + 2 * GROUPS
+                            + group,
                             1,
                         )
                     ]
                 )[0][0].bitcast(fx.Float32)
-                b0 = _bf(c["args"]["base"], 3 * H + element)
-                b1 = _bf(c["args"]["base"], 3 * H + element + 1)
-                o0, o1 = (
-                    o0 + (b0 + q1) * p0,
-                    o1 + (b1 + q1) * p1,
+                b0 = _bf(c["args"]["base"], 2 * H + element)
+                b1 = _bf(c["args"]["base"], 2 * H + element + 1)
+                o0, o1 = (b0 + q0) * v0, (b1 + q0) * v1
+                if (out_token % BLOCK) >= 1:
+                    p0, p1 = _rank_sum(c, out_token - 1, element)
+                    q1 = c["poll"](
+                        [
+                            (
+                                c["coef"],
+                                out_token * COEF_ROWS
+                                + 3 * GROUPS
+                                + group,
+                                1,
+                            )
+                        ]
+                    )[0][0].bitcast(fx.Float32)
+                    b0 = _bf(c["args"]["base"], 3 * H + element)
+                    b1 = _bf(c["args"]["base"], 3 * H + element + 1)
+                    o0, o1 = (
+                        o0 + (b0 + q1) * p0,
+                        o1 + (b1 + q1) * p1,
+                    )
+                _store_bf2(
+                    c["args"]["out"],
+                    (out_token * H + element) // 2,
+                    o0,
+                    o1,
                 )
-            _store_bf2(
-                c["args"]["out"], (out_token * H + element) // 2, o0, o1
-            )
-        gpu.barrier()
-        task = task + c["B"]
+            gpu.barrier()
+            task = task + c["B"]
 
 
 def build_dmlp(key: DMLPBuild):
-    if key.tokens != MAX_TOKENS:
-        raise ValueError(f"first gfx1250 D-MLP supports width {MAX_TOKENS}, got {key.tokens}")
+    if key.tokens not in SUPPORTED_TOKENS:
+        raise ValueError(
+            f"gfx1250 D-MLP supports widths {SUPPORTED_TOKENS}, got {key.tokens}"
+        )
     if key.npes not in (1, 4):
         raise ValueError(f"gfx1250 D-MLP supports TP1 or TP4, got TP{key.npes}")
     if key.resident_blocks not in (96, 192):
@@ -442,7 +491,7 @@ def build_dmlp(key: DMLPBuild):
     @fx.struct
     class Lds:
         red: fx.Array[fx.Float32, 2 * RED_FLOATS, 16]
-        xbuf: fx.Array[fx.BFloat16, MAX_TOKENS * H, 16]
+        xbuf: fx.Array[fx.BFloat16, ROWS * H, 16]
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def dmlp(
@@ -460,7 +509,8 @@ def build_dmlp(key: DMLPBuild):
         mb = Mailbox(step_tag(epoch, layer), active_guard)
         bases = peer_bases(peers, key.npes)
         c = {
-            "S": key.tokens, "W": key.npes, "B": key.resident_blocks,
+            "S": key.tokens, "TOKEN_TILES": (key.tokens + ROWS - 1) // ROWS,
+            "W": key.npes, "B": key.resident_blocks,
             "tid": tid, "bid": bid, "lane": tid % WAVE_SIZE, "wave": tid // WAVE_SIZE,
             "rank": rank, "red": lds.red.ptr, "wmma_red": lds.red.ptr,
             "xbuf": lds.xbuf.ptr, "put": mb.put, "put_bf": mb.put_bf,

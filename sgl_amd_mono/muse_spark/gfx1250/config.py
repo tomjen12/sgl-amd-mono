@@ -47,10 +47,11 @@ GATE_TEMPERATURE = 0.3
 LAYERS = 62
 LAYER_SLOTS = 128
 
-# V1 serves one DFlash2 verify request: 8 rows.
+# Target verify uses eight rows per request.  Allocations and mailbox strides
+# cover eight concurrent requests; each build key selects its live row count.
 DRAFT_TOKENS = 8
-MAX_TOKENS = DRAFT_TOKENS
-WIDTHS = (DRAFT_TOKENS,)
+MAX_TOKENS = 64
+WIDTHS = (8, 16, 32, 64) if ACTIVE_PROFILE.name == "cu96_tp4" else (8,)
 
 # The compiler target is wave32.  Runtime confirmation remains behind the GPU
 # approval gate; keeping this explicit prevents inheriting gfx950's wave64 math.

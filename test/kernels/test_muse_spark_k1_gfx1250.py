@@ -49,7 +49,24 @@ def _reference(x, w, cos_sin, positions, rope):
         V_OFF,
     )
 
-    y = (x.float() @ w.float().T).to(torch.bfloat16)
+    # Match the kernel's deterministic reduction order: 16 split-K parts,
+    # eight wave32 partials per part and two K=32 WMMA steps per wave.
+    y = torch.zeros(
+        x.shape[0], w.shape[0], dtype=torch.float32, device=x.device
+    )
+    for kpart in range(16):
+        part = torch.zeros_like(y)
+        for wave in range(8):
+            wave_part = torch.zeros_like(y)
+            for step in range(2):
+                start = kpart * 512 + wave * 64 + step * 32
+                wave_part += (
+                    x[:, start : start + 32].float()
+                    @ w[:, start : start + 32].float().T
+                )
+            part += wave_part
+        y += part
+    y = y.to(torch.bfloat16)
     rows = x.shape[0]
     q = y[:, :K_OFF].reshape(rows, LOCAL_Q_HEADS, HEAD_DIM)
     k = y[:, K_OFF:V_OFF].reshape(rows, LOCAL_KV_HEADS, HEAD_DIM)
@@ -120,13 +137,13 @@ def _epoch(device):
     "rope,swa,slot64",
     [(True, True, True), (False, False, False)],
 )
-def test_gfx1250_k1_matches_the_fused_kernel_math(rope, swa, slot64):
+@pytest.mark.parametrize("rows", [8, 16, 32, 64])
+def test_gfx1250_k1_matches_the_fused_kernel_math(rows, rope, swa, slot64):
     from sgl_amd_mono.muse_spark.gfx1250.config import (
         HEAD_DIM,
         HIDDEN,
         KV_K,
         LOCAL_KV_HEADS,
-        MAX_TOKENS,
         Q_K,
         QKVG_ROWS,
     )
@@ -136,7 +153,6 @@ def test_gfx1250_k1_matches_the_fused_kernel_math(rope, swa, slot64):
         scratch_bytes,
     )
 
-    rows = MAX_TOKENS
     torch.manual_seed(1250 + int(rope) + 2 * int(swa))
     device, bf16 = torch.device("cuda"), torch.bfloat16
     x = torch.randn(rows, HIDDEN, device=device).to(bf16)
@@ -151,8 +167,8 @@ def test_gfx1250_k1_matches_the_fused_kernel_math(rope, swa, slot64):
         SLOTS, LOCAL_KV_HEADS, HEAD_DIM, device=device
     ).to(torch.float8_e4m3fn)
     v_cache = torch.zeros_like(k_cache)
-    q = torch.full((MAX_TOKENS, Q_K), float("nan"), device=device, dtype=bf16)
-    k = torch.full((MAX_TOKENS, KV_K), float("nan"), device=device, dtype=bf16)
+    q = torch.full((rows, Q_K), float("nan"), device=device, dtype=bf16)
+    k = torch.full((rows, KV_K), float("nan"), device=device, dtype=bf16)
     v = torch.full_like(k, float("nan"))
     g = torch.full_like(q, float("nan"))
     scratch = torch.zeros(

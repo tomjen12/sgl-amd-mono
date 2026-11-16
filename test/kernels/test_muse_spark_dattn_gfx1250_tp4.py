@@ -56,15 +56,17 @@ def _reference(q, k_cache, v_cache, slots, prefix, window, scale):
 
 
 @pytest.mark.parametrize("resident_blocks", [96])
-@pytest.mark.parametrize("prefix,window", [(300, 0), (3000, 2048)])
+@pytest.mark.parametrize("total_rows", [8, 16, 32, 64])
+@pytest.mark.parametrize("base_prefix,window", [(300, 0), (3000, 2048)])
 def test_gfx1250_dflash2_tp4_dattn(
-    resident_blocks, prefix, window
+    resident_blocks, total_rows, base_prefix, window
 ):
     from sgl_amd_mono.muse_spark.gfx1250 import draft_attn as D
 
     torch.manual_seed(0xDFA1250)
     device = torch.device("cuda")
-    q = (torch.randn(D.BLOCK, D.Q_K, device=device) * 0.4).to(torch.bfloat16)
+    requests = total_rows // D.BLOCK
+    q = (torch.randn(total_rows, D.Q_K, device=device) * 0.4).to(torch.bfloat16)
     k_cache = (
         torch.randn(SLOTS, D.LOCAL_KV_HEADS, D.HEAD_DIM, device=device) * 1.5
     ).to(torch.float8_e4m3fn)
@@ -72,15 +74,19 @@ def test_gfx1250_dflash2_tp4_dattn(
         SLOTS, D.LOCAL_KV_HEADS, D.HEAD_DIM, device=device
     ).to(torch.float8_e4m3fn)
 
-    keys = prefix + D.BLOCK
-    token_slots = torch.randperm(SLOTS - 1, device=device)[:keys] + 1
+    prefixes = [base_prefix - 7 * request for request in range(requests)]
     req_to_token = torch.zeros(
-        3, TABLE_STRIDE, dtype=torch.int32, device=device
+        requests + 2, TABLE_STRIDE, dtype=torch.int32, device=device
     )
-    request_row = 2
-    req_to_token[request_row, :keys] = token_slots.to(torch.int32)
-    req_pool = torch.tensor([request_row], dtype=torch.int64, device=device)
-    seq_lens = torch.tensor([prefix], dtype=torch.int32, device=device)
+    req_pool_values = list(reversed(range(1, requests + 1)))
+    request_slots = []
+    for request, prefix in enumerate(prefixes):
+        keys = prefix + D.BLOCK
+        slots = torch.randperm(SLOTS - 1, device=device)[:keys] + 1
+        request_slots.append(slots)
+        req_to_token[req_pool_values[request], :keys] = slots.to(torch.int32)
+    req_pool = torch.tensor(req_pool_values, dtype=torch.int64, device=device)
+    seq_lens = torch.tensor(prefixes, dtype=torch.int32, device=device)
     out = torch.full_like(q, float("nan"))
     scratch = torch.zeros(
         D.dattn_scratch_bytes(), dtype=torch.uint8, device=device
@@ -91,7 +97,7 @@ def test_gfx1250_dflash2_tp4_dattn(
 
     launch = D.build_dattn(
         D.DAttnBuild(
-            tokens=D.BLOCK,
+            tokens=total_rows,
             q_len=D.BLOCK,
             resident_blocks=resident_blocks,
         )
@@ -117,8 +123,19 @@ def test_gfx1250_dflash2_tp4_dattn(
     )
     torch.cuda.synchronize()
 
-    reference = _reference(
-        q, k_cache, v_cache, token_slots, prefix, window, scale
+    reference = torch.cat(
+        [
+            _reference(
+                q[request * D.BLOCK : (request + 1) * D.BLOCK],
+                k_cache,
+                v_cache,
+                request_slots[request],
+                prefixes[request],
+                window,
+                scale,
+            )
+            for request in range(requests)
+        ]
     )
     got = out.float()
     want = reference.float()
@@ -130,8 +147,8 @@ def test_gfx1250_dflash2_tp4_dattn(
         f"{bad:.2%} outputs exceed tolerance; max error {error.max().item():.4f}"
     )
     cosine = torch.nn.functional.cosine_similarity(
-        got.reshape(D.BLOCK, D.LOCAL_Q_HEADS, D.HEAD_DIM),
-        want.reshape(D.BLOCK, D.LOCAL_Q_HEADS, D.HEAD_DIM),
+        got.reshape(total_rows, D.LOCAL_Q_HEADS, D.HEAD_DIM),
+        want.reshape(total_rows, D.LOCAL_Q_HEADS, D.HEAD_DIM),
         dim=-1,
     )
     assert cosine.min().item() > 0.999

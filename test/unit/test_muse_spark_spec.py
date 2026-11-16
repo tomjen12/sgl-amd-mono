@@ -105,7 +105,8 @@ def test_the_plugin_registers_the_architecture():
     assert draft.SPEC.tokens_per_request is not None and draft.SPEC.widths(
         "gfx950"
     ) == muse.SPEC.widths("gfx950")
-    assert draft.SPEC.widths("gfx1250") == muse.SPEC.widths("gfx1250") == (8,)
+    assert draft.SPEC.widths("gfx1250") == GFX1250.WIDTHS
+    assert muse.SPEC.widths("gfx1250") == GFX1250.WIDTHS
 
 
 def test_the_draft_config_is_accepted():
@@ -247,7 +248,7 @@ def test_the_recipe_routes_verify_batches_of_one_to_eight():
     from sgl_amd_mono.muse_spark.gfx950.config import WIDTHS
 
     assert muse.SPEC.widths("gfx950") == WIDTHS and 8 in WIDTHS
-    assert muse.SPEC.widths("gfx1250") == (8,)
+    assert muse.SPEC.widths("gfx1250") == GFX1250.WIDTHS
     # 8 verify rows a request: with every width served, the 8-, 16-, 32- and 64-row
     # launches route batch sizes 1, 2, 4 and 8, captured besides the configured sizes
     assert covered_capture_sizes(

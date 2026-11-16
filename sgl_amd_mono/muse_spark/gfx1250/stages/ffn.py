@@ -235,9 +235,9 @@ def _block_sum(c, value, slot):
 
 
 @flyc.jit
-def stage_expert_pick(c):
+def stage_expert_pick(c, task=None):
     """Kernel 1: one CTA computes one ``(token, slot)`` local expert."""
-    tid, pick = c["tid"], c["bid"]
+    tid, pick = c["tid"], c["bid"] if task is None else task
     token, slot = pick // TOP_K, pick % TOP_K
     a = c["args"]
     expert = fx.Int32(

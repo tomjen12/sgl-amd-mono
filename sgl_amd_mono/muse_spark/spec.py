@@ -49,6 +49,7 @@ from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.muse_spark import DRAFT_TOKENS, HF_CONFIG, TP
 from sgl_amd_mono.muse_spark.gfx1250.config import (
     RESIDENT_BLOCKS as GFX1250_RESIDENT_BLOCKS,
+    WIDTHS as GFX1250_WIDTHS,
 )
 from sgl_amd_mono.muse_spark.gfx950.config import WIDTHS
 
@@ -544,7 +545,7 @@ SPEC = MonoSpec(
     devices={
         "gfx950": DeviceLimits(widths=WIDTHS, tp_sizes=(TP,), resident_blocks=BLOCKS),
         "gfx1250": DeviceLimits(
-            widths=(8,),
+            widths=GFX1250_WIDTHS,
             tp_sizes=(4,),
             resident_blocks=GFX1250_RESIDENT_BLOCKS,
         ),

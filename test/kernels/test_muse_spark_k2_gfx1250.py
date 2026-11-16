@@ -81,7 +81,7 @@ def _inputs(device, seed=1252):
     from sgl_amd_mono.muse_spark.gfx1250.config import (
         EXPERTS,
         HIDDEN,
-        MAX_TOKENS,
+        DRAFT_TOKENS as MAX_TOKENS,
         MOE_HIDDEN,
         Q_K,
     )
@@ -126,7 +126,11 @@ def test_gfx1250_k2_matches_explicit_reference_for_two_epochs():
         scratch_bytes,
         sym_bytes,
     )
-    from sgl_amd_mono.muse_spark.gfx1250.config import MAX_TOKENS, MOE_HIDDEN, TOP_K
+    from sgl_amd_mono.muse_spark.gfx1250.config import (
+        DRAFT_TOKENS as MAX_TOKENS,
+        MOE_HIDDEN,
+        TOP_K,
+    )
 
     device = torch.device("cuda")
     o, g, stream, w = _inputs(device)

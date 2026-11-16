@@ -121,7 +121,8 @@ def _close(got, expected, what, rtol=1 / 16, atol=0.04, bad_max=0.02, cosine=0.9
     assert similarity.min().item() > cosine, f"{what}: cosine {similarity.min().item():.6f}"
 
 
-def test_gfx1250_dpre_width8_matches_torch():
+@pytest.mark.parametrize("rows", [8, 16, 32, 64])
+def test_gfx1250_dpre_matches_torch(rows):
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.muse_spark.gfx1250 import draft_attn_half as D
     from sgl_amd_mono.muse_spark.gfx1250.draft_config import (
@@ -129,29 +130,28 @@ def test_gfx1250_dpre_width8_matches_torch():
         HEAD_DIM,
         HIDDEN,
         LOCAL_KV_HEADS,
-        MAX_TOKENS,
         Q_K,
     )
 
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(1251)
-    x = (0.5 * torch.randn(MAX_TOKENS, HIDDEN, device=device, generator=generator)).to(torch.bfloat16)
-    res = torch.randn(MAX_TOKENS, HIDDEN, device=device, generator=generator).to(torch.bfloat16)
+    x = (0.5 * torch.randn(rows, HIDDEN, device=device, generator=generator)).to(torch.bfloat16)
+    res = torch.randn(rows, HIDDEN, device=device, generator=generator).to(torch.bfloat16)
     weights = _weights(device)
-    positions = torch.randint(0, MAX_POS, (MAX_TOKENS,), device=device, generator=generator, dtype=torch.int32)
+    positions = torch.randint(0, MAX_POS, (rows,), device=device, generator=generator, dtype=torch.int32)
     angle = torch.arange(MAX_POS, device=device)[:, None] * (
         500000.0 ** (-torch.arange(HEAD_DIM // 2, device=device) / (HEAD_DIM // 2))
     )[None, :]
     cos_sin = torch.cat([torch.cos(angle), torch.sin(angle)], dim=-1)
-    slots = torch.randperm(SLOTS, device=device, generator=generator)[:MAX_TOKENS].to(torch.int32)
+    slots = torch.randperm(SLOTS, device=device, generator=generator)[:rows].to(torch.int32)
     k_cache = torch.zeros(SLOTS, LOCAL_KV_HEADS, HEAD_DIM, device=device, dtype=torch.float8_e4m3fn)
     v_cache = torch.zeros_like(k_cache)
     res_out = torch.empty_like(x)
-    q = torch.empty(MAX_TOKENS, Q_K, device=device, dtype=torch.bfloat16)
-    coef = torch.empty(MAX_TOKENS, COEF_ROWS, device=device)
+    q = torch.empty(rows, Q_K, device=device, dtype=torch.bfloat16)
+    coef = torch.empty(rows, COEF_ROWS, device=device)
     scratch = torch.zeros(D.dp_scratch_bytes(), dtype=torch.uint8, device=device)
     epoch = _epoch(device)
-    launch = D.build_dpre(D.DPreBuild())
+    launch = D.build_dpre(D.DPreBuild(tokens=rows))
     launch(
         x.data_ptr(), res.data_ptr(), 0, weights["w_in"].data_ptr(),
         weights["w_kp"].data_ptr(), weights["base"].data_ptr(),
@@ -166,8 +166,8 @@ def test_gfx1250_dpre_width8_matches_torch():
     expected = _pre_reference(x, res, False, weights, cos_sin, positions)
     assert torch.equal(res_out, expected[0])
     _close(q, expected[1], "q", bad_max=0.08, cosine=0.995)
-    _close(k_cache[slots.long()], expected[2].reshape(MAX_TOKENS, LOCAL_KV_HEADS, HEAD_DIM), "fp8 k", rtol=1 / 8, atol=0.06, cosine=0.995)
-    _close(v_cache[slots.long()], expected[3].reshape(MAX_TOKENS, LOCAL_KV_HEADS, HEAD_DIM), "fp8 v", rtol=1 / 8, atol=0.06, cosine=0.995)
+    _close(k_cache[slots.long()], expected[2].reshape(rows, LOCAL_KV_HEADS, HEAD_DIM), "fp8 k", rtol=1 / 8, atol=0.06, cosine=0.995)
+    _close(v_cache[slots.long()], expected[3].reshape(rows, LOCAL_KV_HEADS, HEAD_DIM), "fp8 v", rtol=1 / 8, atol=0.06, cosine=0.995)
     # The scalar fixed-order dot intentionally differs from rocBLAS's reduction
     # tree; the downstream q/k/v comparisons constrain the projected values too.
     _close(
@@ -192,17 +192,18 @@ def _post_reference(outputs, weights, coef):
     return _conv(reduced, delta[:, 1], weights[0]["base"][1]).to(torch.bfloat16)
 
 
-def test_gfx1250_dpost_width8_tp1_matches_torch():
+@pytest.mark.parametrize("rows", [8, 16, 32, 64])
+def test_gfx1250_dpost_tp1_matches_torch(rows):
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
     from sgl_amd_mono.muse_spark.gfx1250 import draft_attn_half as D
-    from sgl_amd_mono.muse_spark.gfx1250.draft_config import COEF_ROWS, MAX_TOKENS, Q_K
+    from sgl_amd_mono.muse_spark.gfx1250.draft_config import COEF_ROWS, Q_K
 
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(1252)
-    output = (0.5 * torch.randn(MAX_TOKENS, Q_K, device=device, generator=generator)).to(torch.bfloat16)
+    output = (0.5 * torch.randn(rows, Q_K, device=device, generator=generator)).to(torch.bfloat16)
     weights = _weights(device)
-    coef = (0.1 * torch.randn(MAX_TOKENS, COEF_ROWS, device=device, generator=generator))
+    coef = (0.1 * torch.randn(rows, COEF_ROWS, device=device, generator=generator))
     expected = _post_reference([output], [weights], coef)
     got = torch.empty_like(expected)
     scratch = torch.zeros(D.do_scratch_bytes(), dtype=torch.uint8, device=device)
@@ -210,7 +211,7 @@ def test_gfx1250_dpost_width8_tp1_matches_torch():
     peers.bytes.zero_()
     epoch = _epoch(device)
     try:
-        D.build_dpost(D.DPostBuild(npes=1))(
+        D.build_dpost(D.DPostBuild(tokens=rows, npes=1))(
             output.data_ptr(), weights["w_o"].data_ptr(), coef.data_ptr(),
             weights["base"].data_ptr(), got.data_ptr(), scratch.data_ptr(),
             peers.local, peers.addresses.data_ptr(), 0, epoch.data_ptr(), LAYER,
