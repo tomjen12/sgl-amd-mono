@@ -69,6 +69,9 @@ class K2Build(msgspec.Struct, frozen=True):
         False  # xn also writes the expert input as MXFP4 blocks (``k2_xinq``) for K3
     )
     pshard: bool = False  # w_pool is the rank's 1 / npes of the pooler rows; partials to every rank (``poolx``)
+    # (with pshard, S = 8, npes = 8) the o all-reduce as a reduce-scatter to the K eighths' owner ranks;
+    # w_pool, w_hi, w_lo are the rank's K eighth of every row; partials to every rank (``poolx``, ``lgx``)
+    kshard: bool = False
 
 
 def k2_context(
@@ -115,9 +118,18 @@ def k2_context(
         "defer_k1": key.defer_k1,
         "xq_pre": key.xq_pre,
         "pshard": key.pshard,
+        "kshard": key.kshard,
+        "sy": sy,
         "own_poolx": preg(sym, sy["poolx"][0], "poolx"),
+        "own_kss": preg(sym, sy["kss"][0], "kss"),
+        "own_vx2": preg(sym, sy["vx2"][0], "vx2"),
+        "own_lgx": preg(sym, sy["lgx"][0], "lgx"),
+        "own_scx": preg(sym, sy["scx"][0], "scx"),
+        "own_poolq": sym + fx.Int64(sy["poolq"][0]),
+        "own_poolf": sym + fx.Int64(sy["poolf"][0]),
     }
     c["peer_poolx"] = [preg(base, sy["poolx"][0], "poolx") for base in c["bases"]]
+    c["peer_lgx"] = [preg(base, sy["lgx"][0], "lgx") for base in c["bases"]]
     for region, (off, _) in layout.items():
         if region in ("k2_xbuf", "k2_xbuf2", "k2_c1", "k2_xinq"):
             c[region[3:]] = scratch + fx.Int64(
@@ -133,6 +145,9 @@ def build_k2(key: K2Build):
     of a ``key.npes``-way TP group."""
     S, W = key.tokens, key.npes
     assert 1 <= S <= MAX_TOKENS and 1 <= W <= guard.FLAG_WORDS
+    assert not key.kshard or (key.pshard and S == 8 and W == 8), (
+        "the K-sharded boundary: 8 rows at TP 8"
+    )
     name = kernel_symbol(
         "muse_spark_k2",
         s=S,
@@ -143,6 +158,7 @@ def build_k2(key: K2Build):
         d=int(key.defer_k1),
         xq=int(key.xq_pre),
         ps=int(key.pshard),
+        ks=int(key.kshard),
     )
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after = key.fault_site, key.fault_after

@@ -109,7 +109,7 @@ def k3_context(
     }
     if key.tpx:
         c.update(ffn.tpx_dims(npes))
-        for region in ("midx", "vx", "ssx"):
+        for region in ("midx", "vx", "ssx", "scx"):
             off = sym_layout[region][0]
             c["own_" + region] = preg(sym, off, region)
             c["peer_" + region] = [preg(base, off, region) for base in bases]

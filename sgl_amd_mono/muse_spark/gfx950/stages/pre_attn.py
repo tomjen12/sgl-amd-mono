@@ -61,7 +61,11 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
     RMS_EPS,
     V_OFF,
 )
-from sgl_amd_mono.muse_spark.gfx950.device import poll_flags, stamp
+from sgl_amd_mono.muse_spark.gfx950.device import (
+    FLAG_STRIDE,
+    poll_flags,
+    stamp,
+)
 from sgl_amd_mono.muse_spark.gfx950.layout import (
     ELEMS,
     G_ROWS,
@@ -180,6 +184,122 @@ def stage_gemv(c, rg, kpart, first=None):
                 v = row_sum(red + (r // ROWS) * RED_FLOATS, r % ROWS, idx // G_ROWS)
                 put(part, (kpart * MAX_TOKENS + tk) * QKVG_ROWS + rg * G_ROWS + r, v)
         gpu.barrier()  # ``red`` is reused by the next token tile / task
+
+
+def spread_tiles(c, bid):
+    """A merged launch's GEMV spread (``c["late"]``: [(first CTA, count)] of the CTAs
+    that reach K1 late, which take no GEMV work): K part ``bid % K_PARTS``'s row tiles
+    in contiguous ranges over the other CTAs of that part, in CTA order. (first tile,
+    tiles) of this CTA; (0, 0) for a late CTA."""
+    T = QKVG_ROWS // ROWS
+    r = bid % K_PARTS
+    below = fx.Int32(0)
+    total = fx.Int32(0)
+    late = fx.Int32(0) == fx.Int32(1)
+    for a0, n in c["late"]:
+        first = (
+            a0 + (r - a0 % K_PARTS + K_PARTS) % K_PARTS
+        )  # the group's first CTA of part r
+        cnt = (first < a0 + n).select((a0 + n - 1 - first) // K_PARTS + 1, fx.Int32(0))
+        d = fx.max(bid - first, fx.Int32(0))
+        below = below + fx.min((d + K_PARTS - 1) // K_PARTS, cnt)
+        total = total + cnt
+        late = late | ((bid >= a0) & (bid < a0 + n))
+    n_early = BLOCKS // K_PARTS - total
+    j = bid // K_PARTS - below
+    lo = j * T // n_early
+    hi = (j + 1) * T // n_early
+    return lo, late.select(fx.Int32(0), hi - lo)
+
+
+def spread_max_tiles(late) -> int:
+    """The most row tiles a CTA of ``spread_tiles`` takes (its static unroll)."""
+    T = QKVG_ROWS // ROWS
+    most = 0
+    for r in range(K_PARTS):
+        n_late = sum(1 for a0, n in late for b in range(a0, a0 + n) if b % K_PARTS == r)
+        most = max(most, -(-T // (BLOCKS // K_PARTS - n_late)))
+    return most
+
+
+def spread_w_loads(c, lo, cnt, kpart, w, maxt):
+    """The weights of row tiles lo .. lo + cnt of K part ``kpart``, this lane's, ``maxt``
+    tiles in flight (a tile past ``cnt`` reads past the buffer: zeros, no traffic)."""
+    lane, wave = c["lane"], c["wave"]
+    r_w = rsrc(w, QKVG_ROWS * HIDDEN * 2)
+    out = []
+    for it in range(maxt):
+        row = (it < cnt).select((lo + it) * ROWS + lane % 16, fx.Int32(QKVG_ROWS))
+        out.append(
+            [
+                fx.Vector(
+                    bo.buffer_load(
+                        r_w,
+                        (row * HIDDEN + gemv_k(lane, wave, kpart, kc)) // 2,
+                        vec_width=4,
+                        dtype=T.i32,
+                        cache_modifier=CM_NT,
+                    )
+                )  # fmt: skip
+                for kc in range(K_STEPS)
+            ]
+        )
+    return out
+
+
+@flyc.jit
+def stage_gemv_spread(c, lo, cnt, kpart, w):
+    """``stage_gemv`` on a spread range: row tiles lo .. lo + cnt of K part ``kpart``
+    (weights ``w`` in flight, ``spread_w_loads``), the same MFMA, wave-order sums and
+    partial slot as the 144-row task that held each tile; the reductions go G_TILES
+    tiles a round through the one reduction row set."""
+    S, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
+    red, put, part = c["red"], c["put"], c["part"]
+    r_x = rsrc(c["args"]["x"])
+    x_cm = c["x_cm"]
+    maxt = len(w)
+    for t in range_constexpr(token_tiles(S)):
+        tok = fx.min(t * TILE + lane % 16, S - 1)
+        xb = [
+            fx.Vector(
+                bo.buffer_load(
+                    r_x,
+                    (tok * HIDDEN + gemv_k(lane, wave, kpart, kc)) // 2,
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=x_cm,
+                )
+            )  # fmt: skip
+            for kc in range(K_STEPS)
+        ]
+        nt = min(TILE, S - t * TILE)
+        for r0 in range_constexpr(0, maxt, G_TILES):
+            nr = min(G_TILES, maxt - r0)
+            for i in range_constexpr(nr):
+                acc = fx.Vector.filled(4, 0.0, fx.Float32)
+                for kc in range_constexpr(K_STEPS):
+                    acc = mfma_bf16(
+                        w[r0 + i][kc].bitcast(fx.BFloat16),
+                        xb[kc].bitcast(fx.BFloat16),
+                        acc,
+                    )
+                fx.ptr_store(acc, red + (i * RED_FLOATS + (wave * 64 + lane) * 4))
+            gpu.barrier()
+            n_out = nr * ROWS * nt
+            for p in range_constexpr(-(-n_out // THREADS)):
+                idx = tid + p * THREADS
+                rr = idx % (nr * ROWS)
+                if (idx < n_out) & (r0 + rr // ROWS < cnt):
+                    tk = t * TILE + idx // (nr * ROWS)
+                    v = row_sum(
+                        red + (rr // ROWS) * RED_FLOATS, rr % ROWS, idx // (nr * ROWS)
+                    )
+                    put(
+                        part,
+                        (kpart * MAX_TOKENS + tk) * QKVG_ROWS + (lo + r0) * ROWS + rr,
+                        v,
+                    )
+            gpu.barrier()  # ``red`` is reused by the next round / token tile
 
 
 @flyc.jit
@@ -344,6 +464,10 @@ def stage_head(c, h):
     use_rope, use_swa = a["use_rope"], a["use_swa"]
     slot64, swa64 = a["slot64"], a["swa64"]
     r_cs = rsrc(a["cos_sin"])
+    KV_ROWS, SWA_ROWS = (
+        c["kv_rows"],
+        c.get("swa_rows", 0),
+    )  # head-major pools' rows (0: NHD)
     for p in range_constexpr(token_passes(S)):
         tk = tid // TOKEN_LANES + p * TOKENS_PER_PASS
         if tk < S:
@@ -425,8 +549,22 @@ def stage_head(c, h):
                         clamp_fp8(out[2]),
                         clamp_fp8(out[3]),
                     )
-                    # NHD page-16 fp8: slot s, head hh, dim d at byte (s KV_HEADS + hh) HEAD_DIM + d
+                    # NHD page-16 fp8: slot s, head hh, dim d at byte (s KV_HEADS + hh) HEAD_DIM + d;
+                    # a full layer's head-major pool (``kv_rows``): byte (hh rows + s) HEAD_DIM + d
                     idx = (slot * LOCAL_KV_HEADS + kv_head) * (HEAD_DIM // 4) + d0 // 4
+                    # a sliding layer's head-major SWA pool (``swa_rows``): byte (hh swa_rows + s) HEAD_DIM + d
+                    idx_swa = idx
+                    if const_expr(SWA_ROWS > 0):
+                        idx_swa = (kv_head * SWA_ROWS + slot) * (
+                            HEAD_DIM // 4
+                        ) + d0 // 4
+                    idx_full = idx
+                    if const_expr(KV_ROWS > 0):
+                        idx_full = (kv_head * KV_ROWS + slot) * (
+                            HEAD_DIM // 4
+                        ) + d0 // 4
+                    if const_expr(KV_ROWS > 0 or SWA_ROWS > 0):
+                        idx = (use_swa != 0).select(idx_swa, idx_full)
                     if is_k:
                         bo.buffer_store(packed, rsrc(a["k_cache"]), idx)
                     else:
@@ -453,33 +591,43 @@ def stage_gate(c, g):
 def run_k1(c, bid, x_flag=None):
     """K1's stages on this CTA: its GEMV task, then its head or gate task. ``x_flag`` (a mailbox region): x was written earlier in this
     launch (the previous layer's boundary), flagged a token each; the first task's
-    weights go out before the wait. In that launch the boundary CTAs (0 .. S) reach
-    K1 last (their weights would land ~7 us after everyone's x): their GEMV tasks
-    run on the last S CTAs, idle since K3's experts, which issue both tasks' weights
-    on arrival."""
+    weights go out before the wait. In that launch the boundary CTAs and the active
+    unpool CTAs reach K1 last (their weights would land after everyone's x): they take
+    no GEMV work, which spreads over the other CTAs (``spread_tiles``)."""
     S = c["S"]
     stamp(c, 0)
     first = None
-    extra = None
-    if const_expr(x_flag is not None):
-        moved = bid < S  # a boundary CTA: its task runs on CTA BLOCKS - S + bid
+    defer = c.get("defer", False)
+    if const_expr(x_flag is not None and defer):
+        # deferred norms (the GEMV polls its unpooled rows itself): the boundary CTAs'
+        # (0 .. S) tasks run on the last S CTAs, which issue both tasks' weights on arrival
+        moved = bid < S
         spare = bid >= BLOCKS - S
         own = moved.select(fx.Int32(GEMV_TASKS), bid)  # past the last task: zero loads
         t2 = spare.select(bid - (BLOCKS - S), fx.Int32(GEMV_TASKS))
         first = gemv_w_loads(c, own // K_PARTS, own % K_PARTS, c["args"]["w"])
         extra = gemv_w_loads(c, t2 // K_PARTS, t2 % K_PARTS, c["args"]["w"])
         rocdl.sched_barrier(0)
-        if const_expr(not c.get("defer", False)):
-            poll_flags(
-                c, [(x_flag, S)]
-            )  # (deferred: the GEMV polls its unpooled rows itself)
+    elif const_expr(x_flag is not None):
+        # the CTAs that reach K1 late (``c["late"]``: the boundary's and the active unpool
+        # CTAs) take no GEMV work: each K part's row tiles spread over the part's other CTAs,
+        # whose weights go out on arrival (``spread_tiles``)
+        lo, cnt = spread_tiles(c, bid)
+        first = spread_w_loads(
+            c, lo, cnt, bid % K_PARTS, c["args"]["w"], spread_max_tiles(c["late"])
+        )
+        rocdl.sched_barrier(0)
+        poll_flags(c, [(x_flag, 0, S, FLAG_STRIDE)])
     stamp(c, 1)  # x arrived (a merged launch) / entry
-    if const_expr(x_flag is not None):
+    if const_expr(x_flag is not None and defer):
         if bid >= S:
             stage_gemv(c, bid // K_PARTS, bid % K_PARTS, first)
         if bid >= BLOCKS - S:
             t2 = bid - (BLOCKS - S)
             stage_gemv(c, t2 // K_PARTS, t2 % K_PARTS, extra)
+    elif const_expr(x_flag is not None):
+        if cnt > 0:
+            stage_gemv_spread(c, lo, cnt, bid % K_PARTS, first)
     else:
         stage_gemv(c, bid // K_PARTS, bid % K_PARTS, first)
     if const_expr(SECOND_TASKS > 0):

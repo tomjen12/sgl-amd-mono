@@ -72,7 +72,7 @@ def k1_scratch_layout() -> dict:
     return pair_layout(
         [
             ("k1_part", PARTS * MAX_TOKENS * QKVG_ROWS),
-            ("k1_xflag", MAX_TOKENS),
+            ("k1_xflag", MAX_TOKENS * 8),
             ("k1_trace", TRACE_LAYERS * BLOCKS * TRACE_SLOTS),
         ],
         align=256,

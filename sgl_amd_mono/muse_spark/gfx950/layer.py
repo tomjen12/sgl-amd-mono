@@ -14,12 +14,13 @@ from sgl_amd_mono.common.ops import CM_DEV
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, kernel_sources, key_tuple
 from sgl_amd_mono.common.sync import Mailbox, sreg
 from sgl_amd_mono.muse_spark.gfx950 import compat
-from sgl_amd_mono.muse_spark.gfx950.config import MAX_TOKENS
+from sgl_amd_mono.muse_spark.gfx950.config import LAYER_SLOTS, MAX_TOKENS
 from sgl_amd_mono.muse_spark.gfx950.device import global_atomic, step_tag
 from sgl_amd_mono.muse_spark.gfx950.layout import (
     attn_rows,
     k1_scratch_layout,
     kattn_scratch_layout,
+    scratch_bytes,
 )
 from sgl_amd_mono.muse_spark.gfx950.stages import attention, pre_attn
 
@@ -38,6 +39,10 @@ class K1Build(msgspec.Struct, frozen=True):
     fault_after: int = 0
     trace: bool = False  # stage stamps into the ``k1_trace`` region (``device.stamp``)
     defer: bool = False  # a merged launch's K1 with the boundary's norms deferred (``stage_gemv_deferred``)
+    kv_rows: int = 0  # the full layers' KV pool rows when it is head-major ([head][row][dim]; 0: NHD)
+    swa_rows: int = (
+        0  # the sliding layers' (SWA) KV pool rows when it is head-major (0: NHD)
+    )
 
 
 def k1_context(
@@ -69,6 +74,8 @@ def k1_context(
         if merged
         else 0,  # x from this launch: past the L2 (another XCD wrote it)
         "defer": key.defer,
+        "kv_rows": key.kv_rows,
+        "swa_rows": key.swa_rows,
         "trace_on": key.trace,
         "layer": layer,
     }
@@ -81,7 +88,14 @@ def build_k1(key: K1Build):
     """``@flyc.jit`` launcher of K1 for a step of ``key.tokens`` rows."""
     tokens = key.tokens
     assert 1 <= tokens <= MAX_TOKENS
-    name = kernel_symbol("muse_spark_k1", s=tokens, f=key.fault_site, t=int(key.trace))
+    name = kernel_symbol(
+        "muse_spark_k1",
+        s=tokens,
+        f=key.fault_site,
+        t=int(key.trace),
+        **({"hm": key.kv_rows} if key.kv_rows else {}),
+        **({"hs": key.swa_rows} if key.swa_rows else {}),
+    )
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after = key.fault_site, key.fault_after
     layout = k1_scratch_layout()
@@ -169,6 +183,11 @@ class KAttnBuild(msgspec.Struct, frozen=True):
     fault_site: int = 0
     fault_after: int = 0
     trace: bool = False
+    kind: str = ""  # "sliding": a sliding layer's own build (attention.run_kattn's SL); "": any layer
+    kv_rows: int = (
+        0  # the full layers' KV pool rows when head-major ([head][row][dim]; 0: NHD)
+    )
+    swa_rows: int = 0  # the sliding layers' (SWA) KV pool rows when head-major (0: NHD)
 
 
 def _attn_views(lds):
@@ -198,6 +217,9 @@ def kattn_context(
         "args": args,
         "trace_on": key.trace,
         "layer": layer,
+        "KIND": key.kind,
+        "kv_rows": key.kv_rows,
+        "swa_rows": key.swa_rows,
     }
     for region in ("attn_part", "attn_pflag", "attn_l2", "attn_l2flag", "attn_trace"):
         c[region[5:]] = sreg(
@@ -214,7 +236,15 @@ def build_kattn(key: KAttnBuild):
     NT = min(NT, row_tiles)
     assert row_tiles % NT == 0, (row_tiles, NT)
     name = kernel_symbol(
-        "muse_spark_kattn", s=S, q=QL, n=NT, f=key.fault_site, t=int(key.trace)
+        "muse_spark_kattn",
+        s=S,
+        q=QL,
+        n=NT,
+        f=key.fault_site,
+        t=int(key.trace),
+        **({"k": key.kind} if key.kind else {}),
+        **({"hm": key.kv_rows} if key.kv_rows else {}),
+        **({"hs": key.swa_rows} if key.swa_rows else {}),
     )
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after = key.fault_site, key.fault_after
@@ -289,6 +319,25 @@ def build_kattn(key: KAttnBuild):
     return launch
 
 
+def k1_late(tokens: int, npes: int) -> list:
+    """A merged launch's CTAs that reach the next K1 late, [(first CTA, count)]: the
+    boundary CTAs and, where the others can hold their tiles, the active unpool CTAs
+    (``ffn.k3_bases``); the GEMV spreads over the others (``pre_attn.spread_tiles``)."""
+    from sgl_amd_mono.muse_spark.gfx950.stages import ffn
+    from sgl_amd_mono.muse_spark.gfx950.stages.pre_attn import spread_max_tiles
+
+    b = ffn.k3_bases(tokens, npes)
+    late = [(0, tokens), (b["unp0"], b["unp_jobs"])]
+    if b["unp0"] + b["unp_jobs"] > BLOCKS or spread_max_tiles(late) > SPREAD_TILES_MAX:
+        late = late[
+            :1
+        ]  # (wider steps: the unpool CTAs keep their part; the registers cap a CTA's tiles)
+    return late
+
+
+SPREAD_TILES_MAX = 14  # row tiles a CTA's GEMV holds in flight at most (two VGPR quads a tile and k-step)
+
+
 class LayerBuild(msgspec.Struct, frozen=True):
     """A whole-layer build: the step's row count and rows a request, the TP / EP
     size, whether the next layer's K1 ends the launch, whether the FFN boundary is
@@ -314,6 +363,55 @@ class LayerBuild(msgspec.Struct, frozen=True):
     pshard: bool = (
         False  # the pooler sharded by rows over the ranks (K2Build.pshard; npes == 8)
     )
+    kshard: bool = False  # the K-sharded boundary (K2Build.kshard; with pshard, 8 rows at npes == 8)
+    kind: str = (
+        ""  # "sliding": the sliding layers' own build (KAttnBuild.kind); "": any layer
+    )
+    kv_rows: int = 0  # the full layers' KV pool rows when head-major (the K1 writes, the full layers' reads; 0: NHD)
+    swa_rows: int = 0  # the sliding layers' (SWA) KV pool rows when head-major (K1's SWA writes, the sliding reads; 0: NHD)
+    pf: bool = False  # before the next K1, warm each XCD's L2 with the next layer's kernel code (code_prefetch)
+
+
+# The code prefetch's table, past K1's scratch: entry (tokens, layer) = the code (address, bytes) of the kernel the
+# next layer launches, filled by the runner once that kernel is loaded (0 bytes: nothing). A kernel switch (the
+# sliding / full builds alternate) costs ~1-1.5 us of instruction fetch from HBM otherwise: the other build's code
+# has left L2. The warm-up only reads: exact.
+def pf_table_offset() -> int:
+    return (scratch_bytes(k1_scratch_layout()) + 255) // 256 * 256
+
+
+def pf_table_bytes() -> int:
+    return (MAX_TOKENS + 1) * LAYER_SLOTS * 16
+
+
+def pf_entry(tokens: int, layer: int) -> int:
+    return pf_table_offset() + (tokens * LAYER_SLOTS + layer) * 16
+
+
+@flyc.jit
+def prefetch_code(entry, lds_ptr, bid):
+    """Wave 0 of each CTA: the table entry by a scalar load, then one 4 B LDS-DMA load a 128 B line of the code
+    (lines (bid // 8) * 64 + lane: the 32 CTAs of an XCD cover 256 KB) into a dead LDS word; out-of-range lanes
+    (and 0 bytes) read nothing. Nothing waits on the DMA: it only warms L2."""
+    from flydsl._mlir import ir
+    from flydsl._mlir.dialects import llvm
+    from flydsl.expr.typing import as_ir_value
+
+    from sgl_amd_mono.common.ops import rsrc
+    from sgl_amd_mono.muse_spark.gfx950.device import lds_dma_4
+
+    tid = fx.thread_idx.x
+    if tid < 64:
+        v4 = llvm.inline_asm(
+            ir.VectorType.get([4], ir.IntegerType.get_signless(32)),
+            [as_ir_value(fx.Int64(entry))],
+            "s_load_dwordx4 $0, $1, 0x0\n\ts_waitcnt lgkmcnt(0)",
+            "=s,s",
+            has_side_effects=True,
+        )
+        w = fx.Vector(v4, (4,), fx.Int32)
+        addr = (fx.Int64(w[1]) << 32) | fx.Int64(fx.Uint32(w[0]))
+        lds_dma_4(rsrc(addr, fx.Int32(w[2])), lds_ptr, ((bid // 8) * 64 + tid) * 128)
 
 
 def build_layer(key: LayerBuild):
@@ -346,18 +444,38 @@ def build_layer(key: LayerBuild):
         and QL in (1, 8)
         and 1 <= W <= guard.FLAG_WORDS
     )
-    name = kernel_symbol("muse_spark_layer", s=S, q=QL, w=W, n=int(next_k1), l=int(last), f=key.fault_site, t=int(key.trace), p8=int(key.fp8_dense), x=int(key.tpx), d=int(key.defer_k1 and next_k1), xq=int(key.xq_pre and S <= 16), u=int(key.ug_dyn and key.xq_pre and S == 16), ps=int(key.pshard))  # fmt: skip
+    name = kernel_symbol("muse_spark_layer", s=S, q=QL, w=W, n=int(next_k1), l=int(last), f=key.fault_site, t=int(key.trace), p8=int(key.fp8_dense), x=int(key.tpx), d=int(key.defer_k1 and next_k1), xq=int(key.xq_pre and S <= 16), u=int(key.ug_dyn and key.xq_pre and S == 16), ps=int(key.pshard), ks=int(key.kshard), **({"k": key.kind} if key.kind else {}), **({"hm": key.kv_rows} if key.kv_rows else {}), **({"hs": key.swa_rows} if key.swa_rows else {}), **({"pf": 1} if key.pf and next_k1 else {}))  # fmt: skip
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after, tr = key.fault_site, key.fault_after, key.trace
     defer = key.defer_k1 and next_k1
-    k1_key = K1Build(S, fault_site, fault_after, tr, defer)
-    ka_key = KAttnBuild(S, QL, fault_site=fault_site, fault_after=fault_after, trace=tr)
+    k1_key = K1Build(
+        S, fault_site, fault_after, tr, defer, key.kv_rows, swa_rows=key.swa_rows
+    )
+    ka_key = KAttnBuild(
+        S,
+        QL,
+        fault_site=fault_site,
+        fault_after=fault_after,
+        trace=tr,
+        kind=key.kind,
+        kv_rows=key.kv_rows,
+        swa_rows=key.swa_rows,
+    )
     xq = key.xq_pre and S <= 16
     assert not key.pshard or (W == 8 and not key.fp8_dense), (
         "the sharded pooler: TP 8, bf16"
     )
     k2_key = K2Build(
-        S, W, fault_site, fault_after, tr, key.fp8_dense, defer, xq, key.pshard
+        S,
+        W,
+        fault_site,
+        fault_after,
+        tr,
+        key.fp8_dense,
+        defer,
+        xq,
+        key.pshard,
+        key.kshard,
     )
     ugd = (
         key.ug_dyn and xq and S >= 16
@@ -371,6 +489,12 @@ def build_layer(key: LayerBuild):
     flags_offset = sym_bytes(W)
     ALoop, ATree = attention.kattn_lds(min(ka_key.nt, (attn_rows(QL) + 15) // 16))
     K2Lds, K3Lds, K1Lds = post_attn.k2_lds(S), ffn.k3_lds(S), pre_attn.k1_lds(S)
+
+    @fx.struct
+    class PfLds:
+        buf: fx.Array[
+            fx.Float32, 64, 16
+        ]  # the code prefetch's dead DMA words (its own LDS symbol)
 
     @fx.union
     class Lds:
@@ -412,7 +536,11 @@ def build_layer(key: LayerBuild):
                 fault_after=fault_after,
             )  # fmt: skip
         ):
-            lds = fx.SharedAllocator().allocate(Lds)
+            lds_alloc = fx.SharedAllocator()
+            lds = lds_alloc.allocate(Lds)
+            pf = key.pf and next_k1
+            if const_expr(pf):
+                pfl = lds_alloc.allocate(PfLds)
             tag = step_tag(epoch, layer)
             tag1 = step_tag(epoch, layer + 1)
             bid = fx.block_idx.x
@@ -493,6 +621,7 @@ def build_layer(key: LayerBuild):
                     merged=True,
                     layer=layer + 1,
                 )
+                c1["late"] = k1_late(S, W)
                 if const_expr(defer):
                     # the unpooled rows and the scalars are this layer's (K3's tag)
                     c1.update(
@@ -505,8 +634,16 @@ def build_layer(key: LayerBuild):
                     x_flag=c1["xflag"],
                     x_put=c1["put"],
                     res_flag=(c2["resflag"], S * post_attn.a_parts(S)),
+                    ids_mb=c2["idx"],
+                    sc_mb=c3.get("own_scx"),
                 )
                 gpu.barrier()
+                if const_expr(pf):
+                    prefetch_code(
+                        scratch1 + fx.Int64(pf_entry(S, 0)) + fx.Int64(layer) * 16,
+                        pfl.peek().buf.ptr,
+                        bid,
+                    )
                 pre_attn.run_k1(c1, bid, x_flag=c1["xflag"])
             else:
                 ffn.run_k3(
@@ -514,6 +651,8 @@ def build_layer(key: LayerBuild):
                     route_flag=rflag,
                     xin_flag=xinflag,
                     res_flag=(c2["resflag"], S * post_attn.a_parts(S)),
+                    ids_mb=c2["idx"],
+                    sc_mb=c3.get("own_scx"),
                 )
 
     @flyc.jit

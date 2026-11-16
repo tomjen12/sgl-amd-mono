@@ -71,9 +71,9 @@ from sgl_amd_mono.common.ops import (
     fp8_to_bf16x8,
     hw_exp2,
     hw_rsq,
-    lane_gather,
     mfma_bf16,
     popcount,
+    read_lane_i32,
     row_sum,
     rsrc,
     sum_partials,
@@ -94,6 +94,8 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
     TOP_K,
 )
 from sgl_amd_mono.muse_spark.gfx950.device import (
+    FLAG_STRIDE,
+    acquire_loads,
     global_atomic,
     poll_flags,
     release_stores,
@@ -119,6 +121,10 @@ CHUNK = (
 )
 UG_CHUNKS = MOE_HIDDEN // CHUNK // WAVES  # 4 chunks a wave: the waves split K
 DN_CHUNKS = INTER // CHUNK // WAVES  # 4
+DN_AHEAD = 3  # dn items whose weights a CTA keeps in flight (40 VGPRs each)
+DN_UNROLL_MAX = (
+    4  # dn items a CTA up to which the dn loop is unrolled (S = 8; 8 spill at S = 16)
+)
 XS_LDS_MAX = 8  # tokens an unpool pass stages in LDS
 XQW = MOE_HIDDEN // 8  # packed E2M1 words a staged column (eight codes a word)
 XSW = MOE_HIDDEN // MXFP4_GROUP  # its E8M0 scales, an Int32 each
@@ -139,6 +145,9 @@ AR_PARTS_MAX = 8
 UNP_ROWS = 16  # unpooler rows an unpool task: the MFMA's M
 UNP_TASKS = HIDDEN // UNP_ROWS  # 512 row tiles, 1 / npes of them a rank
 UNP_STEPS = MOE_HIDDEN // WAVES // 32  # 16 bf16 MFMA steps a wave
+UNP_PITCH = (
+    MOE_HIDDEN // 2 + 4
+)  # LDS floats a staged unpool row: the 16 B skew puts the tokens' rows on different banks
 BND_ELEMS = HIDDEN // THREADS  # 16 elements a thread of a token's row
 assert XQW == THREADS and INTER == MOE_HIDDEN and UG_CHUNKS == 4 and DN_CHUNKS == 4
 assert (
@@ -258,6 +267,20 @@ def k3_sym_layout(npes: int) -> dict:
             ("ssx", MAX_TOKENS * TOP_K * DN_T),
             # the sharded pooler: every rank's partial pooled rows of its row slice, [K part][token][row]
             ("poolx", POOL_PARTS * MAX_TOKENS * MOE_HIDDEN // 2),
+            # the K-sharded boundary (post_attn ``kshard``): the owners' norm sums [token][owner
+            # rank][wave of the column eighth] (4 a wave), their summed attention rows
+            # [token][HIDDEN / 2], every rank's partial logits of its K eighth [K part][token][expert]
+            ("kss", MAX_TOKENS * POOL_PARTS * 8 * 4),
+            ("vx2", MAX_TOKENS * HIDDEN // 2),
+            ("lgx", POOL_PARTS * MAX_TOKENS * EXPERTS),
+            # the K-sharded pooled rows [K part][token][row] as plain bf16 (no tags: 8-byte words, all
+            # ones while unpublished; the reader restores them, ``post_attn.sym_init`` sets them first)
+            ("poolq", POOL_PARTS * MAX_TOKENS * MOE_HIDDEN // 4),
+            # the K-sharded pooled rows summed by their owner rank (``post_attn.stage_pool_sum``),
+            # [token][row] fp32, 8-byte words all ones while unpublished (as ``poolq``)
+            ("poolf", MAX_TOKENS * MOE_HIDDEN // 2),
+            # the route's scores again, tagged, written by this rank (K3's fin polls them with ``vx``)
+            ("scx", MAX_TOKENS * TOP_K),
         ],
         align=256,
     )
@@ -268,8 +291,7 @@ def k3_lds_floats() -> dict:
     return {
         "red": RED_SLOTS * RED_SLOT_FLOATS,
         "xcol": XS_LDS_MAX
-        * MOE_HIDDEN
-        // 2,  # a tile's MXFP4 columns; the unpool passes' rows
+        * UNP_PITCH,  # a tile's MXFP4 columns; the unpool passes' rows
         "misc": max(
             UNP_ROWS * XS_LDS_MAX, 2 * WAVES * TILE_COLS
         ),  # an unpool pass's bf16 row sums; dn's wave partials
@@ -334,11 +356,19 @@ def bor(x, y):
 
 
 def lane_prefix(v, lane):
-    """The wave's inclusive prefix sum of v, lanes ascending."""
-    incl = v
-    for d in (1, 2, 4, 8, 16, 32):
-        moved = lane_gather(incl, fx.max(lane - d, 0))
-        incl = incl + (lane >= d).select(moved, fx.Int32(0))
+    """The wave's inclusive prefix sum of v, lanes ascending (integers: any order is
+    the same sum): DPP row shifts 1, 2, 4, 8 within each 16-lane row (an out-of-row
+    source reads 0), then row_bcast15 (rows 1, 3 add their lower row's last lane) and
+    row_bcast31 (rows 2, 3 add lane 31): six VALU steps, no LDS round trips."""
+    from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
+
+    incl = fx.Int32(v)
+    for d in (1, 2, 4, 8):
+        incl = incl + fx.Int32(
+            update_dpp_i32(fx.Int32(0), incl, 0x110 + d, 0xF, 0xF, True)
+        )
+    incl = incl + fx.Int32(update_dpp_i32(fx.Int32(0), incl, 0x142, 0xA, 0xF, False))
+    incl = incl + fx.Int32(update_dpp_i32(fx.Int32(0), incl, 0x143, 0xC, 0xF, False))
     return incl
 
 
@@ -409,13 +439,25 @@ def w13_rsrc(c, e):
     )
 
 
-def w2_rsrc(c, e):
-    """Expert e's down rows (TP experts: the rank's ``w2_rows`` output rows)."""
+def w2_rsrc(c, e, live=None):
+    """Expert e's down rows (TP experts: the rank's ``w2_rows`` output rows); with
+    ``live`` false, empty buffers: the loads return zeros and move no bytes."""
     a = c["args"]
     rows = c["w2_rows"]
+    if live is None:
+        return (
+            rsrc(a["w2"] + fx.Int64(e) * (rows * W2_ROW_BYTES)),
+            rsrc(a["s2"] + fx.Int64(e) * (rows * W2_SCALE_COLS)),
+        )
     return (
-        rsrc(a["w2"] + fx.Int64(e) * (rows * W2_ROW_BYTES)),
-        rsrc(a["s2"] + fx.Int64(e) * (rows * W2_SCALE_COLS)),
+        rsrc(
+            a["w2"] + fx.Int64(e) * (rows * W2_ROW_BYTES),
+            live.select(fx.Int64(rows * W2_ROW_BYTES), fx.Int64(0)),
+        ),
+        rsrc(
+            a["s2"] + fx.Int64(e) * (rows * W2_SCALE_COLS),
+            live.select(fx.Int64(rows * W2_SCALE_COLS), fx.Int64(0)),
+        ),
     )
 
 
@@ -424,28 +466,25 @@ def fp4_tile_loads(c, r_w, r_s, row, chunks):
     ``chunks`` k chunks: (weight words, scale bytes) in flight. A lane's 16 B are
     32 E2M1 of the row at byte row K / 2 + chunk 64 + lane group 16; the wave's
     chunks' 16 scale bytes of the row are one load (byte 4 kc + g4: chunk kc's,
-    lane group g4's)."""
+    lane group g4's). TP experts' slices are tile-shuffled (``weights.tile_shuffle``):
+    the same 16 B a lane at tile (row / 16)'s [wave][chunk][lane], 1 KB a wave a chunk."""
     lane, wave = c["lane"], c["wave"]
     g4 = lane // 16
     assert chunks == 4
     wts = []
     for kc in range(chunks):
         k_chunk = wave * chunks + kc
-        wts.append(
-            fx.Vector(
-                bo.buffer_load(
-                    r_w,
-                    (
-                        row * (chunks * WAVES * CHUNK // 2)
-                        + k_chunk * (CHUNK // 2)
-                        + g4 * 16
-                    )
-                    // 4,
-                    vec_width=4,
-                    dtype=T.i32,
-                )
-            )
-        )
+        if c["tpx"]:
+            at = (
+                (row // 16) * (16 * chunks * WAVES * CHUNK // 2)
+                + k_chunk * (CHUNK // 2) * 16
+                + lane * 16
+            ) // 4
+        else:
+            at = (
+                row * (chunks * WAVES * CHUNK // 2) + k_chunk * (CHUNK // 2) + g4 * 16
+            ) // 4
+        wts.append(fx.Vector(bo.buffer_load(r_w, at, vec_width=4, dtype=T.i32)))
     sc16 = fx.Vector(
         bo.buffer_load(
             r_s,
@@ -557,12 +596,13 @@ def lane_token(c, e, col0, n):
     return fx.max(fx.min(tk, fx.Int32(c["S"] - 1)), fx.Int32(0))
 
 
-def xq_b(c, n, chunks, kc):
+def xq_b(c, n, chunks, kc, cb=0):
     """This lane's B operand of chunk ``kc``: its column's 32 codes of k block g4
-    and their scale, from the staged blocks (a column past n: the last)."""
+    and their scale, from the staged blocks (a column past n: the last; ``cb``: the
+    tile's first LDS column)."""
     lane, wave, xcol = c["lane"], c["wave"], c["xcol"]
     V4F = fx.Vector.make_type(4, fx.Float32)
-    col = fx.min(lane % 16, n - 1)
+    col = cb + fx.min(lane % 16, n - 1)
     kb = (wave * chunks + kc) * (CHUNK // MXFP4_GROUP) + lane // 16
     q = fx.Vector(fx.ptr_load(xcol + (col * XQW + kb * 4), result_type=V4F)).bitcast(
         fx.Int32
@@ -633,11 +673,12 @@ def ug_or_dn_pair_loads(c, q, pr, dq, n_tiles, use_dn):
     ]
 
 
-def dn_pair_loads(c, q, n_tiles):
-    """dn item q's tile pair: 32 rows of the expert's down weight."""
+def dn_pair_loads(c, q, n_tiles, live=None):
+    """dn item q's tile pair: 32 rows of the expert's down weight (``live`` false:
+    zeros, no traffic)."""
     l16 = c["lane"] % 16
     e, _, _ = tile_info(c, q // c["dn_t"], n_tiles)
-    r_w, r_s = w2_rsrc(c, e)
+    r_w, r_s = w2_rsrc(c, e, live)
     return [
         [
             list(part)
@@ -769,7 +810,7 @@ def stage_plan(c):
         )
         incl = lane_prefix(tiles, lane)
         tile0 = incl - tiles
-        n_tiles = lane_gather(incl, 63)
+        n_tiles = read_lane_i32(incl, 63)
         if lane == 0:
             # an empty plan's first tile is expert 0, column 0: a CTA with no item
             # still issues its first item's loads, from the list's head, not the
@@ -784,12 +825,15 @@ def stage_plan(c):
 
 
 @flyc.jit
-def stage_plan_tpx(c):
+def stage_plan_tpx(c, ids_mb=None, flags=None):
     """TP experts' plan (every rank alike): wave 0 walks the picks in rounds of 64, a
     pick's column its rank among its expert's picks in pick order (the round's
     same-expert lanes from 8 ballots, the earlier rounds' count in LDS), then lays out
     the experts' starts in the sorted pick list (``pick_of``) and their column tiles
-    of 16 in expert order. Returns the tiles."""
+    of 16 in expert order. Returns the tiles. ``ids_mb`` (a mailbox region): the
+    picks polled from the route tasks' tagged copy (no flag wait first). ``flags``
+    (``poll_flags`` regions): polled meanwhile by wave 1 .., waited for at the plan's
+    closing barrier."""
     S, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     sorted_, cnt_of, start_of, tile_of, nt = (
         c["pick_of"],
@@ -806,77 +850,123 @@ def stage_plan_tpx(c):
     if tid < EXPERTS:
         fx.ptr_store(fx.Int32(0), cnt_of + tid)
     gpu.barrier()
+    if const_expr(flags is not None):
+        poll_flags(c, flags, first=64, sync=False)
     if wave == 0:
+        if const_expr(ids_mb is not None):
+            got = c["poll"](
+                [(ids_mb, fx.min(rr * 64 + lane, PICKS - 1), 1) for rr in range(ROUNDS)]
+            )
+            raw = [fx.Int32(got[rr][0]) for rr in range(ROUNDS)]
+        else:
+            raw = [
+                fx.Int32(
+                    bo.buffer_load(
+                        r_ids,
+                        fx.min(rr * 64 + lane, PICKS - 1),
+                        vec_width=1,
+                        dtype=T.i32,
+                        cache_modifier=CM_DEV,
+                    )
+                )  # fmt: skip
+                for rr in range(ROUNDS)
+            ]
         ids = [
-            fx.max(
-                fx.min(
-                    fx.Int32(
-                        bo.buffer_load(
-                            r_ids,
-                            fx.min(rr * 64 + lane, PICKS - 1),
-                            vec_width=1,
-                            dtype=T.i32,
-                            cache_modifier=CM_DEV,
-                        )
-                    ),
-                    fx.Int32(EXPERTS - 1),
-                ),
-                fx.Int32(0),
-            )  # fmt: skip
+            fx.max(fx.min(raw[rr], fx.Int32(EXPERTS - 1)), fx.Int32(0))
             for rr in range(ROUNDS)
         ]
-        cols = []
-        for rr in range_constexpr(ROUNDS):
-            # a lane's same-expert lanes of the round by the expert id's 8 bits (a
-            # ballot a bit: a fixed cost, where a turn a distinct expert took 6.8 us
-            # at 64 picks); its column = the expert's count of the earlier rounds +
-            # its same-expert lanes below it (pick order, alike on every rank); the
-            # round's lowest lane of an expert moves the expert's count
-            e = ids[rr]
-            valid = rr * 64 + lane < PICKS
-            m = ballot(valid)
-            for bit in range_constexpr(8):
-                on = (e >> bit) & 1
-                m = m & (
-                    ballot(on == 1) ^ (fx.Int64(on) - fx.Int64(1))
-                )  # its own bit's lanes
-            below = lanes_before(m, lane)
-            base = fx.ptr_load(cnt_of + e)
-            cols.append(base + below)
-            if valid & (below == 0):
-                fx.ptr_store(base + popcount(m), cnt_of + e)
-        # the experts' starts and tiles: EPL experts a lane, an exclusive prefix over the lanes
-        cn = [fx.ptr_load(cnt_of + (lane * EPL + k)) for k in range(EPL)]
-        tl = [
-            (fx.min(cn[k], fx.Int32(COLS)) + TILE_COLS - 1) // TILE_COLS
-            for k in range(EPL)
-        ]
-        tot, tsum = cn[0], tl[0]
-        for k in range_constexpr(1, EPL):
-            tot = tot + cn[k]
-            tsum = tsum + tl[k]
-        incl = lane_prefix(tot, lane)
-        tincl = lane_prefix(tsum, lane)
-        n_tiles = lane_gather(tincl, 63)
-        if lane == 0:
-            # an empty plan's first tile is expert 0, column 0 (a later real tile 0 wins)
-            fx.ptr_store(fx.Int32(0), tile_of)
-            fx.ptr_store(n_tiles, nt)
-        run, tile_run = incl - tot, tincl - tsum
-        for k in range_constexpr(EPL):
-            ek = lane * EPL + k
-            fx.ptr_store(run, start_of + ek)
-            for j in range_constexpr(TILES_PER_EXPERT):
-                if j < tl[k]:
-                    fx.ptr_store(ek * COLS + j * TILE_COLS, tile_of + (tile_run + j))
-            run = run + cn[k]
-            tile_run = tile_run + tl[k]
-        # the sorted picks (a wave's LDS operations run in order: the starts are in)
-        for rr in range_constexpr(ROUNDS):
-            p = rr * 64 + lane
-            if p < PICKS:
-                fx.ptr_store(p, sorted_ + (fx.ptr_load(start_of + ids[rr]) + cols[rr]))
+        if const_expr(ROUNDS == 1 and S <= TILE_COLS):
+            # one round, one tile an expert (S <= TILE_COLS picks of it at most): every value of the
+            # plan from 8 ballots and popcounts, no LDS round trip. Over the expert id's bits, MSB
+            # first: ``eq`` the lanes with my expert, ``less`` those with a smaller one; my column =
+            # my same-expert lanes below me (pick order), my expert's start = the picks of smaller
+            # experts, its tile = the smaller experts picked (their first lanes) - the values the
+            # general path below computes through ``cnt_of`` / the prefix sums / ``start_of``
+            e = ids[0]
+            valid = lane < PICKS
+            eq = ballot(valid)
+            less = fx.Int64(0)
+            for bit in range_constexpr(7, -1, -1):
+                on = fx.Int64((e >> bit) & 1)
+                sel = ballot(((e >> bit) & 1) == 1) ^ (
+                    on - fx.Int64(1)
+                )  # the lanes with my bit
+                less = less | (
+                    eq & (sel ^ fx.Int64(-1)) & (fx.Int64(0) - on)
+                )  # mine 1, theirs 0
+                eq = eq & sel
+            below = lanes_before(eq, lane)
+            start = popcount(less)
+            lead = valid & (below == 0)
+            leads = ballot(lead)
+            if lane == 0:
+                fx.ptr_store(popcount(leads), nt)
+            if lead:
+                fx.ptr_store(popcount(eq), cnt_of + e)
+                fx.ptr_store(start, start_of + e)
+                fx.ptr_store(e * COLS, tile_of + popcount(less & leads))
+            if valid:
+                fx.ptr_store(lane, sorted_ + (start + below))
+        else:
+            cols = []
+            for rr in range_constexpr(ROUNDS):
+                # a lane's same-expert lanes of the round by the expert id's 8 bits (a
+                # ballot a bit: a fixed cost, where a turn a distinct expert took 6.8 us
+                # at 64 picks); its column = the expert's count of the earlier rounds +
+                # its same-expert lanes below it (pick order, alike on every rank); the
+                # round's lowest lane of an expert moves the expert's count
+                e = ids[rr]
+                valid = rr * 64 + lane < PICKS
+                m = ballot(valid)
+                for bit in range_constexpr(8):
+                    on = (e >> bit) & 1
+                    m = m & (
+                        ballot(on == 1) ^ (fx.Int64(on) - fx.Int64(1))
+                    )  # its own bit's lanes
+                below = lanes_before(m, lane)
+                # (the first round's counts are the zeros stored above: no LDS round trip)
+                base = fx.Int32(0) if rr == 0 else fx.ptr_load(cnt_of + e)
+                cols.append(base + below)
+                if valid & (below == 0):
+                    fx.ptr_store(base + popcount(m), cnt_of + e)
+            # the experts' starts and tiles: EPL experts a lane, an exclusive prefix over the lanes
+            cn = [fx.ptr_load(cnt_of + (lane * EPL + k)) for k in range(EPL)]
+            tl = [
+                (fx.min(cn[k], fx.Int32(COLS)) + TILE_COLS - 1) // TILE_COLS
+                for k in range(EPL)
+            ]
+            tot, tsum = cn[0], tl[0]
+            for k in range_constexpr(1, EPL):
+                tot = tot + cn[k]
+                tsum = tsum + tl[k]
+            incl = lane_prefix(tot, lane)
+            tincl = lane_prefix(tsum, lane)
+            n_tiles = read_lane_i32(tincl, 63)
+            if lane == 0:
+                # an empty plan's first tile is expert 0, column 0 (a later real tile 0 wins)
+                fx.ptr_store(fx.Int32(0), tile_of)
+                fx.ptr_store(n_tiles, nt)
+            run, tile_run = incl - tot, tincl - tsum
+            for k in range_constexpr(EPL):
+                ek = lane * EPL + k
+                fx.ptr_store(run, start_of + ek)
+                for j in range_constexpr(TILES_PER_EXPERT):
+                    if j < tl[k]:
+                        fx.ptr_store(
+                            ek * COLS + j * TILE_COLS, tile_of + (tile_run + j)
+                        )
+                run = run + cn[k]
+                tile_run = tile_run + tl[k]
+            # the sorted picks (a wave's LDS operations run in order: the starts are in)
+            for rr in range_constexpr(ROUNDS):
+                p = rr * 64 + lane
+                if p < PICKS:
+                    fx.ptr_store(
+                        p, sorted_ + (fx.ptr_load(start_of + ids[rr]) + cols[rr])
+                    )
     gpu.barrier()
+    if const_expr(flags is not None):
+        acquire_loads()
     return uniform(fx.ptr_load(nt))
 
 
@@ -911,10 +1001,11 @@ def stage_xq_cols(c, e, col0, n, xv=None):
 
 
 @flyc.jit
-def stage_mid_q(c, e, col0, n):
+def stage_mid_q(c, e, col0, n, more=()):
     """Expert e's columns col0 .. col0 + n's mid blocks (MXFP4, from the ug items)
     into LDS in ``stage_xq_cols``' layout; every round polled in one spin (a
-    column past n polls the last one's, its store skipped)."""
+    column past n polls the last one's, its store skipped). ``more``: further tiles
+    (e, col0, n, first LDS column) staged after it."""
     S, tid, xcol, poll, mid = c["S"], c["tid"], c["xcol"], c["poll"], c["mid"]
     if const_expr(c["tpx"]):
         mid = c[
@@ -923,23 +1014,26 @@ def stage_mid_q(c, e, col0, n):
     xq_l = xcol
     xs_l = xcol + TILE_COLS * XQW
     XR = cdiv(tile_cols(S) * UG_T, THREADS)
+    tiles = [(e, col0, n, 0)] + list(more)
 
-    def specs(i):
+    def specs(e, col0, n, i):
         v = tid + THREADS * i  # block v % UG_T of column v / UG_T
         j = fx.min(v // UG_T, n - 1)
         base = (pick_at(c, e, col0 + j) * UG_T + v % UG_T) * MID_W
         return [(mid, base, 2), (mid, base + 2, 2), (mid, base + 4, 1)]
 
-    got = poll([sp for i in range(XR) for sp in specs(i)])
-    for i in range_constexpr(XR):
-        v = tid + THREADS * i
-        if v < n * UG_T:
-            words = [got[3 * i][0], got[3 * i][1], got[3 * i + 1][0], got[3 * i + 1][1]]
-            fx.ptr_store(
-                fx.Vector.from_elements(words, fx.Int32).bitcast(fx.Float32),
-                xq_l + ((v // UG_T) * XQW + (v % UG_T) * 4),
-            )
-            fx.ptr_store(got[3 * i + 2][0].bitcast(fx.Float32), xs_l + v)
+    got = poll([sp for (e, col0, n, _) in tiles for i in range(XR) for sp in specs(e, col0, n, i)], batch=3 * XR)  # a spin a tile  # fmt: skip
+    for ti, (e, col0, n, cb) in enumerate(tiles):
+        for i in range_constexpr(XR):
+            v = tid + THREADS * i
+            g = 3 * (ti * XR + i)
+            if v < n * UG_T:
+                words = [got[g][0], got[g][1], got[g + 1][0], got[g + 1][1]]
+                fx.ptr_store(
+                    fx.Vector.from_elements(words, fx.Int32).bitcast(fx.Float32),
+                    xq_l + ((cb + v // UG_T) * XQW + (v % UG_T) * 4),
+                )
+                fx.ptr_store(got[g + 2][0].bitcast(fx.Float32), xs_l + (cb * XSW + v))
     gpu.barrier()
 
 
@@ -991,6 +1085,18 @@ def put_rows(c, region, width, r, rows, e, col0, n, vals_of):
             )
 
 
+def item_range(slot, total):
+    """The first item and the item count of CTA slot ``slot`` of ``total`` items in
+    contiguous ranges: the last ``total % BLOCKS`` slots take one item more, so the
+    late tiles' ug items are on the CTAs that take longer. The dn ranges go to the
+    slots in reverse (``BLOCKS - 1 - bid``): the late tiles' dn items, which wait for
+    the longest ug ranges' mids, are on the CTAs with the shorter ug ranges, and
+    their weights land while those CTAs wait."""
+    m, r = total // BLOCKS, total % BLOCKS
+    first = slot * m + fx.max(slot - (BLOCKS - r), 0)
+    return first, m + (slot >= BLOCKS - r).select(fx.Int32(1), fx.Int32(0))
+
+
 @flyc.jit
 def stage_ug(c, n_tiles):
     """This CTA's contiguous range of the ug items (tile, 32-row block), each two
@@ -1001,8 +1107,8 @@ def stage_ug(c, n_tiles):
     S, bid, red = c["S"], c["bid"], c["red"]
     UGT, DNT = c["ug_t"], c["dn_t"]  # items a tile (TP experts: the rank's slices)
     TU = n_tiles * UGT
-    q0 = (bid * TU) // BLOCKS
-    n_items = 2 * (((bid + 1) * TU) // BLOCKS - q0)
+    q0, n_items = item_range(bid, TU)
+    n_items = 2 * n_items
     # the first tile's x goes out before the first weights: loads complete in
     # order, so x lands (and is quantized) while the weights stream
     t0 = q0 // UGT
@@ -1013,7 +1119,7 @@ def stage_ug(c, n_tiles):
     # duplicate of the last pair went out there before; a CTA without ug items
     # issues them first thing), so they land while the dn stage waits for its mids
     TD = n_tiles * DNT
-    dq0 = (bid * TD) // BLOCKS
+    dq0, _ = item_range(BLOCKS - 1 - bid, TD)
     cur = ug_or_dn_pair_loads(c, q0, 0, dq0, n_tiles, n_items == 0)
     if const_expr(pre):
         stage_xq_all(
@@ -1074,7 +1180,7 @@ def stage_ug_dyn(c, n_tiles):
     UGT, DNT = c["ug_t"], c["dn_t"]
     TU = n_tiles * UGT
     TD = n_tiles * DNT
-    dq0 = (bid * TD) // BLOCKS
+    dq0, _ = item_range(BLOCKS - 1 - bid, TD)
     ctr = c["ugq"].value
     no = fx.Int32(0) == fx.Int32(1)
     xv = xq_all_loads(c)
@@ -1126,17 +1232,30 @@ def stage_ug_dyn(c, n_tiles):
     return cur
 
 
+def dn_items_max(c):
+    """The most dn items a CTA can get (TP experts: a tile holds at least one pick), or
+    None when too many to unroll."""
+    if not c["tpx"]:
+        return None
+    ni = cdiv(min(c["S"] * TOP_K, EXPERTS * TILES_PER_EXPERT) * c["dn_t"], BLOCKS)
+    return ni if ni <= DN_UNROLL_MAX else None
+
+
 @flyc.jit
 def stage_dn(c, n_tiles, first=None):
     """This CTA's contiguous range of the dn items (tile, 32-row block): the tile's
-    mid blocks restaged at a tile boundary, the next item's weights issued before
-    this item's MFMAs, each item's 32 y rows of its columns to ``k3_y``. ``first``:
-    the first item's weights, in flight (the ug stage's last prefetch)."""
+    mid blocks restaged at a tile boundary, each item's 32 y rows of its columns to
+    ``k3_y``. ``first``: the first item's weights, in flight (the ug stage's last
+    prefetch). With few items a CTA (``dn_items_max``) the loop is unrolled and
+    DN_AHEAD items' weights are in flight, the first ones issued before the first
+    mids wait, so the stream runs on through the ug tail and the mids all-gather (a
+    rolled loop's carried weights cost a register copy that waits for them: no
+    overlap); an item past the CTA's range loads nothing."""
     S, bid, red = c["S"], c["bid"], c["red"]
     DNT = c["dn_t"]
     TD = n_tiles * DNT
-    q0 = (bid * TD) // BLOCKS
-    n_items = ((bid + 1) * TD) // BLOCKS - q0
+    q0, n_items = item_range(BLOCKS - 1 - bid, TD)
+    ni_max = dn_items_max(c)
     cur = (
         first if first is not None else dn_pair_loads(c, q0, n_tiles)
     )  # (a trace-time choice)
@@ -1169,23 +1288,28 @@ def stage_dn(c, n_tiles, first=None):
             else:
                 put(c["ss"], pick_at(c, pe, pc0 + tid) * DN_T + pq % DN_T, tot)
 
-    for i in range(0, n_items):
-        q = q0 + i
-        ti = q // DNT
-        e, col0, n = tile_info(c, ti, n_tiles)
-        if ti != cur_t:
-            gpu.barrier()  # every thread is done with the previous tile's columns
-            stage_mid_q(c, e, col0, n)
-            stamp(c, 12)  # a tile's mids arrived (the CTA's last tile's survives)
-            cur_t = ti
-        nxt = dn_pair_loads(c, q0 + fx.min(i + 1, n_items - 1), n_tiles)
-        xb = [xq_b(c, n, DN_CHUNKS, kc) for kc in range(DN_CHUNKS)]
-        par = i % 2
+    def pen_w_of(q):
+        """The item's output columns of this thread (a pair) and their pen_w."""
+        c0 = (q % DNT) * 32 + 2 * fx.min(rp, fx.Int32(15))
+        if const_expr(c["tpx"]):
+            c0 = c0 + c["rank"] * c["w2_rows"]  # the rank's output columns
+        return c0, bf2_f32(
+            fx.Int32(bo.buffer_load(r_pw, c0 // 2, vec_width=1, dtype=T.i32))
+        )
+
+    def item(q, par, w, c0, pw, e, col0, n, prev, cb=0, live=True):
+        """dn item q (``w`` its weights, reduction rows ``par``) after its tile's mids
+        are staged (from LDS column ``cb``): the MFMAs, the previous item's sums of
+        squares, the y rows / the finalized values out (``live`` false: none), this
+        item's sums of squares into ``misc``."""
         pbase = par * (2 * RED_SLOT_FLOATS)
+        xb = [xq_b(c, n, DN_CHUNKS, kc, cb) for kc in range(DN_CHUNKS)]
         for t in range_constexpr(2):
-            tile_store(c, 2 * par + t, tile_mfmas_a4(cur[t][0], cur[t][1], xb))
+            tile_store(c, 2 * par + t, tile_mfmas_a4(w[t][0], w[t][1], xb))
         gpu.barrier()
-        publish_ss((i + 1) % 2, prev_q, prev_e, prev_c0, prev_n)  # the previous item's
+        publish_ss(
+            1 - par, *prev
+        )  # the previous item's (an argument: a closure does not see a rolled loop's carried values)
 
         def y_of(row, j):
             return row_sum(red + pbase + (row // 16) * RED_SLOT_FLOATS, row % 16, j)
@@ -1207,17 +1331,11 @@ def stage_dn(c, n_tiles, first=None):
                 lambda row, j: (row % 2 == 0).select(ya, yb),
             )
         # (row pairs 16 .. 31 are no rows of the item: threads 256 .. 511 add 0)
-        c0 = (q % DNT) * 32 + 2 * fx.min(rp, fx.Int32(15))
-        if const_expr(c["tpx"]):
-            c0 = c0 + c["rank"] * c["w2_rows"]  # the rank's output columns
-        pw0, pw1 = bf2_f32(
-            fx.Int32(bo.buffer_load(r_pw, c0 // 2, vec_width=1, dtype=T.i32))
-        )
-        v0 = bf16_round(bf16_round(ya) * pw0)
-        v1 = bf16_round(bf16_round(yb) * pw1)
+        v0 = bf16_round(bf16_round(ya) * pw[0])
+        v1 = bf16_round(bf16_round(yb) * pw[1])
         if const_expr(c["tpx"]):
             # the finalized values v = bf16(y pen_w) to every rank: each finalizes the whole row
-            if (j16 < n) & (rp < 16):
+            if (j16 < n) & (rp < 16) & live:
                 at = pick_at(c, e, col0 + j16) * (MOE_HIDDEN // 2) + c0 // 2
                 for pr_ in range_constexpr(c["W"]):
                     c["put_bf"](c["peer_vx"][pr_], 2 * at, [v0, v1])
@@ -1227,8 +1345,71 @@ def stage_dn(c, n_tiles, first=None):
             fx.ptr_store(
                 ss, misc + (par * (WAVES * TILE_COLS) + wave * TILE_COLS + lane)
             )
-        prev_q, prev_e, prev_c0, prev_n = q, e, col0, n
-        cur = nxt
+
+    if const_expr(ni_max is not None):
+        # every item's pen_w first: a load issued later waits behind the weights and
+        # (past a branch's remote stores) behind their acknowledgements
+        pws = [pen_w_of(q0 + i) for i in range(ni_max)]
+        wts = [cur] + [
+            dn_pair_loads(c, q0 + k, n_tiles, k < n_items)
+            for k in range(1, min(DN_AHEAD, ni_max))
+        ]
+        # the range's (at most) two tiles' mids up front, the second at LDS column
+        # tile_cols: no branch and no poll between the items (a poll between them waits
+        # behind the earlier items' remote stores; a join made the compiler wait for
+        # every weight in flight)
+        assert 2 * tile_cols(S) <= TILE_COLS, S
+        ta = q0 // DNT
+        tb = (q0 + fx.max(n_items, 1) - 1) // DNT
+        ea, ca, na = tile_info(c, ta, n_tiles)
+        eb, cbb, nb = tile_info(c, tb, n_tiles)
+        gpu.barrier()  # every thread is done with the ug stage's LDS
+        stage_mid_q(c, ea, ca, na, more=[(eb, cbb, nb, tile_cols(S))])
+        stamp(c, 12)  # the range's mids arrived
+        for i in range_constexpr(ni_max):
+            q = q0 + i
+            c0, pw = pws[i]
+            if const_expr(i + DN_AHEAD < ni_max):
+                wts.append(
+                    dn_pair_loads(c, q0 + i + DN_AHEAD, n_tiles, i + DN_AHEAD < n_items)
+                )
+            live = fx.Int32(i) < n_items
+            second = (q // DNT) != ta
+            e, col0, n = (
+                second.select(eb, ea),
+                second.select(cbb, ca),
+                second.select(nb, na),
+            )
+            item(
+                q,
+                i % 2,
+                wts[i],
+                c0,
+                pw,
+                e,
+                col0,
+                n,
+                (prev_q, prev_e, prev_c0, prev_n),
+                second.select(fx.Int32(tile_cols(S)), fx.Int32(0)),
+                live,
+            )
+            prev_q = live.select(q, fx.Int32(-1))
+            prev_e, prev_c0, prev_n = e, col0, n
+    else:
+        for i in range(0, n_items):
+            q = q0 + i
+            ti = q // DNT
+            e, col0, n = tile_info(c, ti, n_tiles)
+            if ti != cur_t:
+                gpu.barrier()  # every thread is done with the previous tile's columns
+                stage_mid_q(c, e, col0, n)
+                stamp(c, 12)  # a tile's mids arrived (the CTA's last tile's survives)
+                cur_t = ti
+            c0, pw = pen_w_of(q)
+            nxt = dn_pair_loads(c, q0 + fx.min(i + 1, n_items - 1), n_tiles)
+            item(q, i % 2, cur, c0, pw, e, col0, n, (prev_q, prev_e, prev_c0, prev_n))
+            prev_q, prev_e, prev_c0, prev_n = q, e, col0, n
+            cur = nxt
     gpu.barrier()  # ``red`` is reused by the fin and unpool stages; the last item's partials are in
     publish_ss(
         (n_items + 1) % 2, prev_q, prev_e, prev_c0, prev_n
@@ -1394,23 +1575,30 @@ def stage_fin_tpx(c, t, part):
     col = part * AR_COLS + NV * fx.min(
         tid, AR_COLS // NV - 1
     )  # an idle thread loads the last columns
-    scs = [
-        fx.Float32(
-            bo.buffer_load(
-                rsrc(a["scores"]),
-                t * TOP_K + sl,
-                vec_width=1,
-                dtype=T.f32,
-                cache_modifier=CM_DEV,
-            )
-        )  # fmt: skip
-        for sl in range(TOP_K)
-    ]
+    sc_mb = c.get("sc_mb")
+    if const_expr(sc_mb is None):
+        scs = [
+            fx.Float32(
+                bo.buffer_load(
+                    rsrc(a["scores"]),
+                    t * TOP_K + sl,
+                    vec_width=1,
+                    dtype=T.f32,
+                    cache_modifier=CM_DEV,
+                )
+            )  # fmt: skip
+            for sl in range(TOP_K)
+        ]
     assert WAVES == TOP_K  # wave w sums slot w's squares
     got = poll(
         [(vx, (t * TOP_K + sl) * (MOE_HIDDEN // 2) + col // 2, PPT) for sl in range(TOP_K)]
         + [(ssx, (t * TOP_K + wave) * DN_T + 2 * lane, 2)]
+        + ([(sc_mb, t * TOP_K + sl, 1) for sl in range(TOP_K)] if sc_mb is not None else [])
     )  # fmt: skip
+    if const_expr(sc_mb is not None):
+        scs = [
+            got[TOP_K + 1 + sl][0].bitcast(fx.Float32) for sl in range(TOP_K)
+        ]  # the route's tagged scores
     stamp(c, 13)  # the token's v and sums of squares arrived
     tot = got[TOP_K][0].bitcast(fx.Float32) + got[TOP_K][1].bitcast(fx.Float32)
     tot = butterfly(tot, (1, 2, 4, 8, 16, 32))
@@ -1482,12 +1670,12 @@ def stage_unpool(c, first_w):
             t0 = fx.min(job_ps, b["unp_passes"] - 1) * XS_LDS_MAX
             nt = XS_LDS_MAX  # every served width is whole passes
             tl = fx.min(l16, nt - 1)
-            # the pass's rows by LDS DMA: 16 B a lane a round at M0 + 16 lane
+            # the pass's rows by LDS DMA: 16 B a lane a round at M0 + 16 lane (round i: token i)
             for i in range_constexpr(nt * (MOE_HIDDEN // 8) // THREADS):
                 v = tid + THREADS * i
                 rocdl.raw_ptr_buffer_load_lds(
                     r_f,
-                    (xcol + (i * THREADS + wave * 64) * 4).llvm_ptr,
+                    (xcol + (i * UNP_PITCH + wave * 64 * 4)).llvm_ptr,
                     16,
                     t0 * (MOE_HIDDEN * 2) + v * 16,
                     fx.Int32(0),
@@ -1508,9 +1696,7 @@ def stage_unpool(c, first_w):
             for kc in range_constexpr(UNP_STEPS):
                 k0 = wave * (MOE_HIDDEN // WAVES) + kc * 32 + 8 * g4
                 fbv = fx.Vector(
-                    fx.ptr_load(
-                        xcol + (tl * (MOE_HIDDEN // 2) + k0 // 2), result_type=V4F
-                    )
+                    fx.ptr_load(xcol + (tl * UNP_PITCH + k0 // 2), result_type=V4F)
                 )
                 acc = mfma_bf16(unp_a(c, cur[kc]), fbv.bitcast(fx.BFloat16), acc)
             fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
@@ -1607,32 +1793,63 @@ def stage_bnd(c, t, x_flag=None, x_put=None):
         release_stores()
         gpu.barrier()
         if tid == 0:
-            x_put(x_flag, t, fx.Int32(1))
+            x_put(x_flag, t * FLAG_STRIDE, fx.Int32(1))
 
 
 # ---------------------------------------------------------------- the launch's order
 @flyc.jit
-def run_k3(c, route_flag=None, xin_flag=None, x_flag=None, x_put=None, res_flag=None):
+def run_k3(
+    c,
+    route_flag=None,
+    xin_flag=None,
+    x_flag=None,
+    x_put=None,
+    res_flag=None,
+    ids_mb=None,
+    sc_mb=None,
+):
     """K3's stages on this CTA. ``route_flag`` / ``xin_flag`` (mailbox regions):
     the routing and the expert input were written earlier in this launch, flagged a
-    token each. ``x_flag`` / ``x_put``: see ``stage_bnd``."""
+    token each. ``x_flag`` / ``x_put``: see ``stage_bnd``. ``ids_mb`` (TP experts,
+    static ug items): the picks' tagged copy: the plan goes ahead of the flags'
+    wait (the route ends 1-2 us before the expert input). The first ug weights stay
+    behind the wait: issued before it, they delay the flags' poll (loads return in
+    order) by their ~5 us burst."""
     S, bid = c["S"], c["bid"]
     b = c["bases"]
     AP = c["ar_parts"]
     stamp(c, 0)
+    early = ids_mb is not None and c["tpx"] and not c["ug_dyn"]
+    # (``res_flag`` = (region, count): K2's boundary parts flag their stream columns; the
+    # boundary below reads them, and the next K1 (deferred) their c1 half)
+    late_res = res_flag is not None and not c["defer_k1"]
+    flags = None
+    # ``sc_mb`` (with ``ids_mb``, TP experts, static items): the scores' tagged copy, polled by
+    # the fin tasks; then nothing in K3 reads the route's buffers and its flags are not waited for
+    no_rflag = early and sc_mb is not None
+    if const_expr(no_rflag):
+        c["sc_mb"] = sc_mb
     if const_expr(route_flag is not None):
-        # (``res_flag`` = (region, count): K2's boundary parts flag their stream columns
-        # after the x halves the routing came from; the boundary below reads them)
-        poll_flags(
-            c,
-            [(route_flag, S), (xin_flag, S)]
-            + ([res_flag] if res_flag is not None else []),
+        flags = (
+            ([] if no_rflag else [(route_flag, 0, S, FLAG_STRIDE)])
+            + [(xin_flag, 0, S, FLAG_STRIDE)]
+            + (
+                [(res_flag[0], 0, res_flag[1], FLAG_STRIDE)]
+                if res_flag is not None and not late_res
+                else []
+            )
         )
+    if const_expr(early):
+        # the flags polled by wave 1 .. while wave 0 builds the plan (one closing barrier)
+        n_tiles = stage_plan_tpx(c, ids_mb, flags)
+    elif const_expr(flags is not None):
+        poll_flags(c, flags)
     stamp(c, 1)  # the routing and expert input arrived (a merged launch) / entry
-    if const_expr(c["tpx"]):
-        n_tiles = stage_plan_tpx(c)
-    else:
-        n_tiles = stage_plan(c)
+    if const_expr(not early):
+        if const_expr(c["tpx"]):
+            n_tiles = stage_plan_tpx(c)
+        else:
+            n_tiles = stage_plan(c)
     stamp(c, 2)  # the plan built
     if const_expr(c["ug_dyn"]):
         dn_first = stage_ug_dyn(c, n_tiles)
@@ -1654,5 +1871,7 @@ def run_k3(c, route_flag=None, xin_flag=None, x_flag=None, x_put=None, res_flag=
     stage_unpool(c, first_w)
     stamp(c, 6)  # the unpool task(s) done (unpool CTAs)
     if bid < S:
+        if const_expr(late_res):
+            poll_flags(c, [(res_flag[0], 0, res_flag[1], FLAG_STRIDE)])
         stage_bnd(c, bid, x_flag, x_put)
     stamp(c, 7)  # the boundary done (end)

@@ -40,6 +40,12 @@ their o tasks and wait on the tokens' flags behind them, as they must anyway::
     route   S tasks, chain CTA CHAIN0 + t: top-8 -> ids / scores
     xn      S tasks, stream CTA t (beside the route): the pre-expert norm -> expert input
 
+With ``kshard`` (8 rows at TP 8) the router tiles run on stream CTAs KR0 .. with their weights
+issued before the norm sums' wait, each rank pushes its K-part partial of a pooled row tile only
+to the rank owning those rows, whose ``stage_pool_sum`` CTAs (POOL_SUM0 ..) sum the eight parts
+and push the fp32 rows to every rank (24 KB a link instead of 64), and the route tasks run on
+stream CTAs ROUTE0 .. (the chain CTAs keep the stream update, which K3 does not wait for).
+
 Width scaling (8 .. 64 rows): the o GEMV holds every token's og row in LDS
 (S x 2 KB) and runs a token tile of 16 an MFMA accumulator, each tile's rows
 summed through one reduction row set in turn; the router / pooler GEMVs load
@@ -63,6 +69,7 @@ from flydsl.expr.typing import T
 from sgl_amd_mono.common.ops import (
     CM_DEV,
     CM_NT,
+    CM_SYS,
     bf2_f32,
     bf16_pair,
     bf16_round,
@@ -71,10 +78,13 @@ from sgl_amd_mono.common.ops import (
     hw_exp2,
     hw_rsq,
     mfma_bf16,
+    permlane_swap,
     row_sum,
     rsrc,
+    xshfl,
 )
 from sgl_amd_mono.common.plan import BLOCKS, PAIR_BYTES, THREADS, WAVES, pair_layout
+from sgl_amd_mono.common.sync import _spin as spin
 from sgl_amd_mono.common.sync import preg
 from sgl_amd_mono.muse_spark.gfx950.config import (
     EXPERTS,
@@ -93,6 +103,7 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
     TOP_K,
 )
 from sgl_amd_mono.muse_spark.gfx950.device import (
+    FLAG_STRIDE,
     acquire_loads,
     poll_flags,
     release_stores,
@@ -136,6 +147,7 @@ P_NS = 10  # 24 x 10 = 240 row tiles
 P_NC = 2  # 8 x 2 = 16
 assert 24 * P_NS + 8 * P_NC == MOE_HIDDEN // ROWS and P_NS <= P_SUB + 2
 P_PARTS = R_PARTS  # the pooler's K split is the router's: a CTA's two tasks share a K eighth of x
+from sgl_amd_mono.muse_spark.gfx950.stages.attention import merge_ctas  # noqa: E402
 from sgl_amd_mono.muse_spark.gfx950.stages.ffn import POOL_PARTS  # noqa: E402
 
 assert POOL_PARTS == P_PARTS
@@ -150,6 +162,7 @@ CHAIN0 = BLOCKS - MAX_TOKENS  # 192: the chain CTAs, token bid - CHAIN0's route 
 AP0 = CHAIN0  # the boundary tasks: the chain CTAs, before their pooler weights go out
 A_TASKS_MAX = BLOCKS - CHAIN0  # 64 boundary tasks at most
 R0 = 0  # the router tasks
+KR0 = MAX_TOKENS  # kshard: the router tiles past the xn CTAs (0 .. S)
 assert O_TASKS == 2 * BLOCKS and R0 + R_TASKS <= CHAIN0  # two o tasks a CTA, every CTA
 assert MAX_TOKENS <= CHAIN0 and MAX_TOKENS <= A_TASKS_MAX
 assert K_STEPS % STEP_BATCH == 0 and K_STEPS % WAVES == 0 and O_K_PER_WAVE % K_STEP == 0
@@ -203,10 +216,14 @@ def k2_scratch_layout() -> dict:
                 "k2_xinq",
                 MAX_TOKENS * (MOE_HIDDEN // 8 + MOE_HIDDEN // 32) * 4 // PAIR_BYTES,
             ),
-            ("k2_resflag", MAX_TOKENS * A_PARTS_MAX),
-            ("k2_rflag", MAX_TOKENS),
-            ("k2_xinflag", MAX_TOKENS),
-            ("k2_oflag", MAX_TOKENS * LOCAL_KV_HEADS * 4),
+            ("k2_resflag", MAX_TOKENS * A_PARTS_MAX * FLAG_STRIDE),
+            ("k2_rflag", MAX_TOKENS * FLAG_STRIDE),
+            (
+                "k2_idx",
+                MAX_TOKENS * TOP_K,
+            ),  # the picks again, tagged: K3's plan polls them (no flag hop)
+            ("k2_xinflag", MAX_TOKENS * FLAG_STRIDE),
+            ("k2_oflag", MAX_TOKENS * LOCAL_KV_HEADS * 4 * FLAG_STRIDE),
             ("k2_trace", TRACE_LAYERS * BLOCKS * TRACE_SLOTS),
         ],
         align=256,
@@ -272,6 +289,49 @@ def k2_lds(tokens: int):
 def sigmoid(z):
     """Triton's ``tl.sigmoid``: 1 / (1 + exp2(-z log2(e)))."""
     return fx.Float32(1.0) / (fx.Float32(1.0) + hw_exp2(z * fx.Float32(-LOG2E)))
+
+
+def _cs(x, y):
+    """A compare-exchange, descending."""
+    return fx.max(x, y), fx.min(x, y)
+
+
+def _sort8_bitonic(v):
+    """A bitonic list of 8 keys sorted descending (three compare-exchange levels)."""
+    v = list(v)
+    for st in (4, 2, 1):
+        for i in range(8):
+            if i & st == 0:
+                v[i], v[i + st] = _cs(v[i], v[i + st])
+    return v
+
+
+def top8_sorted(keys):
+    """The wave's 8 largest of its 4 keys a lane (distinct), descending, on every lane:
+    each lane sorts its 4, then six butterfly steps (xor 1 .. 32) each keep the top 8
+    of its list and its partner's (a bitonic merge of two descending lists: the same
+    set on both lanes). The picks are the 8 rounds of wave maxima's, in their order;
+    ~45 independent VALU ops a step instead of 8 dependent rounds of six shuffles."""
+    assert len(keys) == 4 and TOP_K == 8
+    a, b = _cs(keys[0], keys[1])
+    c, d = _cs(keys[2], keys[3])
+    a, c = _cs(a, c)
+    b, d = _cs(b, d)
+    b, c = _cs(b, c)
+    own = [a, b, c, d]
+    # xor 1: two sorted 4s -> the sorted 8 of both (own descending, the partner's ascending: bitonic)
+    oth = [xshfl(v, 1) for v in own]
+    top = _sort8_bitonic(own + oth[::-1])
+    for off in (2, 4, 8, 16, 32):
+        if off >= 16:
+            pairs = [
+                permlane_swap(off, v, v) for v in top
+            ]  # (the lower lane's, the upper lane's)
+            lo, hi = [p[0] for p in pairs], [p[1] for p in pairs]
+        else:
+            lo, hi = top, [xshfl(v, off) for v in top]
+        top = _sort8_bitonic([fx.max(lo[i], hi[7 - i]) for i in range(8)])
+    return top
 
 
 def route_key(v, e):
@@ -418,26 +478,31 @@ def stage_og_rows(c, o_flag=None, QL=8):
     row tile) flags first, then device-scope loads."""
     S, tid, lane, xs = c["S"], c["tid"], c["lane"], c["xs"]
     a = c["args"]
+    TPR = THREADS // OG_THREADS  # tokens a round: 2
+    e = ((tid % OG_THREADS) // 16) * HEAD_DIM + (lane % 16) * 4
+    rounds = list(range(0, S, TPR))
+    ts = [fx.min(t0 + tid // OG_THREADS, S - 1) for t0 in rounds]
+    # the gate's sigmoids before the flags (K1 wrote the gate, in an earlier launch)
+    sg = [[sigmoid(g) for g in ld_bf(a["g"], t * Q_K + e, 4)] for t in ts]
     o_cm = 0  # o from memory the host wrote: the default cache policy
     if const_expr(o_flag is not None):
         o_cm = CM_DEV  # the attention's device-scope stores, earlier in this launch
         rocdl.sched_barrier(0)
         RT = (QL * GQA + 15) // 16  # the attention's row tiles a (request, KV head)
-        poll_flags(c, [(o_flag, (S // QL) * LOCAL_KV_HEADS * RT)])
+        poll_flags(c, [(o_flag, 0, (S // QL) * LOCAL_KV_HEADS * RT, FLAG_STRIDE)])
         acquire_loads()
-    TPR = THREADS // OG_THREADS  # tokens a round: 2
-    e = ((tid % OG_THREADS) // 16) * HEAD_DIM + (lane % 16) * 4
-    for t0 in range_constexpr(0, S, TPR):
-        t = fx.min(t0 + tid // OG_THREADS, S - 1)
-        ov = ld_bf(a["o"], t * Q_K + e, 4, o_cm)
-        gv = ld_bf(a["g"], t * Q_K + e, 4)
+    ovs = [
+        ld_bf(a["o"], t * Q_K + e, 4, o_cm) for t in ts
+    ]  # every round's o in flight at once
+    for i in range_constexpr(len(rounds)):
+        t, ov = ts[i], ovs[i]
         ss = fx.Float32(0.0)
         for j in range_constexpr(4):
             ss = ss + ov[j] * ov[j]
         ss = butterfly(ss, (8, 4, 2, 1))
         rstd = hw_rsq(ss / float(HEAD_DIM) + RMS_EPS)
-        vals = [ov[j] * rstd * sigmoid(gv[j]) for j in range(4)]
-        if t0 + tid // OG_THREADS < S:
+        vals = [ov[j] * rstd * sg[i][j] for j in range(4)]
+        if rounds[i] + tid // OG_THREADS < S:
             fx.ptr_store(bf16_pair(vals[0], vals[1]), xs + (t * (Q_K // 2) + e // 2))
             fx.ptr_store(
                 bf16_pair(vals[2], vals[3]), xs + (t * (Q_K // 2) + e // 2 + 1)
@@ -446,55 +511,79 @@ def stage_og_rows(c, o_flag=None, QL=8):
 
 
 @flyc.jit
-def stage_o(c, task, wts):
-    """o task ``task``: rows ``16 task ..`` of o_proj for every token tile (lane l
-    of wave w holds row l % 16 and k = 128 w + 32 s + 8 (l / 16) .. of token
-    16 t + l % 16, from LDS), the waves' accumulators summed in wave order, one
-    bf16 rounding, the partial rows pushed to every rank's ``attn`` region.
-    ``wts``: the task's weights, in flight (``o_w_loads``)."""
+def stage_o(c, tasks, wts):
+    """o tasks ``tasks`` (one or two, their weights ``wts`` in flight: ``o_w_loads``): rows
+    ``16 task ..`` of o_proj for every token tile (lane l of wave w holds row l % 16 and
+    k = 128 w + 32 s + 8 (l / 16) .. of token 16 t + l % 16, from LDS), the waves'
+    accumulators summed in wave order (the tasks' through one barrier pair), one bf16
+    rounding, the partial rows pushed to every rank's ``attn`` region."""
     S, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     xs, red, misc, put_bf = c["xs"], c["red"], c["misc"], c["put_bf"]
     W, bases, rank, sy_attn = c["W"], c["bases"], c["rank"], c["sy_attn"]
     l16, g4 = lane % 16, lane // 16
     V4F = fx.Vector.make_type(4, fx.Float32)
     tiles = token_tiles(S)
-    accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(tiles)]
+    NTK = len(tasks)
+    if const_expr(NTK > 1 and (NTK * S > MAX_TOKENS or NTK > red_sets(S))):
+        for j in range_constexpr(
+            NTK
+        ):  # the rows of every task do not fit ``misc``: one at a time
+            stage_o(c, [tasks[j]], [wts[j]])
+        return
+    accs = [
+        [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(tiles)] for _ in range(NTK)
+    ]
     for s in range_constexpr(O_STEPS):
         k0 = wave * O_K_PER_WAVE + s * K_STEP + 8 * g4
-        wa = wts[s].bitcast(fx.BFloat16)
         for t in range_constexpr(tiles):
             tok = fx.min(t * TILE + l16, S - 1)
             xb = fx.Vector(
                 fx.ptr_load(xs + (tok * (Q_K // 2) + k0 // 2), result_type=V4F)
             )
-            accs[t] = mfma_bf16(wa, xb.bitcast(fx.BFloat16), accs[t])
-    # each tile's accumulators through the one reduction row set in turn (LDS)
+            for j in range_constexpr(NTK):
+                accs[j][t] = mfma_bf16(
+                    wts[j][s].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), accs[j][t]
+                )
+    # each tile's accumulators through the reduction row sets (LDS), a set a task
     for t in range_constexpr(tiles):
-        fx.ptr_store(accs[t], red + (wave * 64 + lane) * 4)
+        for j in range_constexpr(NTK):
+            fx.ptr_store(accs[j][t], red + (j * RED_FLOATS + (wave * 64 + lane) * 4))
         gpu.barrier()
         if tid < ROWS * TILE:
             r = tid % ROWS
             tk = t * TILE + tid // ROWS
             if tk < S:
-                fx.ptr_store(
-                    bf16_round(row_sum(red, r, tid // ROWS)), misc + (tk * ROWS + r)
-                )
+                for j in range_constexpr(NTK):
+                    fx.ptr_store(
+                        bf16_round(row_sum(red + j * RED_FLOATS, r, tid // ROWS)),
+                        misc + ((j * S + tk) * ROWS + r),
+                    )
         gpu.barrier()
-    # pair i: token i / 8, rows 2 (i % 8), + 1; to every rank (itself too)
+    # pair i: token i / 8, rows 2 (i % 8), + 1; to every rank (itself too), or with
+    # ``kshard`` to the rank owning the rows' K eighth only (the reduce-scatter)
     n_pairs = (ROWS // 2) * S
-    for rnd in range_constexpr(-(-n_pairs // THREADS)):
-        i = tid + rnd * THREADS
-        if i < n_pairs:
-            tk = i // (ROWS // 2)
-            rr = (i % (ROWS // 2)) * 2
-            v0 = fx.ptr_load(misc + (tk * ROWS + rr))
-            v1 = fx.ptr_load(misc + (tk * ROWS + rr + 1))
-            for p in range_constexpr(W):
-                put_bf(
-                    preg(bases[p], sy_attn, "attn"),
-                    (rank * MAX_TOKENS + tk) * HIDDEN + task * ROWS + rr,
-                    [v0, v1],
-                )
+    for j in range_constexpr(NTK):
+        task = tasks[j]
+        dsts = bases
+        if const_expr(c["kshard"]):
+            owner = task // (HIDDEN // W // ROWS)
+            dst = bases[0]
+            for p in range_constexpr(1, W):
+                dst = (owner == p).select(bases[p], dst)
+            dsts = [dst]
+        for rnd in range_constexpr(-(-n_pairs // THREADS)):
+            i = tid + rnd * THREADS
+            if i < n_pairs:
+                tk = i // (ROWS // 2)
+                rr = (i % (ROWS // 2)) * 2
+                v0 = fx.ptr_load(misc + ((j * S + tk) * ROWS + rr))
+                v1 = fx.ptr_load(misc + ((j * S + tk) * ROWS + rr + 1))
+                for p in range_constexpr(len(dsts)):
+                    put_bf(
+                        preg(dsts[p], sy_attn, "attn"),
+                        (rank * MAX_TOKENS + tk) * HIDDEN + task * ROWS + rr,
+                        [v0, v1],
+                    )
     gpu.barrier()  # ``misc`` is reused by the CTA's next task
 
 
@@ -571,6 +660,84 @@ def stage_a_part(c, t, part):
         )
 
 
+KS_COLS = (
+    HIDDEN // A_PARTS_MAX // WAVES
+)  # 128: a K-sharded owner task's columns (a wave of ``stage_a_part``'s)
+
+
+@flyc.jit
+def stage_kowner(c, t, sub):
+    """The K-sharded boundary (``kshard``, S = 8 at TP 8): rank r owns K eighth r, whose o
+    rows every rank pushed here only. This task owns token ``t``'s columns KS_COLS ``sub``
+    .. of the eighth, lane l of wave 0 the pair at 2 l: the columns and lane of wave
+    ``sub`` of ``stage_a_part``'s task (t, r), so every value and sum below is that
+    task's. Every source rank's pair (a pair a thread, the wave's source), summed in rank
+    order through LDS, one bf16 rounding; the x halves to ``xbuf`` / ``xbuf2`` (this
+    rank's GEMVs read the eighth), the wave's four norm sums to every rank's ``kss``
+    after them, the summed pairs to every rank's ``vx2`` (the stream's update)."""
+    tid, lane, wave, W, rank = c["tid"], c["lane"], c["wave"], c["W"], c["rank"]
+    put, put_bf, poll, bases = c["put"], c["put_bf"], c["poll"], c["bases"]
+    own, xbuf, xbuf2, red = c["own_attn"], c["xbuf"], c["xbuf2"], c["red"]
+    sy = c["sy"]
+    a = c["args"]
+    e0 = rank * (HIDDEN // W) + sub * KS_COLS + 2 * lane
+    prw = ld_bf(a["pre_w"], e0, 2)
+    al = ld_f32(a["alpha"], e0, 2)
+    be = ld_f32(a["beta"], e0, 2)
+    st = ld_f32(a["res"], t * HIDDEN + e0, 2)
+    rocdl.sched_barrier(0)
+    ws = poll(
+        [(own, wave * (MAX_TOKENS * HIDDEN // 2) + t * (HIDDEN // 2) + e0 // 2, 1)]
+    )
+    stamp(c, 8)  # every rank's partial o rows arrived (thread 0's)
+    lo, hi = bf2_f32(ws[0][0])
+    fx.ptr_store(lo, red + 2 * tid)
+    fx.ptr_store(hi, red + 2 * tid + 1)
+    gpu.barrier()
+    if wave == 0:
+        acc0 = fx.ptr_load(red + 2 * lane)
+        acc1 = fx.ptr_load(red + 2 * lane + 1)
+        for src in range_constexpr(1, W):
+            acc0 = acc0 + fx.ptr_load(red + (src * 128 + 2 * lane))
+            acc1 = acc1 + fx.ptr_load(red + (src * 128 + 2 * lane + 1))
+        v = [bf16_round(acc0), bf16_round(acc1)]
+        w1 = [
+            bf16_pair(prw[0] * al[0] * st[0], prw[1] * al[1] * st[1]).bitcast(fx.Int32)
+        ]
+        w2 = [bf16_pair(prw[0] * be[0] * v[0], prw[1] * be[1] * v[1]).bitcast(fx.Int32)]
+        st_words(xbuf, (t * HIDDEN + e0) // 2, w1, CM_DEV)
+        st_words(xbuf2, (t * HIDDEN + e0) // 2, w2, CM_DEV)
+        ssp, A_, B_, C_ = (
+            fx.Float32(0.0),
+            fx.Float32(0.0),
+            fx.Float32(0.0),
+            fx.Float32(0.0),
+        )
+        for k in range_constexpr(2):
+            ssp = ssp + v[k] * v[k]
+            A_ = A_ + (al[k] * st[k]) * (al[k] * st[k])
+            B_ = B_ + al[k] * be[k] * st[k] * v[k]
+            C_ = C_ + (be[k] * v[k]) * (be[k] * v[k])
+        sums = [butterfly(x, (32, 16, 8, 4, 2, 1)) for x in (ssp, A_, B_, C_)]
+        release_stores()  # the halves out before the sums that flag them
+        if lane < 4 * W:
+            q = lane % 4
+            dst = bases[0]
+            for p in range_constexpr(1, W):
+                dst = (lane // 4 == p).select(bases[p], dst)
+            val = (q == 0).select(
+                sums[0], (q == 1).select(sums[1], (q == 2).select(sums[2], sums[3]))
+            )
+            put(
+                preg(dst, sy["kss"][0], "kss"),
+                ((t * W + rank) * WAVES + sub) * 4 + q,
+                val,
+            )
+        for p in range_constexpr(W):
+            put_bf(preg(bases[p], sy["vx2"][0], "vx2"), t * HIDDEN + e0, v)
+    gpu.barrier()  # ``red`` is reused by ``wait_x``
+
+
 @flyc.jit
 def stage_a_part_res(c, t, part):
     """The rest of boundary part ``part`` of token ``t``, after the CTA's pooler job
@@ -593,38 +760,46 @@ def stage_a_part_res(c, t, part):
         npw1 = ld_bf(a["npw"], e0, NC)
         al2 = ld_f32(a["alpha2"], e0, NC)
     pb = t * (HIDDEN // 2) + e0 // 2
-    PW = 2 if PAIRS % 2 == 0 else 1
-    ws = poll(
-        [
-            (own, src * (MAX_TOKENS * HIDDEN // 2) + pb + PW * q, PW)
-            for q in range(PAIRS // PW)
-            for src in range(W)
-        ],
-        batch=max(8, (PAIRS // PW) * W),
-    )
-    v = []
-    for j in range_constexpr(PAIRS):
-        acc0, acc1 = bf2_f32(ws[(j // PW) * W][j % PW])
-        for src in range_constexpr(1, W):
-            lo, hi = bf2_f32(ws[(j // PW) * W + src][j % PW])
-            acc0 = acc0 + lo
-            acc1 = acc1 + hi
-        v += [bf16_round(acc0), bf16_round(acc1)]
-    if const_expr(A_PARTS > 1):
-        got = poll(
-            [(ss_mb, (t * A_PARTS_MAX + q) * 4, 2) for q in range(A_PARTS)],
-            batch=A_PARTS,
-        )
-        stamp(c, 9)  # the parts' norm sums arrived
-        tot = fx.Float32(0.0)
-        for q in range_constexpr(A_PARTS):
-            tot = tot + got[q][0].bitcast(fx.Float32)
+    if const_expr(c["kshard"]):
+        # the owners' summed pairs, and the post norm's rstd from ``wait_x`` (this CTA's LDS)
+        v = []
+        for j in range_constexpr(PAIRS):
+            lo, hi = bf2_f32(poll([(c["own_vx2"], pb + j, 1)])[0][0])
+            v += [lo, hi]
+        rstd = fx.ptr_load(c["misc"] + (SCAL0 + 2 * t))
     else:
-        tot = fx.Float32(0.0)
-        for k in range_constexpr(NC):
-            tot = tot + v[k] * v[k]
-        tot = block_sum4(c, tot, tot, tot, tot)[0]
-    rstd = hw_rsq(tot / float(HIDDEN) + POST_EPS)
+        PW = 2 if PAIRS % 2 == 0 else 1
+        ws = poll(
+            [
+                (own, src * (MAX_TOKENS * HIDDEN // 2) + pb + PW * q, PW)
+                for q in range(PAIRS // PW)
+                for src in range(W)
+            ],
+            batch=max(8, (PAIRS // PW) * W),
+        )
+        v = []
+        for j in range_constexpr(PAIRS):
+            acc0, acc1 = bf2_f32(ws[(j // PW) * W][j % PW])
+            for src in range_constexpr(1, W):
+                lo, hi = bf2_f32(ws[(j // PW) * W + src][j % PW])
+                acc0 = acc0 + lo
+                acc1 = acc1 + hi
+            v += [bf16_round(acc0), bf16_round(acc1)]
+        if const_expr(A_PARTS > 1):
+            got = poll(
+                [(ss_mb, (t * A_PARTS_MAX + q) * 4, 2) for q in range(A_PARTS)],
+                batch=A_PARTS,
+            )
+            stamp(c, 9)  # the parts' norm sums arrived
+            tot = fx.Float32(0.0)
+            for q in range_constexpr(A_PARTS):
+                tot = tot + got[q][0].bitcast(fx.Float32)
+        else:
+            tot = fx.Float32(0.0)
+            for k in range_constexpr(NC):
+                tot = tot + v[k] * v[k]
+            tot = block_sum4(c, tot, tot, tot, tot)[0]
+        rstd = hw_rsq(tot / float(HIDDEN) + POST_EPS)
     n = [bf16_round(v[k] * rstd) for k in range(NC)]
     new = [al[k] * st[k] + be[k] * n[k] for k in range(NC)]
     st_f32(a["res"], t * HIDDEN + e0, new, CM_DEV)
@@ -635,7 +810,7 @@ def stage_a_part_res(c, t, part):
     gpu.barrier()
     if tid == 0:
         put(
-            resflag, t * A_PARTS + part, fx.Int32(1)
+            resflag, (t * A_PARTS + part) * FLAG_STRIDE, fx.Int32(1)
         )  # the stream's part (and c1) is out
 
 
@@ -649,6 +824,8 @@ def pool_w_loads(c, rt0, part, nsub):
     l16, g4 = lane % 16, lane // 16
     r_w = rsrc(c["args"]["w_pool"])
     fp8 = c["fp8_pool"]
+    # the K-sharded pooler's copy is the rank's K eighth of every row ([MOE_HIDDEN, K_PER_WAVE])
+    kw, k0 = (K_PER_WAVE, 0) if c["kshard"] else (HIDDEN, part * K_PER_WAVE)
     out = []
     for sub in range(nsub):
         row = (rt0 + sub) * ROWS + l16
@@ -683,13 +860,7 @@ def pool_w_loads(c, rt0, part, nsub):
                 fx.Vector(
                     bo.buffer_load(
                         r_w,
-                        (
-                            row * HIDDEN
-                            + part * K_PER_WAVE
-                            + (wave * P_STEPS + kc) * K_STEP
-                            + 8 * g4
-                        )
-                        // 2,
+                        (row * kw + k0 + (wave * P_STEPS + kc) * K_STEP + 8 * g4) // 2,
                         vec_width=4,
                         dtype=T.i32,
                         cache_modifier=CM_NT,
@@ -722,27 +893,27 @@ def pool_scale(c, row):
     )
 
 
-def router_w_loads(c, tile, part):
+def router_w_loads(c, tile, part, live=None):
     """The split router's hi and lo rows of expert tile ``tile`` over this wave's
-    steps of K eighth ``part``, this lane's: ([hi steps], [lo steps])."""
+    steps of K eighth ``part``, this lane's: ([hi steps], [lo steps]). With
+    ``kshard`` the copies are the rank's K eighth of every row ([EXPERTS, K_PER_WAVE]),
+    read only where ``live`` (elsewhere zeros, no traffic)."""
     lane, wave = c["lane"], c["wave"]
     l16, g4 = lane % 16, lane // 16
     row = tile * ROWS + l16
     a = c["args"]
+    kw, k0, nbytes = HIDDEN, part * K_PER_WAVE, None
+    if c["kshard"]:
+        kw, k0 = K_PER_WAVE, 0
+        nbytes = live.select(fx.Int64(EXPERTS * K_PER_WAVE * 2), fx.Int64(0))
 
     def loads(w):
-        r_w = rsrc(w)
+        r_w = rsrc(w, nbytes)
         return [
             fx.Vector(
                 bo.buffer_load(
                     r_w,
-                    (
-                        row * HIDDEN
-                        + part * K_PER_WAVE
-                        + (wave * P_STEPS + kc) * K_STEP
-                        + 8 * g4
-                    )
-                    // 2,
+                    (row * kw + k0 + (wave * P_STEPS + kc) * K_STEP + 8 * g4) // 2,
                     vec_width=4,
                     dtype=T.i32,
                     cache_modifier=CM_NT,
@@ -754,43 +925,49 @@ def router_w_loads(c, tile, part):
     return loads(a["w_hi"]), loads(a["w_lo"])
 
 
-def x_loads(c, part, t0):
-    """Token tile t0 .. t0 + 16's x over K eighth ``part``, this wave's steps: lane
-    l16's token (clamped), 8 values a step, x = bf16(rstd2 (b1 + rstd b2)) from the
-    boundary's two halves (device-scope: other CTAs wrote them) and the token's
-    scalars (``wait_x``)."""
-    S, lane, wave, misc = c["S"], c["lane"], c["wave"], c["misc"]
+def x_halves(c, part, t0):
+    """The boundary's two x halves of token tile t0 .. t0 + 16 over K eighth ``part``,
+    this wave's steps (lane l16's token, clamped; 8 values a step), in flight:
+    device-scope loads (other CTAs wrote them)."""
+    S, lane, wave = c["S"], c["lane"], c["wave"]
     l16, g4 = lane % 16, lane // 16
     tl = fx.min(t0 + l16, S - 1)
     r1, r2 = rsrc(c["xbuf"]), rsrc(c["xbuf2"])
-    rstd = fx.ptr_load(misc + (SCAL0 + 2 * tl))
-    rstd2 = fx.ptr_load(misc + (SCAL0 + 2 * tl + 1))
     out = []
     for kc in range_constexpr(P_STEPS):
         at = (
             tl * HIDDEN + part * K_PER_WAVE + (wave * P_STEPS + kc) * K_STEP + 8 * g4
         ) // 2
-        h1 = (
-            fx.Vector(
-                bo.buffer_load(r1, at, vec_width=4, dtype=T.i32, cache_modifier=CM_DEV)
+        out.append(
+            tuple(
+                bo.buffer_load(r, at, vec_width=4, dtype=T.i32, cache_modifier=CM_DEV)
+                for r in (r1, r2)
             )
-            .bitcast(fx.BFloat16)
-            .to(fx.Float32)
         )
-        h2 = (
-            fx.Vector(
-                bo.buffer_load(r2, at, vec_width=4, dtype=T.i32, cache_modifier=CM_DEV)
-            )
-            .bitcast(fx.BFloat16)
-            .to(fx.Float32)
-        )
+    return out
+
+
+def x_loads(c, part, t0, halves=None):
+    """Token tile t0 .. t0 + 16's x over K eighth ``part``, this wave's steps: lane
+    l16's token (clamped), 8 values a step, x = bf16(rstd2 (b1 + rstd b2)) from the
+    boundary's two halves (``x_halves``, or ``halves`` already in flight) and the
+    token's scalars (``wait_x``)."""
+    S, lane, misc = c["S"], c["lane"], c["misc"]
+    tl = fx.min(t0 + lane % 16, S - 1)
+    if halves is None:
+        halves = x_halves(c, part, t0)
+    rstd = fx.ptr_load(misc + (SCAL0 + 2 * tl))
+    rstd2 = fx.ptr_load(misc + (SCAL0 + 2 * tl + 1))
+    out = []
+    for kc in range_constexpr(P_STEPS):
+        h1, h2 = (fx.Vector(w).bitcast(fx.BFloat16).to(fx.Float32) for w in halves[kc])
         words = [bf16_pair(rstd2 * (fx.Float32(h1[2 * j]) + rstd * fx.Float32(h2[2 * j])), rstd2 * (fx.Float32(h1[2 * j + 1]) + rstd * fx.Float32(h2[2 * j + 1]))).bitcast(fx.Int32) for j in range(4)]  # fmt: skip
         out.append(fx.Vector.from_elements(words, fx.Int32))
     return out
 
 
 @flyc.jit
-def stage_passes(c, rt0, part, pool_w, router_w, r_tile, is_router, nsub):
+def stage_passes(c, rt0, part, pool_w, router_w, r_tile, is_router, nsub, xh=None):
     """The pooler job (row tiles ``rt0`` .., ``part``) and, with ``router_w`` (a
     stream CTA), router task (``r_tile``, ``part``) over every token tile: x loaded
     straight into the B operands (16 B a lane a step, a token tile of 16), the
@@ -806,7 +983,7 @@ def stage_passes(c, rt0, part, pool_w, router_w, r_tile, is_router, nsub):
     for ps in range_constexpr(token_tiles(S)):
         t0 = ps * TILE
         nt = min(TILE, S - t0)
-        xb = x_loads(c, part, t0)
+        xb = x_loads(c, part, t0, xh if ps == 0 else None)
         tiles = []
         for sub in range_constexpr(nsub):
             acc = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -840,7 +1017,22 @@ def stage_passes(c, rt0, part, pool_w, router_w, r_tile, is_router, nsub):
             for j in range_constexpr(n):
                 ti = r0 + j
                 rb = red + j * RED_FLOATS
-                if const_expr(ti < nsub):
+                if const_expr(ti < nsub and c["kshard"]):
+                    # the rank's K eighth of the pooled rows: thread (token tk, rows rq .. + 4) of the
+                    # tile, an 8-byte word of plain bf16 to every rank's ``poolq`` [K part = rank]
+                    if tid < (ROWS // 4) * TILE:
+                        tk = tid // (ROWS // 4)
+                        rq = (tid % (ROWS // 4)) * 4
+                        if tk < nt:
+                            prow = (rt0 + ti) * ROWS + rq
+                            w2 = fx.Vector.from_elements([bf16_pair(row_sum(rb, rq + 2 * h, tk), row_sum(rb, rq + 2 * h + 1, tk)).bitcast(fx.Int32) for h in range(2)], fx.Int32)  # fmt: skip
+                            # to the rank owning the row (``stage_pool_sum``) only
+                            owner = prow // (MOE_HIDDEN // c["W"])
+                            dst = c["bases"][0]
+                            for pe in range_constexpr(1, c["W"]):
+                                dst = (owner == pe).select(c["bases"][pe], dst)
+                            bo.buffer_store(w2, rsrc(dst + fx.Int64(c["sy"]["poolq"][0])), ((c["rank"] * MAX_TOKENS + t0 + tk) * MOE_HIDDEN + prow) // 2, cache_modifier=CM_SYS)  # fmt: skip
+                elif const_expr(ti < nsub):
                     # pooled rows: thread (token tk, row pair rp) of the tile, bf16 pairs
                     if tid < (ROWS // 2) * TILE:
                         tk = tid // (ROWS // 2)
@@ -874,13 +1066,25 @@ def stage_passes(c, rt0, part, pool_w, router_w, r_tile, is_router, nsub):
                         tk = tid // ROWS
                         r = tid % ROWS
                         if tk < nt:
-                            put(
-                                logits,
-                                (part * MAX_TOKENS + t0 + tk) * EXPERTS
-                                + r_tile * ROWS
-                                + r,
-                                row_sum(rb, r, tk),
-                            )
+                            if const_expr(c["kshard"]):
+                                # the rank's K eighth's partial logits: every rank's ``lgx`` [K part = rank]
+                                lg = row_sum(rb, r, tk)
+                                for pe in range_constexpr(c["W"]):
+                                    put(
+                                        c["peer_lgx"][pe],
+                                        (c["rank"] * MAX_TOKENS + t0 + tk) * EXPERTS
+                                        + r_tile * ROWS
+                                        + r,
+                                        lg,
+                                    )
+                            else:
+                                put(
+                                    logits,
+                                    (part * MAX_TOKENS + t0 + tk) * EXPERTS
+                                    + r_tile * ROWS
+                                    + r,
+                                    row_sum(rb, r, tk),
+                                )
             gpu.barrier()  # ``red`` is reused by the next round
 
 
@@ -892,13 +1096,41 @@ SUMS0 = 2 * MAX_TOKENS  # then the (token, part) norm sums, 4 each
 def wait_x(c):
     """Every (token, part)'s four norm sums (stored after its x halves: their flag;
     one round, two words a thread), then each token's rstd (the post norm) and rstd2
-    (the pre-FFN norm) into LDS (``misc``) for ``x_loads``, then device-scope loads."""
+    (the pre-FFN norm) into LDS (``misc``) for ``x_loads``, then device-scope loads.
+    With ``kshard``: this rank's owners' sums first (they flag the x halves of its K
+    eighth), the halves of the first token tile issued (returned, in flight), then the
+    other ranks' sums."""
     S, tid, ss_mb, misc, poll = c["S"], c["tid"], c["ss"], c["misc"], c["poll"]
     A_PARTS = a_parts(S)
     NP = S * A_PARTS
     assert 2 * NP <= THREADS and SUMS0 + 4 * NP <= ROWS * MAX_TOKENS
     rocdl.sched_barrier(0)
-    if tid < 2 * NP:
+    if const_expr(c["kshard"]):
+        # the owners' wave sums (token, owner rank = K part, wave), one a thread, then each
+        # (token, part)'s sum over its waves in wave order (``block_sum4``'s)
+        red = c["red"]
+        assert S * A_PARTS * WAVES == THREADS and A_PARTS == c["W"]
+        local = (tid // WAVES) % A_PARTS == c["rank"]
+        if local:
+            wl = poll([(c["own_kss"], tid * 4, 2), (c["own_kss"], tid * 4 + 2, 2)])
+            for k in range_constexpr(4):
+                fx.ptr_store(wl[k // 2][k % 2].bitcast(fx.Float32), red + (4 * tid + k))
+        gpu.barrier()
+        acquire_loads()
+        halves = x_halves(c, c["rank"], 0)
+        rocdl.sched_barrier(0)
+        if not local:
+            wr = poll([(c["own_kss"], tid * 4, 2), (c["own_kss"], tid * 4 + 2, 2)])
+            for k in range_constexpr(4):
+                fx.ptr_store(wr[k // 2][k % 2].bitcast(fx.Float32), red + (4 * tid + k))
+        gpu.barrier()
+        if tid < NP:
+            for k in range_constexpr(4):
+                tot = fx.ptr_load(red + (4 * (tid * WAVES) + k))
+                for w in range_constexpr(1, WAVES):
+                    tot = tot + fx.ptr_load(red + (4 * (tid * WAVES + w) + k))
+                fx.ptr_store(tot, misc + (SUMS0 + 4 * tid + k))
+    elif tid < 2 * NP:
         tq = tid // 2
         got = poll(
             [
@@ -933,6 +1165,7 @@ def wait_x(c):
             hw_rsq(tot2 / float(HIDDEN) + RMS_EPS), misc + (SCAL0 + 2 * tid + 1)
         )
     gpu.barrier()
+    return halves if c["kshard"] else None
 
 
 # ---------------------------------------------------------------- route and xn tasks
@@ -944,8 +1177,18 @@ def stage_route(c, t, route_flag=None):
     lower expert), the picks' sigmoids / (sum + ROUTE_EPS) x ROUTE_SCALE."""
     tid, lane, wave, sig = c["tid"], c["lane"], c["wave"], c["sig"]
     put, poll, logits = c["put"], c["poll"], c["logits"]
+    if const_expr(c["kshard"]):
+        logits = c["own_lgx"]  # every rank's K eighth, pushed here
     a = c["args"]
     if wave == 0:
+        # the bias first: after the poll it would be a dependent round trip
+        bias = [
+            fx.Float32(
+                bo.buffer_load(rsrc(a["bias"]), lane + 64 * h, vec_width=1, dtype=T.f32)
+            )
+            for h in range(4)
+        ]
+        rocdl.sched_barrier(0)
         got = poll(
             [
                 (logits, (p * MAX_TOKENS + t) * EXPERTS + lane + 64 * h, 1)
@@ -962,51 +1205,43 @@ def stage_route(c, t, route_flag=None):
                 logit = logit + got[p * 4 + h][0].bitcast(fx.Float32)
             sc = sigmoid(logit * fx.Float32(ROUTER_MULT))
             fx.ptr_store(sc, sig + e)
-            b = fx.Float32(bo.buffer_load(rsrc(a["bias"]), e, vec_width=1, dtype=T.f32))
-            keys.append(route_key(sc + b, e))
-        k0, k1, k2_, k3 = keys
+            keys.append(route_key(sc + bias[h], e))
+        top = top8_sorted(keys)
         pid = fx.Int32(0)
         for p in range_constexpr(TOP_K):
-            m = butterfly(fx.max(fx.max(k0, k1), fx.max(k2_, k3)), (32, 16, 8, 4, 2, 1), fx.max)  # fmt: skip
-            k0 = (k0 == m).select(fx.Int32(-(2**31)), k0)
-            k1 = (k1 == m).select(fx.Int32(-(2**31)), k1)
-            k2_ = (k2_ == m).select(fx.Int32(-(2**31)), k2_)
-            k3 = (k3 == m).select(fx.Int32(-(2**31)), k3)
-            pid = (lane == p).select(255 - (m & 255), pid)
+            pid = (lane == p).select(255 - (top[p] & 255), pid)
         if lane < TOP_K:
+            if const_expr(route_flag is not None):
+                put(
+                    c["idx"], t * TOP_K + lane, pid
+                )  # first: the experts' plan waits on it
             w = fx.ptr_load(sig + pid)
             tot = butterfly(w, (1, 2, 4))
+            score = (
+                w / (tot + fx.Float32(ROUTE_EPS)) * fx.Float32(ROUTE_SCALE)
+            ).bitcast(fx.Int32)
+            if const_expr(route_flag is not None):
+                put(
+                    c["own_scx"], t * TOP_K + lane, score
+                )  # (this rank's peer region: K3's fin polls it with vx)
             bo.buffer_store(
                 pid, rsrc(a["ids"]), t * TOP_K + lane, cache_modifier=CM_DEV
             )
             bo.buffer_store(
-                (w / (tot + fx.Float32(ROUTE_EPS)) * fx.Float32(ROUTE_SCALE)).bitcast(
-                    fx.Int32
-                ),
-                rsrc(a["scores"]),
-                t * TOP_K + lane,
-                cache_modifier=CM_DEV,
+                score, rsrc(a["scores"]), t * TOP_K + lane, cache_modifier=CM_DEV
             )
     if const_expr(route_flag is not None):
         # the token's routing is out: its flag, for the experts' plan
         release_stores()
         gpu.barrier()
         if tid == 0:
-            put(route_flag, t, fx.Int32(1))
+            put(route_flag, t * FLAG_STRIDE, fx.Int32(1))
 
 
-@flyc.jit
-def stage_xn(c, t, xin_flag=None):
-    """xn task: token ``t``'s pre-expert norm of its pooled row (8 elements a
-    thread, the K parts' partial rows summed), weight ``xn_w``, one bf16 rounding
-    -> the expert input."""
-    tid, poll, put, pool = c["tid"], c["poll"], c["put"], c["pool"]
-    if const_expr(c["pshard"]):
-        pool = c["own_poolx"]  # every rank's row slice, pushed here
-    a = c["args"]
-    e0 = tid * 8
-    # the P_PARTS K-eighths' pooled rows (bf16 pairs), summed in part order, one round
-    got = poll(
+def _xn_pool(c, pool, t, e0):
+    """The P_PARTS K-eighths' pooled rows e0 .. e0 + 8 of token ``t`` (tagged bf16 pairs),
+    summed in part order, one round."""
+    got = c["poll"](
         [
             (pool, ((p * MAX_TOKENS + t) * MOE_HIDDEN + e0) // 2 + 2 * j, 2)
             for p in range(P_PARTS)
@@ -1021,11 +1256,128 @@ def stage_xn(c, t, xin_flag=None):
                 lo, hi = bf2_f32(got[p * 2 + j][q])
                 v[4 * j + 2 * q] = v[4 * j + 2 * q] + lo
                 v[4 * j + 2 * q + 1] = v[4 * j + 2 * q + 1] + hi
+    return v
+
+
+POOLQ_EMPTY = -1  # an unpublished ``poolq`` word: all ones (no pooled bf16 pair is two NaNs of that pattern)
+
+
+POOL_SUM0 = 16  # kshard: the stream CTAs summing this rank's pooled row tiles (past the xn CTAs)
+POOL_SUMS = MOE_HIDDEN // ROWS // 8  # 32 row tiles a rank at TP 8
+ROUTE0 = (
+    POOL_SUM0 + POOL_SUMS
+)  # kshard: the route tasks' stream CTAs (48 .., past the pool sums)
+
+
+@flyc.jit
+def stage_pool_sum(c, i):
+    """kshard: this rank's pooled row tile ``i`` (rows rank MOE_HIDDEN / W + 16 i ..): the 8 ranks'
+    K-part partials (``poolq``, bf16, pushed to this owner only) summed in part order, as xn
+    summed them, the fp32 rows to every rank's ``poolf``; the partials' words set back to all
+    ones for the next layer. Thread (token tk, rows 4 q ..) of the tile's S x 16 rows."""
+    S, tid = c["S"], c["tid"]
+    if tid < S * (ROWS // 4):
+        tk = tid // (ROWS // 4)
+        row = c["rank"] * (MOE_HIDDEN // c["W"]) + i * ROWS + (tid % (ROWS // 4)) * 4
+        r = rsrc(c["own_poolq"])
+        at = [((p * MAX_TOKENS + tk) * MOE_HIDDEN + row) // 2 for p in range(P_PARTS)]
+
+        def load_all():
+            words = []
+            for d in at:
+                w = fx.Vector(
+                    bo.buffer_load(
+                        r, d, vec_width=2, dtype=T.i32, cache_modifier=CM_SYS
+                    )
+                )
+                words += [w[0], w[1]]
+            return fx.Vector.from_elements(words, fx.Int32)
+
+        def pending(v):
+            bad = (v[0] == POOLQ_EMPTY) & (v[1] == POOLQ_EMPTY)
+            for k in range_constexpr(2, 2 * P_PARTS, 2):
+                bad = bad | ((v[k] == POOLQ_EMPTY) & (v[k + 1] == POOLQ_EMPTY))
+            return bad
+
+        w = spin(load_all, pending)
+        for d in at:
+            bo.buffer_store(
+                fx.Vector.filled(2, POOLQ_EMPTY, fx.Int32), r, d, cache_modifier=CM_SYS
+            )
+        v = [fx.Float32(0.0) for _ in range(4)]
+        for p in range_constexpr(P_PARTS):
+            for k in range_constexpr(2):
+                lo, hi = bf2_f32(w[2 * p + k])
+                v[2 * k] = v[2 * k] + lo
+                v[2 * k + 1] = v[2 * k + 1] + hi
+        words = fx.Vector.from_elements([x.bitcast(fx.Int32) for x in v], fx.Int32)
+        for pe in range_constexpr(c["W"]):
+            bo.buffer_store(words, rsrc(c["bases"][pe] + fx.Int64(c["sy"]["poolf"][0])), tk * MOE_HIDDEN + row, cache_modifier=CM_SYS)  # fmt: skip
+
+
+def _xn_poolf(c, t, e0):
+    """kshard: token ``t``'s pooled rows e0 .. e0 + 8 as their owner summed them (fp32, every 8-byte
+    word, a single-copy store, waited for until it is not all ones; ``_poolf_restore`` sets them
+    back after the token's flag)."""
+    r = rsrc(c["own_poolf"])
+    at = [t * MOE_HIDDEN + e0, t * MOE_HIDDEN + e0 + 4]
+
+    def load_all():
+        words = []
+        for d in at:
+            w = fx.Vector(
+                bo.buffer_load(r, d, vec_width=4, dtype=T.i32, cache_modifier=CM_SYS)
+            )
+            words += [w[k] for k in range(4)]
+        return fx.Vector.from_elements(words, fx.Int32)
+
+    def pending(v):
+        bad = (v[0] == POOLQ_EMPTY) & (v[1] == POOLQ_EMPTY)
+        for k in range_constexpr(2, 8, 2):
+            bad = bad | ((v[k] == POOLQ_EMPTY) & (v[k + 1] == POOLQ_EMPTY))
+        return bad
+
+    w = spin(load_all, pending)
+    return [w[k].bitcast(fx.Float32) for k in range(8)]
+
+
+def _poolf_restore(c, t, e0):
+    """``_xn_poolf``'s words set back to all ones, after the token's flag (only the next layer's
+    sums write them again, long after this release)."""
+    r = rsrc(c["own_poolf"])
+    for d in (t * MOE_HIDDEN + e0, t * MOE_HIDDEN + e0 + 4):
+        bo.buffer_store(
+            fx.Vector.filled(4, POOLQ_EMPTY, fx.Int32), r, d, cache_modifier=CM_SYS
+        )
+
+
+def sym_init(peer_bytes, npes: int) -> None:
+    """A fresh peer buffer's ``poolq`` and ``poolf``: every word unpublished (all ones)."""
+    for region in ("poolq", "poolf"):
+        off, nbytes = sym_layout(npes)[region]
+        peer_bytes[off : off + nbytes].fill_(255)
+
+
+@flyc.jit
+def stage_xn(c, t, xin_flag=None):
+    """xn task: token ``t``'s pre-expert norm of its pooled row (8 elements a
+    thread, the K parts' partial rows summed), weight ``xn_w``, one bf16 rounding
+    -> the expert input."""
+    tid, poll, put, pool = c["tid"], c["poll"], c["put"], c["pool"]
+    if const_expr(c["pshard"]):
+        pool = c["own_poolx"]  # every rank's row slice, pushed here
+    a = c["args"]
+    e0 = tid * 8
+    xw = ld_bf(a["xn_w"], e0, 8)  # before the poll: after it, a dependent round trip
+    rocdl.sched_barrier(0)
+    if const_expr(c["kshard"]):
+        v = _xn_poolf(c, t, e0)
+    else:
+        v = _xn_pool(c, pool, t, e0)
     ss = fx.Float32(0.0)
     for j in range_constexpr(8):
         ss = ss + v[j] * v[j]
     rstd = hw_rsq(block_sum(c, ss, 0) / float(MOE_HIDDEN) + RMS_EPS)
-    xw = ld_bf(a["xn_w"], e0, 8)
     out = [v[j] * rstd * xw[j] for j in range(8)]
     st_bf(a["xin"], t * MOE_HIDDEN + e0, out, CM_DEV)
     if const_expr(c["xq_pre"]):
@@ -1053,7 +1405,9 @@ def stage_xn(c, t, xin_flag=None):
         release_stores()
         gpu.barrier()
         if tid == 0:
-            put(xin_flag, t, fx.Int32(1))
+            put(xin_flag, t * FLAG_STRIDE, fx.Int32(1))
+    if const_expr(c["kshard"]):
+        _poolf_restore(c, t, e0)
 
 
 # ---------------------------------------------------------------- the CTAs' roles
@@ -1074,15 +1428,19 @@ def run_chain(c, route_flag=None, xin_flag=None, o_flag=None, QL=8):
     w_first = o_w_loads(c, bid)
     w_second = o_w_loads(c, bid + BLOCKS)
     stage_og_rows(c, o_flag, QL)
-    stage_o(c, bid, w_first)
-    stage_o(c, bid + BLOCKS, w_second)
+    stage_o(c, [bid, bid + BLOCKS], [w_first, w_second])
     stamp(c, 2)  # the o tasks done
-    if (bid >= AP0) & (bid < AP0 + A_PARTS * S):
+    if const_expr(c["kshard"]):
+        stage_kowner(c, (bid - AP0) // WAVES, (bid - AP0) % WAVES)
+    elif (bid >= AP0) & (bid < AP0 + A_PARTS * S):
         stage_a_part(c, (bid - AP0) // A_PARTS, (bid - AP0) % A_PARTS)
     stamp(c, 3)  # the boundary part done (boundary CTAs)
     # the small pooler job (P_NC row tiles past the stream CTAs' 24 P_NS), K eighth bid % 8
     part = bid % P_PARTS
-    if const_expr(c["pshard"]):
+    if const_expr(c["kshard"]):
+        # the K-sharded pooler: row tile bid of every row, the rank's K eighth
+        nsub, rt0, part = 1, bid, c["rank"]
+    elif const_expr(c["pshard"]):
         # the sharded pooler: a rank's 512 rows are 32 tiles a K part, one a CTA (24 stream, 8 chain)
         nsub = 1
         rt0 = 24 + (bid - CHAIN0) // P_PARTS
@@ -1091,21 +1449,24 @@ def run_chain(c, route_flag=None, xin_flag=None, o_flag=None, QL=8):
         rt0 = 24 * P_NS + P_NC * ((bid - CHAIN0) // P_PARTS)
     pool_w = pool_w_loads(c, rt0, part, nsub)
     rocdl.sched_barrier(0)
-    wait_x(c)
+    xh = wait_x(c)
     stamp(c, 4)  # every token's x arrived
     stage_passes(
-        c, rt0, part, pool_w, None, fx.Int32(0), fx.Int32(0) == fx.Int32(1), nsub
+        c, rt0, part, pool_w, None, fx.Int32(0), fx.Int32(0) == fx.Int32(1), nsub, xh
     )
     stamp(c, 5)  # the pooler passes done
     if (bid >= AP0) & (bid < AP0 + A_PARTS * S):
         stage_a_part_res(c, (bid - AP0) // A_PARTS, (bid - AP0) % A_PARTS)
     stamp(c, 6)  # the boundary's stream update done (boundary CTAs)
-    if tok < S:
-        stage_route(c, tok, route_flag)  # the xn task runs on stream CTA tok meanwhile
+    if const_expr(not c["kshard"]):  # (kshard: the route runs on stream CTAs ROUTE0 ..)
+        if tok < S:
+            stage_route(
+                c, tok, route_flag
+            )  # the xn task runs on stream CTA tok meanwhile
 
 
 @flyc.jit
-def run_stream(c, o_flag=None, QL=8, xin_flag=None):
+def run_stream(c, o_flag=None, QL=8, xin_flag=None, route_flag=None):
     """A stream CTA (``bid < CHAIN0``): its og task (CTAs 0 .. S), its two o tasks
     (``bid`` and ``bid + BLOCKS``), then its pooler weights, the tokens' flags, and
     the router / pooler passes (a router task's rows on CTAs R0 ..: every stream CTA
@@ -1115,32 +1476,65 @@ def run_stream(c, o_flag=None, QL=8, xin_flag=None):
     stamp(c, 1)  # entry (the og rows are computed below, no og task)
     w_first = o_w_loads(c, bid)
     w_second = o_w_loads(c, bid + BLOCKS)
-    stage_og_rows(c, o_flag, QL)
-    stage_o(c, bid, w_first)
-    stage_o(c, bid + BLOCKS, w_second)
+    if const_expr(c["kshard"] and o_flag is not None):
+        # the attention's level-2 merge CTAs [M0, M1) reach K2 last: no o tasks there; the 2 NM
+        # stream CTAs below them take one of their tasks each (zeros and no traffic elsewhere:
+        # the index past the last task)
+        M0, M1 = merge_ctas(S, QL)
+        NM = M1 - M0
+        merging = (bid >= M0) & (bid < M1)
+        h = bid - (M0 - 2 * NM)
+        helper = (h >= 0) & (h < 2 * NM)
+        third = (h < NM).select(M0 + h, BLOCKS + M0 + (h - NM))
+        third = helper.select(third, fx.Int32(O_TASKS))
+        w_third = o_w_loads(c, third)
+        if not merging:
+            stage_og_rows(c, o_flag, QL)
+            stage_o(c, [bid, bid + BLOCKS], [w_first, w_second])
+            if helper:
+                stage_o(c, [third], [w_third])
+    else:
+        stage_og_rows(c, o_flag, QL)
+        stage_o(c, [bid, bid + BLOCKS], [w_first, w_second])
     stamp(c, 2)  # the o tasks done
     stamp(c, 3)  # (the boundary parts run on the chain CTAs)
     # the pooler job: P_NS row tiles of K eighth bid % 8 (the 24 stream CTAs of an eighth)
     part = bid % P_PARTS
     nsub = 1 if c["pshard"] else P_NS
     rt0 = (bid // P_PARTS) * nsub
+    if const_expr(c["kshard"]):
+        # the K-sharded pooler: row tile bid of every row, the rank's K eighth
+        rt0, part = bid, c["rank"]
     pool_w = pool_w_loads(c, rt0, part, nsub)
+    if const_expr(c["kshard"]):
+        # the router tiles of the rank's K eighth on CTAs KR0 .. (zeros elsewhere, no traffic), not
+        # on the xn CTAs; their weights with the pooler's, landed before the norm sums
+        is_router = (bid >= KR0) & (bid < KR0 + R_TILES)
+        r_tile = fx.max(fx.min(bid - KR0, fx.Int32(R_TILES - 1)), fx.Int32(0))
+        router_w = router_w_loads(c, r_tile, part, is_router)
     rocdl.sched_barrier(0)
-    wait_x(c)
+    xh = wait_x(c)
     stamp(c, 4)  # every token's x arrived
-    # a router task on CTAs R0 .. (every stream CTA loads a tile's rows, the index
-    # clamped; they stream while the first token tile's x lands): the same K eighth
-    r_tile = fx.min((bid - R0) // R_PARTS, fx.Int32(R_TILES - 1))
-    router_w = router_w_loads(c, r_tile, part)
-    stage_passes(
-        c, rt0, part, pool_w, router_w, r_tile, (bid >= R0) & (bid < R0 + R_TASKS), nsub
-    )
+    if const_expr(not c["kshard"]):
+        # a router task on CTAs R0 .. (every stream CTA loads a tile's rows, the index
+        # clamped; they stream while the first token tile's x lands): the same K eighth
+        is_router = (bid >= R0) & (bid < R0 + R_TASKS)
+        r_tile = fx.min((bid - R0) // R_PARTS, fx.Int32(R_TILES - 1))
+        router_w = router_w_loads(c, r_tile, part)
+    stage_passes(c, rt0, part, pool_w, router_w, r_tile, is_router, nsub, xh)
     stamp(c, 5)  # the router / pooler passes done
-    stamp(c, 6)  # (the pooled rows go out with the passes)
+    if const_expr(c["kshard"]):
+        if (bid >= POOL_SUM0) & (bid < POOL_SUM0 + POOL_SUMS):
+            stage_pool_sum(c, bid - POOL_SUM0)
+        # kshard: the route tasks on stream CTAs with nothing after their passes (the chain CTAs
+        # run the stream update, which K3 does not wait for)
+        if (bid >= ROUTE0) & (bid < ROUTE0 + S):
+            stage_route(c, bid - ROUTE0, route_flag)
+    stamp(
+        c, 6
+    )  # (the pooled rows go out with the passes; kshard: summed by their owner)
     if bid < S:
-        stage_xn(
-            c, bid, xin_flag
-        )  # token bid's expert input, beside the chain CTA's route
+        stage_xn(c, bid, xin_flag)  # token bid's expert input, beside the token's route
 
 
 @flyc.jit
@@ -1155,5 +1549,5 @@ def run_k2(c, route_flag=None, xin_flag=None, o_flag=None, QL=8):
     if bid >= CHAIN0:
         run_chain(c, route_flag, xin_flag, o_flag, QL)
     else:
-        run_stream(c, o_flag, QL, xin_flag)
+        run_stream(c, o_flag, QL, xin_flag, route_flag)
     stamp(c, 7)  # end
