@@ -1,18 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Correctness-first gfx1250 DFlash2 D-MLP monokernel.
-
-This is deliberately a scalar-dot-product implementation.  It keeps the whole
-eight-token MLP half in one persistent launch and uses tagged global payloads
-for every inter-CTA and inter-rank dependency.  It is therefore useful as the
-executable numerical baseline for a later wave32-WMMA optimization without
-borrowing any of gfx950's wave64 lane mapping.
-"""
+"""gfx1250 DFlash2 D-MLP with full-K wave32 BF16 WMMA projections."""
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import msgspec
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common.epoch import kernel_symbol
@@ -36,15 +29,29 @@ from sgl_amd_mono.muse_spark.gfx1250.draft_config import (
 THREADS = 256
 WAVE_SIZE = 32
 WAVES = THREADS // WAVE_SIZE
+ROWS = 16
+WMMA_K = 32
+WMMA_ACC = 8
+RED_FLOATS = WAVES * WAVE_SIZE * WMMA_ACC
 H = HIDDEN
 I = LOCAL_INTERMEDIATE
 GU_ROWS = 2 * I
+GU_TASKS = I // ROWS
+DOWN_TASKS = H // ROWS
+GU_K_PER_WAVE = H // WAVES
+DOWN_K_PER_WAVE = I // WAVES
+GU_STEPS = GU_K_PER_WAVE // WMMA_K
+DOWN_STEPS = DOWN_K_PER_WAVE // WMMA_K
 GROUP = CONV_GROUP
 GROUPS = CONV_GROUPS
 TAPS = CONV_TAPS
 EPS = RMS_EPS
 SOURCES = kernel_sources(__name__)
 _STREAM = fx.Stream(None)
+
+assert (GU_TASKS, DOWN_TASKS) == (448, 512)
+assert (GU_K_PER_WAVE, DOWN_K_PER_WAVE) == (1024, 896)
+assert (GU_STEPS, DOWN_STEPS) == (32, 28)
 
 
 def dm_scratch_layout() -> dict:
@@ -53,6 +60,7 @@ def dm_scratch_layout() -> dict:
         [
             ("dm_h", MAX_TOKENS * H // 2),
             ("dm_coef", MAX_TOKENS * COEF_ROWS),
+            ("dm_hc", MAX_TOKENS * H // 2),
             ("dm_act", MAX_TOKENS * I // 2),
         ],
         align=256,
@@ -113,6 +121,82 @@ def _poll_bf(c, region, element):
     got = c["poll"]([(region, element // 2, 1)])
     lo, hi = bf2_f32(got[0][0])
     return ((element & 1) == 0).select(lo, hi)
+
+
+def _weight_fragment(resource, base, k0, lane):
+    """One row-major v16bf16 A fragment using legal dwordx4 loads."""
+    kh = (lane // 16) * 8
+    lo = fx.Vector(
+        bo.buffer_load(
+            resource,
+            (base + k0 + kh) // 2,
+            vec_width=4,
+            dtype=T.i32,
+            cache_modifier=2,
+        )
+    )
+    hi = fx.Vector(
+        bo.buffer_load(
+            resource,
+            (base + k0 + 16 + kh) // 2,
+            vec_width=4,
+            dtype=T.i32,
+            cache_modifier=2,
+        )
+    )
+    return fx.Vector.from_elements(
+        [lo[i] for i in range(4)] + [hi[i] for i in range(4)], fx.Int32
+    ).bitcast(fx.BFloat16)
+
+
+def _lds_fragment(xbuf, base, k0, lane):
+    """One LDS v16bf16 B fragment, with one token repeated as a WMMA column."""
+    V8B = fx.Vector.make_type(8, fx.BFloat16)
+    kh = (lane // 16) * 8
+    lo = fx.Vector(fx.ptr_load(xbuf + base + k0 + kh, result_type=V8B))
+    hi = fx.Vector(fx.ptr_load(xbuf + base + k0 + 16 + kh, result_type=V8B))
+    return fx.Vector.from_elements(
+        [lo[i] for i in range(8)] + [hi[i] for i in range(8)],
+        fx.BFloat16,
+    )
+
+
+def _wmma(a, b, acc):
+    result = rocdl.wmma_f32_16x16x32_bf16(
+        fx.Vector.make_type(WMMA_ACC, fx.Float32),
+        fx.as_ir_value(a),
+        fx.as_ir_value(b),
+        fx.as_ir_value(acc),
+        reuseA=False,
+        reuseB=False,
+    ).result
+    return fx.Vector(result)
+
+
+def _tile_value(red, plane, row, token):
+    lane = ((row % ROWS) // 8) * 16 + token
+    elem = row % 8
+    value = fx.Float32(0.0)
+    for wave in range_constexpr(WAVES):
+        value = value + fx.ptr_load(
+            red
+            + plane * RED_FLOATS
+            + (wave * WAVE_SIZE + lane) * WMMA_ACC
+            + elem
+        )
+    return value
+
+
+@flyc.jit
+def _stage_lds_input(c, region, elements):
+    """Copy tagged BF16 input into every CTA's LDS, two payload words per poll."""
+    pair_groups = c["S"] * elements // 4
+    for j in range_constexpr(pair_groups // THREADS):
+        pair = 2 * (c["tid"] + j * THREADS)
+        got = c["poll"]([(region, pair, 2)])
+        words = fx.Vector.from_elements([got[0][0], got[0][1]], fx.Int32)
+        fx.ptr_store(words.bitcast(fx.BFloat16), c["xbuf"] + pair * 2)
+    gpu.barrier()
 
 
 @flyc.jit
@@ -177,40 +261,75 @@ def _hc(c, token, k):
 
 
 @flyc.jit
-def _gu(c, token, row):
-    total = fx.Float32(0.0)
-    k = fx.Int32(0)
-    while k < H:
-        total = total + _bf(c["args"]["w_gu"], row * H + k) * _hc(c, token, k)
-        k = k + 1
-    return bf16_round(total)
-
-
-@flyc.jit
-def stage_act(c):
-    """Grouped conv0, gate/up projection and bf16 SiLU activation."""
-    total = c["S"] * I // 2
+def stage_hc(c):
+    """Materialize conv0 once at the original BF16 boundary."""
+    total = c["S"] * H // 2
     task = c["bid"] * THREADS + c["tid"]
     stride = c["B"] * THREADS
     while task < total:
-        token, pair = task // (I // 2), task % (I // 2)
-        dim = 2 * pair
-        g0, g1 = _gu(c, token, dim), _gu(c, token, dim + 1)
-        u0, u1 = _gu(c, token, I + dim), _gu(c, token, I + dim + 1)
-        s0 = bf16_round(g0 / (fx.Float32(1.0) + hw_exp2(g0 * fx.Float32(-1.4426950408889634))))
-        s1 = bf16_round(g1 / (fx.Float32(1.0) + hw_exp2(g1 * fx.Float32(-1.4426950408889634))))
-        c["put_bf"](c["act"], token * I + dim, [s0 * u0, s1 * u1])
+        token, pair = task // (H // 2), task % (H // 2)
+        element = 2 * pair
+        c["put_bf"](
+            c["hc"],
+            token * H + element,
+            [_hc(c, token, element), _hc(c, token, element + 1)],
+        )
         task = task + stride
 
 
 @flyc.jit
-def _down(c, token, row):
-    total = fx.Float32(0.0)
-    k = fx.Int32(0)
-    while k < I:
-        total = total + _bf(c["args"]["w_down"], row * I + k) * _poll_bf(c, c["act"], token * I + k)
-        k = k + 1
-    return bf16_round(total)
+def stage_act(c):
+    """Fused Gate/Up full-K WMMA and BF16 SiLU activation."""
+    _stage_lds_input(c, c["hc"], H)
+    lane, wave = c["lane"], c["wave"]
+    token = fx.min(lane % ROWS, c["S"] - 1)
+    r_w = rsrc(c["args"]["w_gu"])
+    task = c["bid"]
+    while task < GU_TASKS:
+        row0 = task * ROWS
+        row = row0 + lane % ROWS
+        gate = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+        up = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+        for step in range_constexpr(GU_STEPS):
+            k0 = wave * GU_K_PER_WAVE + step * WMMA_K
+            x = _lds_fragment(c["xbuf"], token * H, k0, lane)
+            gate = _wmma(_weight_fragment(r_w, row * H, k0, lane), x, gate)
+            up = _wmma(_weight_fragment(r_w, (I + row) * H, k0, lane), x, up)
+        fx.ptr_store(
+            gate,
+            c["wmma_red"] + (wave * WAVE_SIZE + lane) * WMMA_ACC,
+        )
+        fx.ptr_store(
+            up,
+            c["wmma_red"] + RED_FLOATS + (wave * WAVE_SIZE + lane) * WMMA_ACC,
+        )
+        gpu.barrier()
+        if c["tid"] < c["S"] * (ROWS // 2):
+            out_token = c["tid"] // (ROWS // 2)
+            dim = 2 * (c["tid"] % (ROWS // 2))
+            g0 = bf16_round(_tile_value(c["wmma_red"], 0, dim, out_token))
+            g1 = bf16_round(_tile_value(c["wmma_red"], 0, dim + 1, out_token))
+            u0 = bf16_round(_tile_value(c["wmma_red"], 1, dim, out_token))
+            u1 = bf16_round(_tile_value(c["wmma_red"], 1, dim + 1, out_token))
+            s0 = bf16_round(
+                g0
+                / (
+                    fx.Float32(1.0)
+                    + hw_exp2(g0 * fx.Float32(-1.4426950408889634))
+                )
+            )
+            s1 = bf16_round(
+                g1
+                / (
+                    fx.Float32(1.0)
+                    + hw_exp2(g1 * fx.Float32(-1.4426950408889634))
+                )
+            )
+            c["put_bf"](
+                c["act"], out_token * I + row0 + dim, [s0 * u0, s1 * u1]
+            )
+        gpu.barrier()
+        task = task + c["B"]
 
 
 @flyc.jit
@@ -230,34 +349,74 @@ def _rank_sum(c, token, element):
 
 @flyc.jit
 def stage_down_out(c):
-    """Down projection, TP rank-ordered reduction, grouped conv1 and output."""
-    total = c["S"] * H // 2
-    task = c["bid"] * THREADS + c["tid"]
-    stride = c["B"] * THREADS
-    while task < total:
-        token, pair = task // (H // 2), task % (H // 2)
-        element = 2 * pair
-        d0, d1 = _down(c, token, element), _down(c, token, element + 1)
-        mailbox_element = (c["rank"] * MAX_TOKENS + token) * H + element
-        for peer in range_constexpr(c["W"]):
-            c["put_bf"](c["peer_dm"][peer], mailbox_element, [d0, d1])
-        # In TP1 the producer immediately consumes its own global payload.  The
-        # explicit gfx1250 store wait prevents the tag dword becoming observable
-        # before the adjacent bf16 payload dword has retired.
+    """Full-K Down WMMA, ordered TP sum, grouped conv1 and output."""
+    _stage_lds_input(c, c["act"], I)
+    lane, wave = c["lane"], c["wave"]
+    token = fx.min(lane % ROWS, c["S"] - 1)
+    r_w = rsrc(c["args"]["w_down"])
+    task = c["bid"]
+    while task < DOWN_TASKS:
+        row0 = task * ROWS
+        row = row0 + lane % ROWS
+        down = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+        for step in range_constexpr(DOWN_STEPS):
+            k0 = wave * DOWN_K_PER_WAVE + step * WMMA_K
+            down = _wmma(
+                _weight_fragment(r_w, row * I, k0, lane),
+                _lds_fragment(c["xbuf"], token * I, k0, lane),
+                down,
+            )
+        fx.ptr_store(
+            down,
+            c["wmma_red"] + (wave * WAVE_SIZE + lane) * WMMA_ACC,
+        )
+        gpu.barrier()
+        out_token = c["tid"] // (ROWS // 2)
+        dim = 2 * (c["tid"] % (ROWS // 2))
+        element = row0 + dim
+        active = c["tid"] < c["S"] * (ROWS // 2)
+        if active:
+            d0 = bf16_round(_tile_value(c["wmma_red"], 0, dim, out_token))
+            d1 = bf16_round(_tile_value(c["wmma_red"], 0, dim + 1, out_token))
+            mailbox_element = (c["rank"] * MAX_TOKENS + out_token) * H + element
+            for peer in range_constexpr(c["W"]):
+                c["put_bf"](c["peer_dm"][peer], mailbox_element, [d0, d1])
+        # Only a subset of threads publishes.  The barriers make every wave
+        # retire its stores before any thread polls a peer's tagged payload.
+        gpu.barrier()
         wait_stores()
-        v0, v1 = _rank_sum(c, token, element)
-        group = element // GROUP
-        q0 = c["poll"]([(c["coef"], token * COEF_ROWS + 2 * GROUPS + group, 1)])[0][0].bitcast(fx.Float32)
-        b0, b1 = _bf(c["args"]["base"], 2 * H + element), _bf(c["args"]["base"], 2 * H + element + 1)
-        o0, o1 = (b0 + q0) * v0, (b1 + q0) * v1
-        if (token % BLOCK) >= 1:
-            p0, p1 = _rank_sum(c, token - 1, element)
-            q1 = c["poll"]([(c["coef"], token * COEF_ROWS + 3 * GROUPS + group, 1)])[0][0].bitcast(fx.Float32)
-            b0 = _bf(c["args"]["base"], 3 * H + element)
-            b1 = _bf(c["args"]["base"], 3 * H + element + 1)
-            o0, o1 = o0 + (b0 + q1) * p0, o1 + (b1 + q1) * p1
-        _store_bf2(c["args"]["out"], (token * H + element) // 2, o0, o1)
-        task = task + stride
+        gpu.barrier()
+        if active:
+            v0, v1 = _rank_sum(c, out_token, element)
+            group = element // GROUP
+            q0 = c["poll"](
+                [(c["coef"], out_token * COEF_ROWS + 2 * GROUPS + group, 1)]
+            )[0][0].bitcast(fx.Float32)
+            b0 = _bf(c["args"]["base"], 2 * H + element)
+            b1 = _bf(c["args"]["base"], 2 * H + element + 1)
+            o0, o1 = (b0 + q0) * v0, (b1 + q0) * v1
+            if (out_token % BLOCK) >= 1:
+                p0, p1 = _rank_sum(c, out_token - 1, element)
+                q1 = c["poll"](
+                    [
+                        (
+                            c["coef"],
+                            out_token * COEF_ROWS + 3 * GROUPS + group,
+                            1,
+                        )
+                    ]
+                )[0][0].bitcast(fx.Float32)
+                b0 = _bf(c["args"]["base"], 3 * H + element)
+                b1 = _bf(c["args"]["base"], 3 * H + element + 1)
+                o0, o1 = (
+                    o0 + (b0 + q1) * p0,
+                    o1 + (b1 + q1) * p1,
+                )
+            _store_bf2(
+                c["args"]["out"], (out_token * H + element) // 2, o0, o1
+            )
+        gpu.barrier()
+        task = task + c["B"]
 
 
 def build_dmlp(key: DMLPBuild):
@@ -282,7 +441,8 @@ def build_dmlp(key: DMLPBuild):
 
     @fx.struct
     class Lds:
-        red: fx.Array[fx.Float32, WAVES, 16]
+        red: fx.Array[fx.Float32, 2 * RED_FLOATS, 16]
+        xbuf: fx.Array[fx.BFloat16, MAX_TOKENS * H, 16]
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def dmlp(
@@ -302,9 +462,11 @@ def build_dmlp(key: DMLPBuild):
         c = {
             "S": key.tokens, "W": key.npes, "B": key.resident_blocks,
             "tid": tid, "bid": bid, "lane": tid % WAVE_SIZE, "wave": tid // WAVE_SIZE,
-            "rank": rank, "red": lds.red.ptr, "put": mb.put, "put_bf": mb.put_bf,
+            "rank": rank, "red": lds.red.ptr, "wmma_red": lds.red.ptr,
+            "xbuf": lds.xbuf.ptr, "put": mb.put, "put_bf": mb.put_bf,
             "poll": mb.poll, "h": sreg(scratch, layout["dm_h"][0], "dm_h"),
             "coef": sreg(scratch, layout["dm_coef"][0], "dm_coef"),
+            "hc": sreg(scratch, layout["dm_hc"][0], "dm_hc"),
             "act": sreg(scratch, layout["dm_act"][0], "dm_act"),
             "own_dm": preg(sym, sy["dm"][0], "dm"),
             "peer_dm": [preg(basep, sy["dm"][0], "dm") for basep in bases],
@@ -316,6 +478,7 @@ def build_dmlp(key: DMLPBuild):
         }
         stage_norm(c)
         stage_coef(c)
+        stage_hc(c)
         stage_act(c)
         stage_down_out(c)
 

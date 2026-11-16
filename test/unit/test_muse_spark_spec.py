@@ -132,6 +132,78 @@ def test_the_draft_config_is_accepted():
     assert len(reasons) == 2 and "head_dim" in reasons[0] and "block_size" in reasons[1]
 
 
+def test_gfx1250_draft_kernels_are_enabled_only_for_cu96(monkeypatch):
+    from sgl_amd_mono.muse_spark import draft
+
+    monkeypatch.setattr(draft, "USE_KERNELS", True)
+    monkeypatch.setattr(draft, "_gfx1250", lambda: True)
+    monkeypatch.setattr(draft, "GFX1250_PROFILE", "cu96_tp4")
+    assert draft._use_kernels()
+
+    monkeypatch.setattr(draft, "GFX1250_PROFILE", "cu192_tp4")
+    assert not draft._use_kernels()
+
+    monkeypatch.setattr(draft, "GFX1250_PROFILE", "cu96_tp4")
+    monkeypatch.setattr(draft, "USE_KERNELS", False)
+    assert not draft._use_kernels()
+
+    monkeypatch.setattr(draft, "USE_KERNELS", True)
+    monkeypatch.setattr(draft, "_gfx1250", lambda: False)
+    assert draft._use_kernels()
+
+
+def test_gfx1250_draft_runner_builds_only_the_validated_geometry(monkeypatch):
+    from sgl_amd_mono.muse_spark import draft
+
+    class Build:
+        def __init__(self, **values):
+            self.__dict__.update(values)
+
+    built = {}
+
+    def module(name):
+        if name == "draft_mlp":
+            return SimpleNamespace(
+                DMLPBuild=Build,
+                build_dmlp=lambda key: built.setdefault("mlp", key),
+            )
+        if name == "draft_attn":
+            return SimpleNamespace(
+                DAttnBuild=Build,
+                build_dattn=lambda key: built.setdefault("attn", key),
+            )
+        if name == "draft_attn_half":
+            return SimpleNamespace(
+                DPreBuild=Build,
+                DPostBuild=Build,
+                build_dpre=lambda key: built.setdefault("pre", key),
+                build_dpost=lambda key: built.setdefault("post", key),
+            )
+        raise AssertionError(name)
+
+    monkeypatch.setattr(draft, "_draft_module", module)
+    runner = object.__new__(draft.DraftRunner)
+    runner.npes = 4
+    runner.gfx1250 = True
+    runner.resident_blocks = 96
+    runner._launch = {}
+    runner._pre = {}
+    runner._attn = {}
+    runner._post = {}
+
+    runner.kernel(8)
+    runner.attn_kernels(8)
+
+    assert (built["mlp"].tokens, built["mlp"].npes) == (8, 4)
+    assert (built["pre"].tokens, built["post"].tokens) == (8, 8)
+    assert built["post"].npes == 4
+    assert (
+        built["attn"].tokens,
+        built["attn"].q_len,
+        built["attn"].resident_blocks,
+    ) == (8, 8, 96)
+
+
 def test_the_recipe_is_accepted():
     assert _config_reasons() == []
     assert _config_reasons(cfg=_replace(CFG, speculative_algorithm=None)) == []

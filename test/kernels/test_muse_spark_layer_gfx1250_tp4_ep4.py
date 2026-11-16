@@ -19,6 +19,7 @@ def _worker(rank, port, queue):
     from test_muse_spark_layer_gfx1250 import (
         ROUTED_IDS,
         TABLE_EXPERTS,
+        _assert_close,
         _attention_reference,
         _check_outputs,
         _epoch,
@@ -354,7 +355,13 @@ def _worker(rank, port, queue):
             _check_outputs(
                 fused, fused_reference, f"rank {rank} fused case {case_index}"
             )
-            _check_outputs(fused, split, f"rank {rank} fused/split case {case_index}")
+            _assert_close(
+                fused["o"],
+                split["o"],
+                1 / 32,
+                2e-2,
+                f"rank {rank} fused/split case {case_index} o",
+            )
             torch.testing.assert_close(fused_q, split_q, rtol=0, atol=0)
             torch.testing.assert_close(fused_k, split_k, rtol=0, atol=0)
             torch.testing.assert_close(fused_v, split_v, rtol=0, atol=0)

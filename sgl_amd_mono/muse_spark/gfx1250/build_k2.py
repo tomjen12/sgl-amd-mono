@@ -17,6 +17,7 @@ from sgl_amd_mono.muse_spark.gfx1250.config import (
     MAX_TOKENS,
     MOE_HIDDEN,
     Q_K,
+    RESIDENT_BLOCKS,
 )
 from sgl_amd_mono.muse_spark.gfx1250.device import mailbox_guard, step_tag
 from sgl_amd_mono.muse_spark.gfx1250.stages import post_attn
@@ -93,6 +94,10 @@ def build_k2(key: K2Build):
     def ptr(base, region):
         return base + fx.Int64(layout[region][0])
 
+    @fx.struct
+    class ProjectionLds:
+        red: fx.Array[fx.Float32, post_attn.RED_FLOATS, 16]
+
     @flyc.kernel(name=f"{name}_norm_gate", known_block_size=[32, 1, 1])
     def norm_gate(o: Int64, g: Int64, scratch: Int64):
         post_attn.stage_norm_gate(
@@ -115,6 +120,8 @@ def build_k2(key: K2Build):
         epoch: Int64,
         layer: Int32,
     ):
+        lds = fx.SharedAllocator().allocate(ProjectionLds).peek()
+        tid = fx.thread_idx.x
         mb = Mailbox(
             step_tag(epoch, layer),
             mailbox_guard(
@@ -132,8 +139,12 @@ def build_k2(key: K2Build):
         post_attn.stage_o_projection(
             {
                 "W": W,
+                "B": RESIDENT_BLOCKS,
                 "bid": fx.block_idx.x,
-                "tid": fx.thread_idx.x,
+                "tid": tid,
+                "lane": tid % 32,
+                "wave": tid // 32,
+                "red": lds.red.ptr,
                 "rank": rank,
                 "og": ptr(scratch, "k2_og"),
                 "w_o": w_o,
@@ -198,27 +209,36 @@ def build_k2(key: K2Build):
     def router(
         w_hi: Int64, w_lo: Int64, scratch: Int64
     ):
+        lds = fx.SharedAllocator().allocate(ProjectionLds).peek()
+        tid = fx.thread_idx.x
         post_attn.stage_router_pool(
             {
                 "bid": fx.block_idx.x,
-                "tid": fx.thread_idx.x,
+                "B": EXPERTS // post_attn.ROWS,
+                "tid": tid,
+                "lane": tid % 32,
+                "wave": tid // 32,
                 "rows": EXPERTS,
                 "router": True,
                 "x": ptr(scratch, "k2_x"),
                 "w0": w_hi,
                 "w1": w_lo,
                 "out": ptr(scratch, "k2_logits"),
-                "red": fx.Int64(0),
+                "red": lds.red.ptr,
             }
         )
 
     @flyc.kernel(name=f"{name}_pool", known_block_size=[THREADS, 1, 1])
     def pool(w_pool: Int64, scratch: Int64):
-        lds = fx.SharedAllocator().allocate(ReductionLds).peek()
+        lds = fx.SharedAllocator().allocate(ProjectionLds).peek()
+        tid = fx.thread_idx.x
         post_attn.stage_router_pool(
             {
                 "bid": fx.block_idx.x,
-                "tid": fx.thread_idx.x,
+                "B": RESIDENT_BLOCKS,
+                "tid": tid,
+                "lane": tid % 32,
+                "wave": tid // 32,
                 "rows": MOE_HIDDEN,
                 "router": False,
                 "x": ptr(scratch, "k2_x"),
@@ -299,7 +319,7 @@ def build_k2(key: K2Build):
             stream=stream,
         )
         oproj(w_o, scratch, sym, peers, rank, epoch, layer).launch(
-            grid=(MAX_TOKENS * HIDDEN // (2 * THREADS),),
+            grid=(HIDDEN // (post_attn.ROWS * post_attn.WAVES),),
             block=(THREADS,),
             stream=stream,
         )
@@ -307,12 +327,12 @@ def build_k2(key: K2Build):
             res, alpha, beta, pre_w, scratch, sym, peers, rank, epoch, layer
         ).launch(grid=(MAX_TOKENS,), block=(THREADS,), stream=stream)
         router(w_hi, w_lo, scratch).launch(
-            grid=(MAX_TOKENS * EXPERTS // THREADS,),
+            grid=(EXPERTS // (post_attn.ROWS * post_attn.WAVES),),
             block=(THREADS,),
             stream=stream,
         )
         pool(w_pool, scratch).launch(
-            grid=(MAX_TOKENS * MOE_HIDDEN // THREADS,),
+            grid=(MOE_HIDDEN // (post_attn.ROWS * post_attn.WAVES),),
             block=(THREADS,),
             stream=stream,
         )

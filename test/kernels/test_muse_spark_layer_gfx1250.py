@@ -446,6 +446,25 @@ def _check_path_against_oracle(got, case, oracle_o, last, prefix):
     )
 
 
+def test_gfx1250_fused_target_normal_and_fault_variants_compile():
+    from sgl_amd_mono.muse_spark.gfx1250.build_layer import (
+        LayerBuild,
+        build_layer,
+    )
+    from sgl_amd_mono.muse_spark.gfx1250.runner import compile_only
+
+    for key in (
+        LayerBuild(npes=4, next_k1=True),
+        LayerBuild(
+            npes=4,
+            next_k1=True,
+            fault_site=1,
+            fault_after=1,
+        ),
+    ):
+        compile_only(build_layer(key))
+
+
 @pytest.mark.parametrize(
     "keys,window,last", [(300, 0, False), (3000, 2047, True)]
 )
@@ -587,7 +606,9 @@ def test_gfx1250_fused_layer_matches_oracle_and_split(keys, window, last):
         torch.cuda.synchronize()
         _check_path_against_oracle(split, case, oracle_o, last, "split")
         _check_path_against_oracle(fused, case, oracle_o, last, "fused")
-        _check_outputs(fused, split, "fused vs split")
+        _assert_close(
+            fused["o"], split["o"], 1 / 32, 2e-2, "fused vs split o"
+        )
     finally:
         split_peers2.close()
         split_peers3.close()

@@ -1,15 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Correctness-first wave32 stages for the fixed-width Muse Spark K2.
-
-The implementation intentionally uses scalar dot products and separate kernel
-launches.  It is the executable numerical specification for a later WMMA port:
-every launch boundary is also a model-operation rounding boundary.
-"""
+"""Wave32-WMMA stages for the fixed-width gfx1250 Muse Spark K2."""
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.ops import (
@@ -39,6 +34,10 @@ from sgl_amd_mono.muse_spark.gfx1250.config import (
 
 THREADS = 256
 WAVES = THREADS // 32
+ROWS = 16
+WMMA_K = 32
+WMMA_ACC = 8
+RED_FLOATS = WAVES * 32 * WMMA_ACC
 
 
 def _bf(ptr, element):
@@ -68,6 +67,49 @@ def _sigmoid(x):
     return fx.Float32(1.0) / (
         fx.Float32(1.0) + hw_exp2(x * fx.Float32(-LOG2E))
     )
+
+
+def _fragment(resource, base, k0, lane, cache_modifier=0):
+    kh = (lane // 16) * 8
+    lo = fx.Vector(
+        bo.buffer_load(
+            resource,
+            (base + k0 + kh) // 2,
+            vec_width=4,
+            dtype=T.i32,
+            cache_modifier=cache_modifier,
+        )
+    )
+    hi = fx.Vector(
+        bo.buffer_load(
+            resource,
+            (base + k0 + 16 + kh) // 2,
+            vec_width=4,
+            dtype=T.i32,
+            cache_modifier=cache_modifier,
+        )
+    )
+    return fx.Vector.from_elements(
+        [lo[i] for i in range(4)] + [hi[i] for i in range(4)], fx.Int32
+    ).bitcast(fx.BFloat16)
+
+
+def _wmma(a, b, acc):
+    result = rocdl.wmma_f32_16x16x32_bf16(
+        fx.Vector.make_type(WMMA_ACC, fx.Float32),
+        fx.as_ir_value(a),
+        fx.as_ir_value(b),
+        fx.as_ir_value(acc),
+        reuseA=False,
+        reuseB=False,
+    ).result
+    return fx.Vector(result)
+
+
+def _wave_value(red, wave, row, token):
+    lane = ((row % ROWS) // 8) * 16 + token
+    elem = row % 8
+    return fx.ptr_load(red + (wave * 32 + lane) * WMMA_ACC + elem)
 
 
 @flyc.jit
@@ -104,21 +146,42 @@ def stage_norm_gate(c):
 
 @flyc.jit
 def stage_o_projection(c):
-    """Two output rows per thread, then push this rank's bf16 partial to all ranks."""
-    pair = c["bid"] * THREADS + c["tid"]
-    if pair < MAX_TOKENS * HIDDEN // 2:
-        token, row0 = pair // (HIDDEN // 2), 2 * (pair % (HIDDEN // 2))
-        a0, a1 = fx.Float32(0.0), fx.Float32(0.0)
-        k = fx.Int32(0)
-        while k < Q_K:
-            x = _bf(c["og"], token * Q_K + k)
-            a0 = a0 + _bf(c["w_o"], row0 * Q_K + k) * x
-            a1 = a1 + _bf(c["w_o"], (row0 + 1) * Q_K + k) * x
-            k = k + 1
-        a0, a1 = bf16_round(a0), bf16_round(a1)
-        element = (c["rank"] * MAX_TOKENS + token) * HIDDEN + row0
+    """Eight full-K O tiles per CTA: one independent tile per wave."""
+    lane, wave = c["lane"], c["wave"]
+    token = fx.min(lane % ROWS, MAX_TOKENS - 1)
+    r_w, r_x = rsrc(c["w_o"]), rsrc(c["og"])
+    tile = c["bid"] * WAVES + wave
+    row0 = tile * ROWS
+    row = row0 + lane % ROWS
+    acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+    for step in range_constexpr(Q_K // WMMA_K):
+        k0 = step * WMMA_K
+        acc = _wmma(
+            _fragment(r_w, row * Q_K, k0, lane, cache_modifier=2),
+            _fragment(r_x, token * Q_K, k0, lane),
+            acc,
+        )
+    fx.ptr_store(acc, c["red"] + (wave * 32 + lane) * WMMA_ACC)
+    gpu.barrier()
+    for p in range_constexpr(2):
+        out = c["tid"] + p * THREADS
+        tile_wave = out // (MAX_TOKENS * (ROWS // 2))
+        within = out % (MAX_TOKENS * (ROWS // 2))
+        out_token = within // (ROWS // 2)
+        dim = 2 * (within % (ROWS // 2))
+        element = (c["bid"] * WAVES + tile_wave) * ROWS + dim
+        a0 = bf16_round(_wave_value(c["red"], tile_wave, dim, out_token))
+        a1 = bf16_round(
+            _wave_value(c["red"], tile_wave, dim + 1, out_token)
+        )
+        peer_element = (
+            c["rank"] * MAX_TOKENS + out_token
+        ) * HIDDEN + element
         for peer in range_constexpr(c["W"]):
-            c["put_bf"](c["peer_attn"][peer], element, [a0, a1])
+            c["put_bf"](
+                c["peer_attn"][peer], peer_element, [a0, a1]
+            )
+    gpu.barrier()
 
 
 @flyc.jit
@@ -177,34 +240,60 @@ def stage_boundary(c):
 
 @flyc.jit
 def stage_router_pool(c):
-    """One scalar, fixed-order dot product per router or pooler output."""
-    out = c["bid"] * THREADS + c["tid"]
-    total = c["rows"] * MAX_TOKENS
-    if out < total:
-        token, row = out // c["rows"], out % c["rows"]
-        acc = fx.Float32(0.0)
-        k = fx.Int32(0)
-        while k < HIDDEN:
-            xv = _bf(c["x"], token * HIDDEN + k)
-            if c["router"]:
-                acc = acc + xv * _bf(c["w0"], row * HIDDEN + k)
-                acc = acc + xv * _bf(c["w1"], row * HIDDEN + k)
-            else:
-                acc = acc + xv * _bf(c["w0"], row * HIDDEN + k)
-            k = k + 1
+    """Eight full-K router/pooler tiles per CTA, one per wave."""
+    lane, wave = c["lane"], c["wave"]
+    token = fx.min(lane % ROWS, MAX_TOKENS - 1)
+    r_x, r_w0 = rsrc(c["x"]), rsrc(c["w0"])
+    r_w1 = rsrc(c["w1"]) if c["router"] else r_w0
+    tile = c["bid"] * WAVES + wave
+    row0 = tile * ROWS
+    row = row0 + lane % ROWS
+    vacc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+    for step in range_constexpr(HIDDEN // WMMA_K):
+        k0 = step * WMMA_K
+        x = _fragment(r_x, token * HIDDEN, k0, lane)
+        vacc = _wmma(
+            _fragment(r_w0, row * HIDDEN, k0, lane, cache_modifier=2),
+            x,
+            vacc,
+        )
         if c["router"]:
-            bo.buffer_store(acc, rsrc(c["out"]), token * EXPERTS + row)
-        else:
-            # Adjacent threads own adjacent rows.  Only even rows publish the pair.
-            fx.ptr_store(acc, c["red"] + c["tid"])
-            gpu.barrier()
-            if (row & 1) == 0:
-                _st_bf2(
-                    c["out"],
-                    (token * MOE_HIDDEN + row) // 2,
-                    acc,
-                    fx.ptr_load(c["red"] + c["tid"] + 1),
-                )
+            vacc = _wmma(
+                _fragment(r_w1, row * HIDDEN, k0, lane, cache_modifier=2),
+                x,
+                vacc,
+            )
+    fx.ptr_store(vacc, c["red"] + (wave * 32 + lane) * WMMA_ACC)
+    gpu.barrier()
+    if c["router"]:
+        for p in range_constexpr(4):
+            out = c["tid"] + p * THREADS
+            tile_wave = out // (MAX_TOKENS * ROWS)
+            within = out % (MAX_TOKENS * ROWS)
+            out_token, dim = within // ROWS, within % ROWS
+            value = _wave_value(c["red"], tile_wave, dim, out_token)
+            bo.buffer_store(
+                value,
+                rsrc(c["out"]),
+                out_token * EXPERTS
+                + (c["bid"] * WAVES + tile_wave) * ROWS
+                + dim,
+            )
+    else:
+        for p in range_constexpr(2):
+            out = c["tid"] + p * THREADS
+            tile_wave = out // (MAX_TOKENS * (ROWS // 2))
+            within = out % (MAX_TOKENS * (ROWS // 2))
+            out_token = within // (ROWS // 2)
+            dim = 2 * (within % (ROWS // 2))
+            row = (c["bid"] * WAVES + tile_wave) * ROWS + dim
+            _st_bf2(
+                c["out"],
+                (out_token * MOE_HIDDEN + row) // 2,
+                _wave_value(c["red"], tile_wave, dim, out_token),
+                _wave_value(c["red"], tile_wave, dim + 1, out_token),
+            )
+    gpu.barrier()
 
 
 @flyc.jit

@@ -73,6 +73,21 @@ def test_kattn_maps_all_bs1_query_heads_over_profile_ctas():
     assert L.kattn_lds_bytes() < 4 * 1024
 
 
+def test_fused_target_attention_cu96_geometry_and_scratch():
+    assert (L.FUSED_TILES, L.FUSED_SPLITS, L.FUSED_TASKS) == (16, 6, 96)
+    assert (L.FUSED_ROWS, L.FUSED_KEY_BLOCK, L.FUSED_BLOCK_STRIDE) == (
+        16,
+        32,
+        48,
+    )
+    assert L.FUSED_DIM_TILES == 4
+    assert L.FUSED_STAT_FLOATS * 4 == 12_288
+    assert L.FUSED_GLOBAL_FLOATS * 4 == 2_048
+    assert L.FUSED_PART_FLOATS * 4 == 393_216
+    assert L.FUSED_TASKS * 8 == 768
+    assert L.FUSED_TILES * 8 == 128
+
+
 @pytest.mark.parametrize("block_id", [-1, C.RESIDENT_BLOCKS])
 def test_invalid_block_is_rejected(block_id):
     with pytest.raises(ValueError):

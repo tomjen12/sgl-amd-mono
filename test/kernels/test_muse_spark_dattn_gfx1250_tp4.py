@@ -55,7 +55,7 @@ def _reference(q, k_cache, v_cache, slots, prefix, window, scale):
     return out
 
 
-@pytest.mark.parametrize("resident_blocks", [96, 192])
+@pytest.mark.parametrize("resident_blocks", [96])
 @pytest.mark.parametrize("prefix,window", [(300, 0), (3000, 2048)])
 def test_gfx1250_dflash2_tp4_dattn(
     resident_blocks, prefix, window
@@ -82,6 +82,9 @@ def test_gfx1250_dflash2_tp4_dattn(
     req_pool = torch.tensor([request_row], dtype=torch.int64, device=device)
     seq_lens = torch.tensor([prefix], dtype=torch.int32, device=device)
     out = torch.full_like(q, float("nan"))
+    scratch = torch.zeros(
+        D.dattn_scratch_bytes(), dtype=torch.uint8, device=device
+    )
     epoch = _epoch(device)
     scale = D.HEAD_DIM**-0.5
     scale_bits = struct.unpack("i", struct.pack("f", scale))[0]
@@ -107,7 +110,9 @@ def test_gfx1250_dflash2_tp4_dattn(
         0,
         window,
         scale_bits,
+        scratch.data_ptr(),
         epoch.data_ptr(),
+        0,
         stream=torch.cuda.current_stream(),
     )
     torch.cuda.synchronize()

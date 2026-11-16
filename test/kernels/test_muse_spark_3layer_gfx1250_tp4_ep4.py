@@ -15,6 +15,7 @@ reference dequantizes only routed expert slices, never a dense expert table.
 import os
 import sys
 import time
+import traceback
 
 import pytest
 import torch
@@ -716,6 +717,8 @@ def _worker(rank, port, queue):
         for layer_index, layer in enumerate(layers):
             outputs = _layer_outputs(device)
             _reset(outputs, fused_stream)
+            base_stream = fused_stream.clone()
+            base_attn_input = fused_attn_input.clone()
             weights = layer["weights"]
             last = layer_index == len(layers) - 1
             current_q, current_k = q.clone(), k.clone()
@@ -772,12 +775,14 @@ def _worker(rank, port, queue):
             )  # fmt: skip
             torch.cuda.synchronize()
             dist.barrier()
-            fused_layers.append(
-                _snapshot(
-                    outputs, current_q, current_k, current_v, current_gate
-                )
+            snapshot = _snapshot(
+                outputs, current_q, current_k, current_v, current_gate
             )
+            snapshot["base_stream"] = base_stream
+            snapshot["base_attn_input"] = base_attn_input
+            fused_layers.append(snapshot)
             fused_stream = outputs["res"].clone()
+            fused_attn_input = outputs["attn_out"].clone()
             fused_epoch[0] += 1
             if not last:
                 k, v = next_kv
@@ -786,112 +791,122 @@ def _worker(rank, port, queue):
             zip(layers, split_layers, fused_layers)
         ):
             layer_index = layer_offset + 1
-            _check_outputs(fused, split, f"rank {rank} paths layer {layer_index}")
-            q_ref, k_ref, v_ref, g_ref = k1_reference(
-                split["base_attn_input"],
-                layer["qkvg"],
-                cos_sin,
-                positions,
-                layer["rope"],
-            )
-            for name, expected, tolerance in (
-                ("q", q_ref, 1 / 32),
-                ("k", k_ref, 1 / 32),
-                ("v", v_ref, 1 / 128),
-                ("g", g_ref, 1 / 128),
+            for path_name, path, k_cache, v_cache in (
+                ("split", split, split_k_cache, split_v_cache),
+                ("fused", fused, fused_k_cache, fused_v_cache),
             ):
-                k1_close(
-                    split[name], expected, tolerance,
-                    f"split layer {layer_index} {name}",
+                q_ref, k_ref, v_ref, g_ref = k1_reference(
+                    path["base_attn_input"],
+                    layer["qkvg"],
+                    cos_sin,
+                    positions,
+                    layer["rope"],
+                )
+                for name, expected, tolerance in (
+                    ("q", q_ref, 1 / 32),
+                    ("k", k_ref, 1 / 32),
+                    ("v", v_ref, 1 / 128),
+                    ("g", g_ref, 1 / 128),
+                ):
+                    k1_close(
+                        path[name],
+                        expected,
+                        tolerance,
+                        f"{path_name} layer {layer_index} {name}",
+                    )
+                attention_ref = _attention_reference(
+                    q_ref,
+                    k_cache[layer_offset],
+                    v_cache[layer_offset],
+                    layer["table"],
+                    KEYS,
+                    layer["window"],
+                    SOFTMAX_SCALE,
+                )
+                _assert_close(
+                    path["o"],
+                    attention_ref,
+                    1 / 32,
+                    2e-2,
+                    f"rank {rank} {path_name} layer {layer_index} o",
+                )
+                post_ref = _distributed_post_reference(
+                    layer, path["o"], path["g"], path["base_stream"]
+                )
+                assert torch.equal(path["ids"], post_ref["ids"])
+                _assert_close(
+                    path["scores"],
+                    post_ref["scores"],
+                    1 / 64,
+                    1e-4,
+                    f"rank {rank} {path_name} layer {layer_index} scores",
+                )
+                _assert_close(
+                    path["xin"],
+                    post_ref["xin"],
+                    1 / 32,
+                    2e-2,
+                    f"rank {rank} {path_name} layer {layer_index} xin",
+                )
+                _assert_close(
+                    path["res"],
+                    post_ref["res"],
+                    1 / 32,
+                    0.15,
+                    f"rank {rank} {path_name} layer {layer_index} res",
+                )
+                _assert_close(
+                    path["attn_out"],
+                    post_ref["attn_out"],
+                    1 / 32,
+                    0.3,
+                    f"rank {rank} {path_name} layer {layer_index} attn_out",
+                )
+
+                expected_k = layer["k_initial"].clone()
+                expected_v = layer["v_initial"].clone()
+                write_slots = (
+                    layer["swa_map"][layer["slots"]]
+                    if layer["sliding"]
+                    else layer["slots"]
+                )
+                expected_k[write_slots] = _fp8(
+                    path["k"].reshape(8, -1, 64)
+                )
+                expected_v[write_slots] = _fp8(
+                    path["v"].reshape(8, -1, 64)
                 )
                 torch.testing.assert_close(
-                    fused[name], split[name], rtol=0, atol=0
+                    k_cache[layer_offset].float(),
+                    expected_k.float(),
+                    rtol=0,
+                    atol=0,
                 )
-            attention_ref = _attention_reference(
-                q_ref,
-                split_k_cache[layer_offset],
-                split_v_cache[layer_offset],
-                layer["table"],
-                KEYS,
-                layer["window"],
-                SOFTMAX_SCALE,
-            )
-            _assert_close(
-                split["o"], attention_ref, 1 / 32, 2e-2,
-                f"rank {rank} split layer {layer_index} o",
-            )
-            post_ref = _distributed_post_reference(
-                layer, split["o"], split["g"], split["base_stream"]
-            )
-            assert torch.equal(split["ids"], post_ref["ids"])
-            _assert_close(
-                split["scores"], post_ref["scores"], 1 / 64, 1e-4,
-                f"rank {rank} split layer {layer_index} scores",
-            )
-            _assert_close(
-                split["xin"], post_ref["xin"], 1 / 32, 2e-2,
-                f"rank {rank} split layer {layer_index} xin",
-            )
-            _assert_close(
-                split["res"], post_ref["res"], 1 / 32, 0.15,
-                f"rank {rank} split layer {layer_index} res",
-            )
-            _assert_close(
-                split["attn_out"], post_ref["attn_out"], 1 / 32, 0.3,
-                f"rank {rank} split layer {layer_index} attn_out",
-            )
+                torch.testing.assert_close(
+                    v_cache[layer_offset].float(),
+                    expected_v.float(),
+                    rtol=0,
+                    atol=0,
+                )
 
-            expected_k = layer["k_initial"].clone()
-            expected_v = layer["v_initial"].clone()
-            write_slots = (
-                layer["swa_map"][layer["slots"]]
-                if layer["sliding"]
-                else layer["slots"]
-            )
-            expected_k[write_slots] = _fp8(split["k"].reshape(8, -1, 64))
-            expected_v[write_slots] = _fp8(split["v"].reshape(8, -1, 64))
-            torch.testing.assert_close(
-                split_k_cache[layer_offset].float(),
-                expected_k.float(),
-                rtol=0,
-                atol=0,
-            )
-            torch.testing.assert_close(
-                split_v_cache[layer_offset].float(),
-                expected_v.float(),
-                rtol=0,
-                atol=0,
-            )
-
-        final_split = split_layers[-1]["attn_out"].float()
         final_oracle = oracle_layers[-1]["attn_out"].float()
-        nrmse = (
-            (final_split - final_oracle).square().mean().sqrt()
-            / final_oracle.square().mean().sqrt()
-        )
-        cosine = torch.nn.functional.cosine_similarity(
-            final_split.flatten(), final_oracle.flatten(), dim=0
-        )
-        assert nrmse < 0.5, f"three-layer NRMSE {nrmse.item():.4f}"
-        assert cosine > 0.85, f"three-layer cosine {cosine.item():.4f}"
-        torch.testing.assert_close(
-            fused_layers[-1]["attn_out"],
-            split_layers[-1]["attn_out"],
-            rtol=0,
-            atol=0,
-        )
-        for layer_index, layer in enumerate(layers):
-            torch.testing.assert_close(
-                fused_k_cache[layer_index].float(),
-                split_k_cache[layer_index].float(),
-                rtol=0,
-                atol=0,
+        for path_name, path_layers in (
+            ("split", split_layers),
+            ("fused", fused_layers),
+        ):
+            final = path_layers[-1]["attn_out"].float()
+            nrmse = (
+                (final - final_oracle).square().mean().sqrt()
+                / final_oracle.square().mean().sqrt()
             )
-            torch.testing.assert_close(
-                fused_v_cache[layer_index].float(),
-                split_v_cache[layer_index].float(),
-                rtol=0,
-                atol=0,
+            cosine = torch.nn.functional.cosine_similarity(
+                final.flatten(), final_oracle.flatten(), dim=0
+            )
+            assert nrmse < 0.5, (
+                f"{path_name} three-layer NRMSE {nrmse.item():.4f}"
+            )
+            assert cosine > 0.85, (
+                f"{path_name} three-layer cosine {cosine.item():.4f}"
             )
 
         for epoch_name, epoch in (
@@ -907,7 +922,13 @@ def _worker(rank, port, queue):
         )
         queue.put((rank, None, elapsed))
     except Exception as error:  # return useful child failures instead of a timeout
-        queue.put((rank, repr(error), time.monotonic() - started))
+        queue.put(
+            (
+                rank,
+                "".join(traceback.format_exception(error)),
+                time.monotonic() - started,
+            )
+        )
     finally:
         for peer in peers:
             peer.close()
@@ -971,5 +992,7 @@ def test_gfx1250_tp4_ep4_three_checkpoint_layers_match_all_paths():
         for rank, error, elapsed in results
         if error is not None
     ]
+    for rank, error, elapsed in failures:
+        print(f"rank {rank} failed after {elapsed:.2f}s:\n{error}")
     assert not failures, failures
     assert max(elapsed for _, _, elapsed in results) < HOST_CEILING_S

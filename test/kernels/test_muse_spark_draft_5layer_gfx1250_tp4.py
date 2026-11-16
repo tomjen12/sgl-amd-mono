@@ -10,6 +10,7 @@ the following layer.
 import os
 import struct
 import sys
+import traceback
 
 import pytest
 import torch
@@ -288,6 +289,9 @@ def _worker(rank, port, queue, checkpoint=None):
         pre_scratch = torch.zeros(
             DH.dp_scratch_bytes(), dtype=torch.uint8, device=device
         )
+        attn_scratch = torch.zeros(
+            DA.dattn_scratch_bytes(), dtype=torch.uint8, device=device
+        )
         post_scratch = torch.zeros(
             DH.do_scratch_bytes(), dtype=torch.uint8, device=device
         )
@@ -331,13 +335,6 @@ def _worker(rank, port, queue, checkpoint=None):
                 hidden, residual, first, aw, cos_sin, positions
             )
             res_pre_ref, q_ref, k_ref, v_ref, coef_ref = expected_pre
-            k_cache_ref, v_cache_ref = k_cache.clone(), v_cache.clone()
-            k_cache_ref[current_slots.long()] = k_ref.reshape(
-                MAX_TOKENS, LOCAL_KV_HEADS, HEAD_DIM
-            ).to(torch.float8_e4m3fn)
-            v_cache_ref[current_slots.long()] = v_ref.reshape(
-                MAX_TOKENS, LOCAL_KV_HEADS, HEAD_DIM
-            ).to(torch.float8_e4m3fn)
 
             res_pre = torch.empty_like(hidden)
             q = torch.empty(
@@ -358,7 +355,9 @@ def _worker(rank, port, queue, checkpoint=None):
                 layer, stream=torch.cuda.current_stream(),
             )
             torch.cuda.synchronize()
-            assert torch.equal(res_pre, res_pre_ref)
+            assert torch.equal(res_pre, res_pre_ref), (
+                f"layer {layer} D-pre residual mismatch"
+            )
             _close(q, q_ref, f"layer {layer} D-pre q")
             _close(coef, coef_ref, f"layer {layer} D-pre coef", rtol=1 / 32)
             _close(
@@ -379,9 +378,9 @@ def _worker(rank, port, queue, checkpoint=None):
             )
 
             o_ref = attn_reference(
-                q_ref,
-                k_cache_ref,
-                v_cache_ref,
+                q,
+                k_cache,
+                v_cache,
                 token_slots,
                 PREFIX,
                 WINDOW,
@@ -393,16 +392,17 @@ def _worker(rank, port, queue, checkpoint=None):
                 v_cache.data_ptr(), table.data_ptr(), TABLE_STRIDE,
                 table.numel() * table.element_size(), request_pool.data_ptr(),
                 1, prefix_lens.data_ptr(), 0, WINDOW, scale_bits,
-                epoch.data_ptr(), stream=torch.cuda.current_stream(),
+                attn_scratch.data_ptr(), epoch.data_ptr(), layer,
+                stream=torch.cuda.current_stream(),
             )
             torch.cuda.synchronize()
             _close(o, o_ref, f"layer {layer} D-attn", rtol=1 / 32, atol=0.02)
 
             local_post = (
-                o_ref.float() @ aw["w_o"].float().T
+                o.float() @ aw["w_o"].float().T
             ).to(torch.bfloat16)
             reduced_post = _rank_ordered_sum(local_post, dist.group.WORLD)
-            post_delta = coef_ref.reshape(
+            post_delta = coef.reshape(
                 MAX_TOKENS, 2, 2, COEF_ROWS // 4
             )
             attn_out_ref = attn_conv(
@@ -421,7 +421,7 @@ def _worker(rank, port, queue, checkpoint=None):
             _close(attn_out, attn_out_ref, f"layer {layer} D-post")
 
             res_out_ref, mlp_coef, hc = _prefix_reference(
-                res_pre_ref, attn_out_ref, mw
+                res_pre, attn_out, mw
             )
             local_down = _rank_partial(
                 hc, mw["w_gu"], mw["w_down"]
@@ -443,7 +443,9 @@ def _worker(rank, port, queue, checkpoint=None):
                 stream=torch.cuda.current_stream(),
             )
             torch.cuda.synchronize()
-            assert torch.equal(res_out, res_out_ref)
+            assert torch.equal(res_out, res_out_ref), (
+                f"layer {layer} D-MLP residual mismatch"
+            )
             _close(out, out_ref, f"layer {layer} D-MLP")
             hidden, residual, first = out, res_out, False
 
@@ -451,8 +453,8 @@ def _worker(rank, port, queue, checkpoint=None):
             guard.ERR_DEADLINE : guard.ERR_FAULT + 1
         ].tolist() == [0, 0, 0]
         queue.put((rank, None))
-    except BaseException as error:
-        queue.put((rank, repr(error)))
+    except BaseException:
+        queue.put((rank, traceback.format_exc()))
     finally:
         if post_peers is not None:
             post_peers.close()

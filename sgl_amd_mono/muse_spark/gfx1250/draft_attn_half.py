@@ -1,16 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Correctness-first gfx1250 DFlash2 attention boundary monokernels.
-
-The implementation is intentionally independent of gfx950's wave64 MFMA lane
-layout.  Work is distributed over the selected 96/192 resident-CTA profile and
-all cross-CTA/rank dependencies use bounded, generation-tagged mailboxes.
-"""
+"""gfx1250 DFlash2 attention boundaries with wave32 BF16 WMMA projections."""
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import msgspec
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common.epoch import kernel_symbol
@@ -27,7 +22,11 @@ from sgl_amd_mono.common.ops import (
 )
 from sgl_amd_mono.common.plan import kernel_sources, key_tuple, pair_layout
 from sgl_amd_mono.common.sync import Mailbox, preg, sreg
-from sgl_amd_mono.muse_spark.gfx1250.device import mailbox_guard, step_tag
+from sgl_amd_mono.muse_spark.gfx1250.device import (
+    mailbox_guard,
+    step_tag,
+    wait_stores,
+)
 from sgl_amd_mono.muse_spark.gfx1250.draft_config import (
     BLOCK,
     COEF_ROWS,
@@ -48,6 +47,10 @@ from sgl_amd_mono.muse_spark.gfx1250.draft_config import (
 THREADS = 256
 WAVE_SIZE = 32
 WAVES = THREADS // WAVE_SIZE
+ROWS = 16
+WMMA_K = 32
+WMMA_ACC = 8
+RED_FLOATS = WAVES * WAVE_SIZE * WMMA_ACC
 H = HIDDEN
 GROUP = CONV_GROUP
 GROUPS = CONV_GROUPS
@@ -55,8 +58,19 @@ TAPS = CONV_TAPS
 EPS = RMS_EPS
 KV_K = LOCAL_KV_HEADS * HEAD_DIM
 QKV_HEADS = LOCAL_Q_HEADS + 2 * LOCAL_KV_HEADS
+COEF_TASKS = COEF_ROWS // ROWS
+QKV_TASKS = QKV_ROWS // ROWS
+O_TASKS = H // ROWS
+K_PER_WAVE = H // WAVES
+K_STEPS = K_PER_WAVE // WMMA_K
+O_K_PER_WAVE = Q_K // WAVES
+O_STEPS = O_K_PER_WAVE // WMMA_K
 SOURCES = kernel_sources(__name__)
 _STREAM = fx.Stream(None)
+
+assert (COEF_TASKS, QKV_TASKS, O_TASKS) == (128, 160, 512)
+assert K_PER_WAVE == 1024 and K_STEPS == 32
+assert O_K_PER_WAVE == 256 and O_STEPS == 8
 
 
 def dp_scratch_layout() -> dict:
@@ -140,6 +154,77 @@ def _poll_bf(c, region, element):
     return ((element & 1) == 0).select(lo, hi)
 
 
+def _weight_fragment(resource, base, k0, lane, cache_modifier=2):
+    kh = (lane // 16) * 8
+    lo = fx.Vector(
+        bo.buffer_load(
+            resource,
+            (base + k0 + kh) // 2,
+            vec_width=4,
+            dtype=T.i32,
+            cache_modifier=cache_modifier,
+        )
+    )
+    hi = fx.Vector(
+        bo.buffer_load(
+            resource,
+            (base + k0 + 16 + kh) // 2,
+            vec_width=4,
+            dtype=T.i32,
+            cache_modifier=cache_modifier,
+        )
+    )
+    return fx.Vector.from_elements(
+        [lo[i] for i in range(4)] + [hi[i] for i in range(4)], fx.Int32
+    ).bitcast(fx.BFloat16)
+
+
+def _lds_fragment(xbuf, base, k0, lane):
+    V8B = fx.Vector.make_type(8, fx.BFloat16)
+    kh = (lane // 16) * 8
+    lo = fx.Vector(fx.ptr_load(xbuf + base + k0 + kh, result_type=V8B))
+    hi = fx.Vector(fx.ptr_load(xbuf + base + k0 + 16 + kh, result_type=V8B))
+    return fx.Vector.from_elements(
+        [lo[i] for i in range(8)] + [hi[i] for i in range(8)],
+        fx.BFloat16,
+    )
+
+
+def _wmma(a, b, acc):
+    result = rocdl.wmma_f32_16x16x32_bf16(
+        fx.Vector.make_type(WMMA_ACC, fx.Float32),
+        fx.as_ir_value(a),
+        fx.as_ir_value(b),
+        fx.as_ir_value(acc),
+        reuseA=False,
+        reuseB=False,
+    ).result
+    return fx.Vector(result)
+
+
+def _tile_value(red, row, token):
+    lane = ((row % ROWS) // 8) * 16 + token
+    elem = row % 8
+    value = fx.Float32(0.0)
+    for wave in range_constexpr(WAVES):
+        value = value + fx.ptr_load(
+            red + (wave * WAVE_SIZE + lane) * WMMA_ACC + elem
+        )
+    return value
+
+
+@flyc.jit
+def _stage_lds_input(c, region):
+    """Copy all eight tagged BF16 rows into every CTA's LDS."""
+    pair_groups = c["S"] * H // 4
+    for j in range_constexpr(pair_groups // THREADS):
+        pair = 2 * (c["tid"] + j * THREADS)
+        got = c["poll"]([(region, pair, 2)])
+        words = fx.Vector.from_elements([got[0][0], got[0][1]], fx.Int32)
+        fx.ptr_store(words.bitcast(fx.BFloat16), c["xbuf"] + pair * 2)
+    gpu.barrier()
+
+
 @flyc.jit
 def _block_sum(value, lane, wave, red):
     # Native wave32 butterfly, followed by an eight-wave LDS reduction.
@@ -181,25 +266,40 @@ def stage_norm_in(c):
 
 @flyc.jit
 def stage_coef(c):
-    """Kernel projection, with adjacent rows sharing each tagged h load."""
-    task = c["bid"] * THREADS + c["tid"]
-    stride = c["B"] * THREADS
-    total = c["S"] * COEF_ROWS // 2
-    while task < total:
-        token, pair = task // (COEF_ROWS // 2), task % (COEF_ROWS // 2)
-        row0 = 2 * pair
-        a0, a1 = fx.Float32(0.0), fx.Float32(0.0)
-        k = fx.Int32(0)
-        while k < H:
-            x = _poll_bf(c, c["h"], token * H + k)
-            a0 = a0 + _bf(c["args"]["w_kp"], row0 * H + k) * x
-            a1 = a1 + _bf(c["args"]["w_kp"], (row0 + 1) * H + k) * x
-            k = k + 1
-        c["put"](c["coef"], token * COEF_ROWS + row0, a0)
-        c["put"](c["coef"], token * COEF_ROWS + row0 + 1, a1)
-        bo.buffer_store(a0, rsrc(c["args"]["coef_out"]), token * COEF_ROWS + row0)
-        bo.buffer_store(a1, rsrc(c["args"]["coef_out"]), token * COEF_ROWS + row0 + 1)
-        task = task + stride
+    """Full-K WMMA kernel projection with fp32 coefficients."""
+    _stage_lds_input(c, c["h"])
+    lane, wave = c["lane"], c["wave"]
+    token = fx.min(lane % ROWS, c["S"] - 1)
+    r_w = rsrc(c["args"]["w_kp"])
+    task = c["bid"]
+    while task < COEF_TASKS:
+        row0 = task * ROWS
+        row = row0 + lane % ROWS
+        acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+        for step in range_constexpr(K_STEPS):
+            k0 = wave * K_PER_WAVE + step * WMMA_K
+            acc = _wmma(
+                _weight_fragment(r_w, row * H, k0, lane),
+                _lds_fragment(c["xbuf"], token * H, k0, lane),
+                acc,
+            )
+        fx.ptr_store(
+            acc, c["wmma_red"] + (wave * WAVE_SIZE + lane) * WMMA_ACC
+        )
+        gpu.barrier()
+        if c["tid"] < c["S"] * ROWS:
+            out_token = c["tid"] // ROWS
+            dim = c["tid"] % ROWS
+            value = _tile_value(c["wmma_red"], dim, out_token)
+            out_row = row0 + dim
+            c["put"](c["coef"], out_token * COEF_ROWS + out_row, value)
+            bo.buffer_store(
+                value,
+                rsrc(c["args"]["coef_out"]),
+                out_token * COEF_ROWS + out_row,
+            )
+        gpu.barrier()
+        task = task + c["B"]
 
 
 @flyc.jit
@@ -234,22 +334,40 @@ def stage_conv0(c):
 
 @flyc.jit
 def stage_qkv(c):
-    """QKV projection, rounded to bf16 before per-head processing."""
-    task = c["bid"] * THREADS + c["tid"]
-    stride = c["B"] * THREADS
-    total = c["S"] * QKV_ROWS // 2
-    while task < total:
-        token, pair = task // (QKV_ROWS // 2), task % (QKV_ROWS // 2)
-        row0 = 2 * pair
-        a0, a1 = fx.Float32(0.0), fx.Float32(0.0)
-        k = fx.Int32(0)
-        while k < H:
-            x = _poll_bf(c, c["hc"], token * H + k)
-            a0 = a0 + _bf(c["args"]["w_qkv"], row0 * H + k) * x
-            a1 = a1 + _bf(c["args"]["w_qkv"], (row0 + 1) * H + k) * x
-            k = k + 1
-        c["put_bf"](c["qkv"], token * QKV_ROWS + row0, [bf16_round(a0), bf16_round(a1)])
-        task = task + stride
+    """Full-K QKV WMMA, rounded to BF16 before per-head processing."""
+    _stage_lds_input(c, c["hc"])
+    lane, wave = c["lane"], c["wave"]
+    token = fx.min(lane % ROWS, c["S"] - 1)
+    r_w = rsrc(c["args"]["w_qkv"])
+    task = c["bid"]
+    while task < QKV_TASKS:
+        row0 = task * ROWS
+        row = row0 + lane % ROWS
+        acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+        for step in range_constexpr(K_STEPS):
+            k0 = wave * K_PER_WAVE + step * WMMA_K
+            acc = _wmma(
+                _weight_fragment(r_w, row * H, k0, lane),
+                _lds_fragment(c["xbuf"], token * H, k0, lane),
+                acc,
+            )
+        fx.ptr_store(
+            acc, c["wmma_red"] + (wave * WAVE_SIZE + lane) * WMMA_ACC
+        )
+        gpu.barrier()
+        if c["tid"] < c["S"] * (ROWS // 2):
+            out_token = c["tid"] // (ROWS // 2)
+            dim = 2 * (c["tid"] % (ROWS // 2))
+            c["put_bf"](
+                c["qkv"],
+                out_token * QKV_ROWS + row0 + dim,
+                [
+                    bf16_round(_tile_value(c["wmma_red"], dim, out_token)),
+                    bf16_round(_tile_value(c["wmma_red"], dim + 1, out_token)),
+                ],
+            )
+        gpu.barrier()
+        task = task + c["B"]
 
 
 def _cs(ptr, pos, index):
@@ -315,24 +433,43 @@ def run_dpre(c):
 
 @flyc.jit
 def stage_o(c):
-    """Local [8192, 2048] projection and bf16 rank-partial publication."""
-    task = c["bid"] * THREADS + c["tid"]
-    stride = c["B"] * THREADS
-    total = c["S"] * H // 2
-    while task < total:
-        token, pair = task // (H // 2), task % (H // 2)
-        row0 = 2 * pair
-        a0, a1 = fx.Float32(0.0), fx.Float32(0.0)
-        k = fx.Int32(0)
-        while k < Q_K:
-            x = _bf(c["args"]["o"], token * Q_K + k)
-            a0 = a0 + _bf(c["args"]["w_o"], row0 * Q_K + k) * x
-            a1 = a1 + _bf(c["args"]["w_o"], (row0 + 1) * Q_K + k) * x
-            k = k + 1
-        element = (c["rank"] * MAX_TOKENS + token) * H + row0
-        for peer in range_constexpr(c["W"]):
-            c["put_bf"](c["peer_do"][peer], element, [bf16_round(a0), bf16_round(a1)])
-        task = task + stride
+    """Full-K O projection WMMA and BF16 rank-partial publication."""
+    lane, wave = c["lane"], c["wave"]
+    token = fx.min(lane % ROWS, c["S"] - 1)
+    r_w, r_o = rsrc(c["args"]["w_o"]), rsrc(c["args"]["o"])
+    task = c["bid"]
+    while task < O_TASKS:
+        row0 = task * ROWS
+        row = row0 + lane % ROWS
+        acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+        for step in range_constexpr(O_STEPS):
+            k0 = wave * O_K_PER_WAVE + step * WMMA_K
+            acc = _wmma(
+                _weight_fragment(r_w, row * Q_K, k0, lane),
+                _weight_fragment(
+                    r_o, token * Q_K, k0, lane, cache_modifier=0
+                ),
+                acc,
+            )
+        fx.ptr_store(
+            acc, c["wmma_red"] + (wave * WAVE_SIZE + lane) * WMMA_ACC
+        )
+        gpu.barrier()
+        if c["tid"] < c["S"] * (ROWS // 2):
+            out_token = c["tid"] // (ROWS // 2)
+            dim = 2 * (c["tid"] % (ROWS // 2))
+            element = row0 + dim
+            d0 = bf16_round(_tile_value(c["wmma_red"], dim, out_token))
+            d1 = bf16_round(_tile_value(c["wmma_red"], dim + 1, out_token))
+            peer_element = (c["rank"] * MAX_TOKENS + out_token) * H + element
+            for peer in range_constexpr(c["W"]):
+                c["put_bf"](
+                    c["peer_do"][peer], peer_element, [d0, d1]
+                )
+        gpu.barrier()
+        wait_stores()
+        gpu.barrier()
+        task = task + c["B"]
 
 
 @flyc.jit
@@ -383,7 +520,8 @@ def build_dpre(key: DPreBuild):
 
     @fx.struct
     class Lds:
-        red: fx.Array[fx.Float32, WAVES, 16]
+        red: fx.Array[fx.Float32, RED_FLOATS, 16]
+        xbuf: fx.Array[fx.BFloat16, MAX_TOKENS * H, 16]
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def dpre(
@@ -406,7 +544,8 @@ def build_dpre(key: DPreBuild):
         )
         c = {
             "S": key.tokens, "B": key.resident_blocks, "tid": tid, "bid": bid,
-            "lane": tid % WAVE_SIZE, "wave": tid // WAVE_SIZE, "red": lds.red.ptr,
+            "lane": tid % WAVE_SIZE, "wave": tid // WAVE_SIZE,
+            "red": lds.red.ptr, "wmma_red": lds.red.ptr, "xbuf": lds.xbuf.ptr,
             "put": mb.put, "put_bf": mb.put_bf, "poll": mb.poll,
             "h": sreg(scratch, layout["dp_h"][0], "dp_h"),
             "hc": sreg(scratch, layout["dp_hc"][0], "dp_hc"),
@@ -455,6 +594,10 @@ def build_dpost(key: DPostBuild):
         f=key.fault_site,
     )
 
+    @fx.struct
+    class Lds:
+        red: fx.Array[fx.Float32, RED_FLOATS, 16]
+
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def dpost(
         o: Int64, w_o: Int64, coef: Int64, base: Int64, attn_out: Int64,
@@ -462,6 +605,7 @@ def build_dpost(key: DPostBuild):
         epoch: Int64, layer: Int32,
     ):
         tid, bid = fx.thread_idx.x, fx.block_idx.x
+        lds = fx.SharedAllocator().allocate(Lds).peek()
         active_guard = mailbox_guard(
             epoch, own=sym, peers=peers, rank=rank, npes=key.npes,
             flags_offset=do_sym_bytes(key.npes), fault_site=key.fault_site or None,
@@ -471,7 +615,9 @@ def build_dpost(key: DPostBuild):
         bases = peer_bases(peers, key.npes)
         c = {
             "S": key.tokens, "W": key.npes, "B": key.resident_blocks,
-            "tid": tid, "bid": bid, "rank": rank, "put_bf": mb.put_bf,
+            "tid": tid, "bid": bid, "lane": tid % WAVE_SIZE,
+            "wave": tid // WAVE_SIZE, "rank": rank,
+            "wmma_red": lds.red.ptr, "put_bf": mb.put_bf,
             "poll": mb.poll, "own_do": preg(sym, sy["do"][0], "do"),
             "peer_do": [preg(basep, sy["do"][0], "do") for basep in bases],
             "args": {"o": o, "w_o": w_o, "coef": coef, "base": base, "attn_out": attn_out},

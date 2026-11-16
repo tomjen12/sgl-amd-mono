@@ -35,7 +35,6 @@ from sgl_amd_mono.muse_spark.gfx1250.config import (
 )
 from sgl_amd_mono.muse_spark.gfx1250.device import mailbox_guard, step_tag
 from sgl_amd_mono.muse_spark.gfx1250.layout import (
-    KATTN_TASK_ROUNDS,
     KATTN_TASKS,
     RESIDENT_BLOCKS,
     THREADS,
@@ -51,12 +50,9 @@ from sgl_amd_mono.muse_spark.gfx1250.stages import (
 SOURCES = kernel_sources(__name__)
 _STREAM = fx.Stream(None)
 _ALIGN = 256
-O_PROJECTION_TASKS = MAX_TOKENS * HIDDEN // (2 * THREADS)
-O_PROJECTION_ROUNDS = (
-    O_PROJECTION_TASKS + RESIDENT_BLOCKS - 1
-) // RESIDENT_BLOCKS
-POOL_TASKS = MAX_TOKENS * MOE_HIDDEN // THREADS
-POOL_TASK_ROUNDS = (POOL_TASKS + RESIDENT_BLOCKS - 1) // RESIDENT_BLOCKS
+O_GROUPS = HIDDEN // (post_attn.ROWS * post_attn.WAVES)
+ROUTER_GROUPS = EXPERTS // (post_attn.ROWS * post_attn.WAVES)
+POOL_GROUPS = MOE_HIDDEN // (post_attn.ROWS * post_attn.WAVES)
 
 
 def _align(value):
@@ -78,12 +74,23 @@ def _private_layout():
     for name, (old_offset, size) in k1_scratch_layout().items():
         out[name] = (k1_base + old_offset, size)
         offset = max(offset, k1_base + old_offset + size)
+    for name, size in (
+        ("attn_stats", attention.FUSED_STAT_FLOATS * 4),
+        ("attn_global", attention.FUSED_GLOBAL_FLOATS * 4),
+        ("attn_part", attention.FUSED_PART_FLOATS * 4),
+    ):
+        offset = _align(offset)
+        out[name] = (offset, size)
+        offset += size
     flags = pair_layout(
         [
+            ("attn_sflag", attention.FUSED_TASKS),
+            ("attn_gflag", attention.FUSED_TILES),
+            ("attn_pflag", attention.FUSED_TASKS),
             ("attn_done", KATTN_TASKS),
             ("boundary_done", MAX_TOKENS),
-            ("router_done", MAX_TOKENS),
-            ("pool_done", MAX_TOKENS * MOE_HIDDEN // THREADS),
+            ("router_done", ROUTER_GROUPS),
+            ("pool_done", POOL_GROUPS),
             ("top_done", MAX_TOKENS),
             ("norm_done", MAX_TOKENS),
             ("expert_done", MAX_TOKENS * TOP_K),
@@ -145,13 +152,45 @@ def _publish(put, flag, index, tid):
 @flyc.jit
 def _wait(poll, specs):
     """Poll tagged device flags, then acquire the data they announce."""
-    values = poll(specs)
+    values = poll(specs, batch=4)
     fx.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
     return values
 
 
+@flyc.jit
+def _finish_attention_tile(c):
+    """Normalize/gate split zero's rows and publish the 256-row contract."""
+    if c["split"] == 0:
+        gpu.barrier()
+        if c["wave"] == 0:
+            for row in range_constexpr(attention.FUSED_ROWS):
+                token, query_head, _ = attention.fused_row_coords(
+                    c["tile"], row
+                )
+                task = token * (Q_K // HEAD_DIM) + query_head
+                post_attn.stage_norm_gate(
+                    {
+                        "bid": task,
+                        "lane": c["lane"],
+                        "o": c["o"],
+                        "g": c["g"],
+                        "og": c["og"],
+                    }
+                )
+        gpu.barrier()
+        fx.memory_fence(
+            syncscope="agent", ordering=fx.AtomicOrdering.Release
+        )
+        if c["tid"] < attention.FUSED_ROWS:
+            token, query_head, _ = attention.fused_row_coords(
+                c["tile"], c["tid"]
+            )
+            task = token * (Q_K // HEAD_DIM) + query_head
+            c["put"](c["attn_done"], task, fx.Int32(1))
+
+
 def build_layer(key: LayerBuild):
-    """Build one 192-CTA, 256-thread, wave32 persistent layer launch.
+    """Build one 96-CTA, 256-thread, wave32 persistent layer launch.
 
     Launch argument order is K-attention inputs/outputs, K2 tensors, K3 tensors,
     combined private scratch, combined peer-symmetric storage, peer bases and
@@ -172,6 +211,11 @@ def build_layer(key: LayerBuild):
             f"Layer profile has {RESIDENT_BLOCKS} resident blocks, "
             f"got {key.resident_blocks}"
         )
+    if RESIDENT_BLOCKS != attention.FUSED_TASKS:
+        raise ValueError(
+            "gfx1250 fused Target attention supports only cu96_tp4; "
+            f"active profile has {RESIDENT_BLOCKS} resident blocks"
+        )
 
     W = key.npes
     layout = _private_layout()
@@ -187,7 +231,7 @@ def build_layer(key: LayerBuild):
         c=key.resident_blocks,
         f=key.fault_site,
     )
-    AttnLds = attention.kattn_lds()
+    AttnLds = attention.fused_attn_lds()
     K3Lds = ffn.k3_lds()
     K1Lds = pre_attn.k1_lds()
 
@@ -196,7 +240,7 @@ def build_layer(key: LayerBuild):
         attn: AttnLds
         k3: K3Lds
         k1: K1Lds
-        post_red: fx.Array[fx.Float32, THREADS, 16]
+        post_red: fx.Array[fx.Float32, post_attn.RED_FLOATS, 16]
         picked: fx.Array[fx.Float32, TOP_K, 16]
 
     def addr(base, region):
@@ -292,10 +336,21 @@ def build_layer(key: LayerBuild):
                 "k3_boundary_done",
             )
         }
+        attn_regions = {
+            name[5:]: sreg(scratch, layout[name][0], name)
+            for name in (
+                "attn_stats",
+                "attn_global",
+                "attn_part",
+                "attn_sflag",
+                "attn_gflag",
+                "attn_pflag",
+            )
+        }
 
-        # The 192 resident CTAs consume all 256 (token, local-Q-head) tasks in
-        # grid-stride order.  A task publishes only after both attention and
-        # its K2 per-head norm/gate are complete.
+        # All 96 cu96_tp4 CTAs first run one (16-row tile, key split) task.
+        # Split zero merges in fixed order, normalizes/gates its 16 rows, then
+        # publishes the existing 256-row attn_done contract.
         attn_args = {
             "q": q,
             "out": o,
@@ -306,63 +361,61 @@ def build_layer(key: LayerBuild):
             "window": window,
             "scale_bits": scale_bits,
         }
-        for task_round in range_constexpr(KATTN_TASK_ROUNDS):
-            task = bid + task_round * RESIDENT_BLOCKS
-            if task < KATTN_TASKS:
-                attention.run_kattn(
-                    {
-                        "tid": tid,
-                        "bid": task,
-                        "lane": lane,
-                        "wave": wave,
-                        "stats": lds.attn.stats.ptr,
-                        "partial": lds.attn.partial.ptr,
-                        "args": attn_args,
-                    }
-                )
-                # Only wave 0 participates; this stage has no CTA-wide barrier.
-                if wave == 0:
-                    post_attn.stage_norm_gate(
-                        {
-                            "bid": task,
-                            "lane": lane,
-                            "o": o,
-                            "g": g,
-                            "og": addr(scratch, "k2_og"),
-                        }
-                    )
-                _publish(mb.put, flags["attn_done"], task, tid)
+        tile, split = bid // attention.FUSED_SPLITS, bid % attention.FUSED_SPLITS
+        attention.run_fused_attn(
+            {
+                "tid": tid,
+                "lane": lane,
+                "wave": wave,
+                "tile": tile,
+                "split": split,
+                "mb": mb,
+                "wave_stats": lds.attn.wave_stats.ptr,
+                "row_stats": lds.attn.row_stats.ptr,
+                "probabilities": lds.attn.probabilities.ptr,
+                "pv": lds.attn.pv.ptr,
+                **attn_regions,
+                "args": attn_args,
+            }
+        )
+        _finish_attention_tile(
+            {
+                "tid": tid,
+                "lane": lane,
+                "wave": wave,
+                "tile": tile,
+                "split": split,
+                "o": o,
+                "g": g,
+                "og": addr(scratch, "k2_og"),
+                "put": mb.put,
+                "attn_done": flags["attn_done"],
+            }
+        )
 
-        for task_round in range_constexpr(O_PROJECTION_ROUNDS):
-            projection_task = bid + task_round * RESIDENT_BLOCKS
-            if projection_task < O_PROJECTION_TASKS:
-                token = projection_task // (HIDDEN // (2 * THREADS))
-                _wait(
-                    mb.poll,
-                    [
-                        (
-                            flags["attn_done"],
-                            token * (Q_K // HEAD_DIM) + head,
-                            1,
-                        )
-                        for head in range(Q_K // HEAD_DIM)
+        if bid < O_GROUPS:
+            _wait(
+                mb.poll,
+                [(flags["attn_done"], task, 1) for task in range(KATTN_TASKS)],
+            )
+            post_attn.stage_o_projection(
+                {
+                    "W": W,
+                    "bid": bid,
+                    "tid": tid,
+                    "lane": lane,
+                    "wave": wave,
+                    "red": lds.post_red.ptr,
+                    "rank": rank,
+                    "og": addr(scratch, "k2_og"),
+                    "w_o": w_o,
+                    "put_bf": mb.put_bf,
+                    "peer_attn": [
+                        preg(base, sy["k2_attn"][0], "k2_attn")
+                        for base in bases
                     ],
-                )
-                post_attn.stage_o_projection(
-                    {
-                        "W": W,
-                        "bid": projection_task,
-                        "tid": tid,
-                        "rank": rank,
-                        "og": addr(scratch, "k2_og"),
-                        "w_o": w_o,
-                        "put_bf": mb.put_bf,
-                        "peer_attn": [
-                            preg(base, sy["k2_attn"][0], "k2_attn")
-                            for base in bases
-                        ],
-                    }
-                )
+                }
+            )
 
         if bid < MAX_TOKENS:
             post_attn.stage_boundary(
@@ -384,45 +437,64 @@ def build_layer(key: LayerBuild):
             )
             _publish(mb.put, flags["boundary_done"], bid, tid)
 
-        if bid < MAX_TOKENS * EXPERTS // THREADS:
-            _wait(mb.poll, [(flags["boundary_done"], bid, 1)])
+        if bid < ROUTER_GROUPS:
+            _wait(
+                mb.poll,
+                [
+                    (flags["boundary_done"], token, 1)
+                    for token in range(MAX_TOKENS)
+                ],
+            )
             post_attn.stage_router_pool(
                 {
                     "bid": bid,
                     "tid": tid,
+                    "lane": lane,
+                    "wave": wave,
                     "rows": EXPERTS,
                     "router": True,
                     "x": addr(scratch, "k2_x"),
                     "w0": w_hi,
                     "w1": w_lo,
                     "out": addr(scratch, "k2_logits"),
-                    "red": fx.Int64(0),
+                    "red": lds.post_red.ptr,
                 }
             )
             _publish(mb.put, flags["router_done"], bid, tid)
 
-        for task_round in range_constexpr(POOL_TASK_ROUNDS):
-            pool_task = bid + task_round * RESIDENT_BLOCKS
-            if pool_task < POOL_TASKS:
-                pool_token = pool_task // (MOE_HIDDEN // THREADS)
-                _wait(mb.poll, [(flags["boundary_done"], pool_token, 1)])
-                post_attn.stage_router_pool(
-                    {
-                        "bid": pool_task,
-                        "tid": tid,
-                        "rows": MOE_HIDDEN,
-                        "router": False,
-                        "x": addr(scratch, "k2_x"),
-                        "w0": w_pool,
-                        "w1": fx.Int64(0),
-                        "out": addr(scratch, "k2_pool"),
-                        "red": lds.post_red.ptr,
-                    }
-                )
-                _publish(mb.put, flags["pool_done"], pool_task, tid)
+        if bid < POOL_GROUPS:
+            _wait(
+                mb.poll,
+                [
+                    (flags["boundary_done"], token, 1)
+                    for token in range(MAX_TOKENS)
+                ],
+            )
+            post_attn.stage_router_pool(
+                {
+                    "bid": bid,
+                    "tid": tid,
+                    "lane": lane,
+                    "wave": wave,
+                    "rows": MOE_HIDDEN,
+                    "router": False,
+                    "x": addr(scratch, "k2_x"),
+                    "w0": w_pool,
+                    "w1": fx.Int64(0),
+                    "out": addr(scratch, "k2_pool"),
+                    "red": lds.post_red.ptr,
+                }
+            )
+            _publish(mb.put, flags["pool_done"], bid, tid)
 
         if bid < MAX_TOKENS:
-            _wait(mb.poll, [(flags["router_done"], bid, 1)])
+            _wait(
+                mb.poll,
+                [
+                    (flags["router_done"], task, 1)
+                    for task in range(ROUTER_GROUPS)
+                ],
+            )
             post_attn.stage_top8(
                 {
                     "bid": bid,
@@ -439,12 +511,8 @@ def build_layer(key: LayerBuild):
             _wait(
                 mb.poll,
                 [
-                    (
-                        flags["pool_done"],
-                        bid * (MOE_HIDDEN // THREADS) + part,
-                        1,
-                    )
-                    for part in range(MOE_HIDDEN // THREADS)
+                    (flags["pool_done"], block, 1)
+                    for block in range(POOL_GROUPS)
                 ],
             )
             post_attn.stage_pooled_norm(

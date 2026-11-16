@@ -48,6 +48,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
 
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.muse_spark.gfx1250.config import (
+    PROFILE as GFX1250_PROFILE,
     RESIDENT_BLOCKS as GFX1250_RESIDENT_BLOCKS,
 )
 from sgl_amd_mono.muse_spark import DRAFT_TOKENS, TP
@@ -144,8 +145,12 @@ def _gfx1250() -> bool:
 
 
 def _use_kernels() -> bool:
-    """Draft kernels are not ported to gfx1250 yet; keep its attached stage 0."""
-    return USE_KERNELS and not _gfx1250()
+    """Use gfx1250 Draft kernels only for the validated cu96 TP4 profile.
+
+    The spec's device limits independently restrict gfx1250 to width 8 and TP4.
+    An explicit profile gate keeps the unvalidated cu192 profile on stage 0.
+    """
+    return USE_KERNELS and (not _gfx1250() or GFX1250_PROFILE == "cu96_tp4")
 
 
 def _draft_module(name: str):
@@ -269,16 +274,16 @@ class DraftRunner:
             self.scratch_pre = torch.zeros(
                 L.scratch_bytes(DH.dp_scratch_layout()), dtype=torch.uint8, device=dev
             )
-            self.scratch_attn = (
-                None
-                if self.gfx1250
-                else torch.zeros(
-                    L.scratch_bytes(
+            self.scratch_attn = torch.zeros(
+                (
+                    DA.dattn_scratch_bytes()
+                    if self.gfx1250
+                    else L.scratch_bytes(
                         DA.dattn_scratch_layout(MAX_TOKENS, DRAFT_TOKENS)
-                    ),
-                    dtype=torch.uint8,
-                    device=dev,
-                )
+                    )
+                ),
+                dtype=torch.uint8,
+                device=dev,
             )
             self.scratch_post = torch.zeros(
                 L.scratch_bytes(DH.do_scratch_layout()), dtype=torch.uint8, device=dev
@@ -439,7 +444,8 @@ class DraftRunner:
                 table.shape[1], table.numel() * 4, _ptr(rpi),
                 int(rpi.dtype == torch.int64), _ptr(lens),
                 int(lens.dtype == torch.int64), DRAFT_CONFIG["sliding_window"],
-                _f32_bits(float(attn.scaling)), _ptr(self.epoch), stream=stream,
+                _f32_bits(float(attn.scaling)), _ptr(self.scratch_attn),
+                _ptr(self.epoch), i, stream=stream,
             )  # fmt: skip
         else:
             dattn(
