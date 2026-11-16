@@ -15,17 +15,17 @@ PROFILES = {
     "cu96_tp4": Profile("cu96_tp4", 96),
     "cu192_tp4": Profile("cu192_tp4", 192),
 }
-DEFAULT_PROFILE = "cu192_tp4"
-PROFILE_ENV = "SGLANG_MUSE_GFX1250_PROFILE"
+DEFAULT_PROFILE = "cu96_tp4"
+CONFIG_ENV = "SGLANG_MUSE_MONO_GFX1250_CONFIG"
 
 
 def active_profile() -> Profile:
-    name = os.environ.get(PROFILE_ENV, DEFAULT_PROFILE)
+    name = os.environ.get(CONFIG_ENV, DEFAULT_PROFILE)
     try:
         return PROFILES[name]
     except KeyError as error:
         choices = ", ".join(sorted(PROFILES))
-        raise ValueError(f"{PROFILE_ENV}={name!r}; choose one of: {choices}") from error
+        raise ValueError(f"{CONFIG_ENV}={name!r}; choose one of: {choices}") from error
 
 
 ACTIVE_PROFILE = active_profile()

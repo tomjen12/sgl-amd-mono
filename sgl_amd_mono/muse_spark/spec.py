@@ -199,14 +199,13 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         and cfg.speculative_num_draft_tokens != DRAFT_TOKENS
     ):
         reasons.append(f"{cfg.speculative_num_draft_tokens} draft tokens; the widths are built for {DRAFT_TOKENS} a request")  # fmt: skip
-    # One spec serves both devices, while Requirements is intentionally
-    # architecture-independent. gfx950 consumes Aiter's unified page tables;
-    # gfx1250 reconstructs page tables from Triton's request-to-token table.
+    # One spec serves both devices. gfx950 requires Aiter; gfx1250 accepts
+    # either Aiter's unified page tables or Triton's request-to-token table.
     backend = getattr(cfg, "decode_attention_backend", None) or getattr(
         cfg, "attention_backend", None
     )
     arch = _device_arch()
-    wanted = "triton" if "gfx1250" in arch else "aiter" if "gfx950" in arch else None
+    wanted = "aiter" if "gfx950" in arch else None
     if wanted is not None and backend is not None and backend != wanted:
         reasons.append(
             f"attention backend {backend!r} on {arch}; the kernels require {wanted!r}"

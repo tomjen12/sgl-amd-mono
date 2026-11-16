@@ -140,13 +140,11 @@ def test_the_recipe_is_accepted():
     assert _config_reasons(hf_config=_replace(OMNI, text_config=rounded)) == []
 
 
-def test_attention_backend_is_narrowed_by_architecture():
+def test_attention_backend_is_narrowed_only_on_gfx950():
     assert muse.SPEC.requires.attention_backends == {"aiter", "triton"}
     with mock.patch.object(muse, "_device_arch", return_value="gfx1250"):
         assert _config_reasons(cfg=_replace(CFG, attention_backend="triton")) == []
-        assert "require 'triton'" in _config_reasons(
-            cfg=_replace(CFG, attention_backend="aiter")
-        )[0]
+        assert _config_reasons(cfg=_replace(CFG, attention_backend="aiter")) == []
     with mock.patch.object(muse, "_device_arch", return_value="gfx950"):
         assert _config_reasons(cfg=_replace(CFG, attention_backend="aiter")) == []
         assert "require 'aiter'" in _config_reasons(
