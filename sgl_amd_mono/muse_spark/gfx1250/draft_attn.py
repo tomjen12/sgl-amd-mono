@@ -455,17 +455,25 @@ def _split_q_fragment(args, tile, k0, lane):
 
 
 def _split_k_fragment(
-    args, request_row, kv_head, key0, keys, k0, lane
+    args, request_row, current_base, kv_head, key0, keys, prefix, k0, lane
 ):
     key = fx.min(key0 + lane % SPLIT_ROWS, keys - 1)
     slot = _split_slot(args, request_row, key)
+    current = current_base + fx.max(key - prefix, fx.Int32(0))
     kh = (lane // SPLIT_ROWS) * 8
     values = []
     for half in range_constexpr(2):
         for element in range_constexpr(8):
             dim = k0 + half * 16 + kh + element
             byte = (slot * LOCAL_KV_HEADS + kv_head) * HEAD_DIM + dim
-            values.append(_split_fp8(args["k_cache"], byte))
+            cached = _split_fp8(args["k_cache"], byte)
+            fresh = _split_bf16(
+                args["k_new"],
+                current * (LOCAL_KV_HEADS * HEAD_DIM)
+                + kv_head * HEAD_DIM
+                + dim,
+            )
+            values.append((key >= prefix).select(fresh, cached))
     return fx.Vector.from_elements(values, fx.Float32).to(fx.BFloat16)
 
 
@@ -481,7 +489,7 @@ def _split_wmma(a, b, acc):
     return fx.Vector(result)
 
 
-def _split_qk(args, tile, request_row, key0, keys, lane, scale):
+def _split_qk(args, tile, request_row, key0, keys, prefix, lane, scale):
     _, _, kv_head = _split_row_coords(tile, fx.Int32(0))
     acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
     for step in range_constexpr(HEAD_DIM // WMMA_K):
@@ -489,7 +497,15 @@ def _split_qk(args, tile, request_row, key0, keys, lane, scale):
         acc = _split_wmma(
             _split_q_fragment(args, tile, k0, lane),
             _split_k_fragment(
-                args, request_row, kv_head, key0, keys, k0, lane
+                args,
+                request_row,
+                (tile // ROW_TILES) * BLOCK,
+                kv_head,
+                key0,
+                keys,
+                prefix,
+                k0,
+                lane,
             ),
             acc,
         )
@@ -576,7 +592,7 @@ def run_split_dattn(c):
         key_lo + wave * KEY_TILE, key_hi, WAVES * KEY_TILE
     ):
         scores = _split_qk(
-            args, tile, request_row, key0, keys, lane, scale
+            args, tile, request_row, key0, keys, prefix, lane, scale
         )
         live = key0 + lane % SPLIT_ROWS < key_hi
         for element in range_constexpr(WMMA_ACC):
@@ -612,7 +628,7 @@ def run_split_dattn(c):
         key_lo + wave * KEY_TILE, key_hi, WAVES * KEY_TILE
     ):
         scores = _split_qk(
-            args, tile, request_row, key0, keys, lane, scale
+            args, tile, request_row, key0, keys, prefix, lane, scale
         )
         live = key0 + lane % SPLIT_ROWS < key_hi
         for element in range_constexpr(WMMA_ACC):
@@ -712,7 +728,7 @@ def run_split_dattn(c):
     for key_tile in range_constexpr(2):
         key0 = pair0 + key_tile * KEY_TILE
         scores = _split_qk(
-            args, tile, request_row, key0, keys, lane, scale
+            args, tile, request_row, key0, keys, prefix, lane, scale
         )
         live = key0 + lane % SPLIT_ROWS < key_hi
         for element in range_constexpr(WMMA_ACC):
@@ -774,9 +790,19 @@ def run_split_dattn(c):
                 byte = (
                     (slot * LOCAL_KV_HEADS + kv_head) * HEAD_DIM + dim
                 )
+                current = request * BLOCK + fx.max(
+                    safe_key - prefix, fx.Int32(0)
+                )
+                cached = _split_fp8(args["v_cache"], byte)
+                fresh = _split_bf16(
+                    args["v_new"],
+                    current * (LOCAL_KV_HEADS * HEAD_DIM)
+                    + kv_head * HEAD_DIM
+                    + dim,
+                )
                 v_values.append(
                     (key < key_hi).select(
-                        _split_fp8(args["v_cache"], byte),
+                        (safe_key >= prefix).select(fresh, cached),
                         fx.Float32(0.0),
                     )
                 )
@@ -888,6 +914,8 @@ def build_dattn(key: DAttnBuild):
         out: Int64,
         k_cache: Int64,
         v_cache: Int64,
+        k_new: Int64,
+        v_new: Int64,
         req_to_token: Int64,
         table_stride: Int32,
         table_bytes: Int32,
@@ -926,6 +954,8 @@ def build_dattn(key: DAttnBuild):
                 "out": out,
                 "k_cache": k_cache,
                 "v_cache": v_cache,
+                "k_new": k_new,
+                "v_new": v_new,
                 "req_to_token": req_to_token,
                 "table_stride": table_stride,
                 "table_bytes": table_bytes,
@@ -965,6 +995,8 @@ def build_dattn(key: DAttnBuild):
         out: Int64,
         k_cache: Int64,
         v_cache: Int64,
+        k_new: Int64,
+        v_new: Int64,
         req_to_token: Int64,
         table_stride: Int32,
         table_bytes: Int32,
@@ -985,6 +1017,8 @@ def build_dattn(key: DAttnBuild):
             out,
             k_cache,
             v_cache,
+            k_new,
+            v_new,
             req_to_token,
             table_stride,
             table_bytes,

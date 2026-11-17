@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import hashlib
+import inspect
 import json
 import multiprocessing
 import os
@@ -24,6 +25,7 @@ WIDTH = 8
 LAYERS = 5
 HIDDEN_SIZE = 8192
 WINDOW = 2048
+PAGE_SIZE = 16
 KV_HEADS_PER_RANK = 2
 HEAD_DIM = 128
 DEFAULT_BUNDLE = Path(
@@ -288,7 +290,7 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _server_args(descriptor: ReplayDescriptor):
+def _server_args(descriptor: ReplayDescriptor, mode: str = "baseline"):
     from sglang.srt.server_args import ServerArgs
 
     return ServerArgs(
@@ -300,7 +302,7 @@ def _server_args(descriptor: ReplayDescriptor):
         max_running_requests=2,
         max_total_tokens=4096,
         context_length=16384,
-        page_size=16,
+        page_size=PAGE_SIZE,
         kv_cache_dtype="fp8_e4m3",
         attention_backend="triton",
         speculative_algorithm="DFLASH",
@@ -308,6 +310,7 @@ def _server_args(descriptor: ReplayDescriptor):
         speculative_draft_attention_backend="triton",
         speculative_num_draft_tokens=WIDTH,
         speculative_draft_window_size=WINDOW,
+        enable_amd_monokernel=mode == "mono",
         disable_cuda_graph=True,
     )
 
@@ -336,7 +339,258 @@ def _install_conv_observers(model, captures: dict[int, Any]) -> list[Any]:
     return handles
 
 
-def _allocate_standalone_draft_pool(runner) -> None:
+def _install_baseline_state_observers(
+    model, states: dict[int, dict[str, Any]]
+) -> list[Any]:
+    """Capture each native layer's hidden/residual without changing its result."""
+
+    class _Restore:
+        def __init__(self, module, original):
+            self.module = module
+            self.original = original
+
+        def remove(self):
+            self.module.forward = self.original
+
+    handles = []
+    for layer_id, layer in enumerate(model.layers):
+        original = layer.forward
+
+        def observe(*args, layer_id=layer_id, original=original, **kwargs):
+            output = original(*args, **kwargs)
+            hidden = output[0]
+            # Native DFlash carries the MLP output convolution into the next
+            # layer. Mono applies it inside D-MLP, so materialize the same
+            # logical boundary before comparing layer hidden states.
+            if len(output) > 2 and output[2] is not None:
+                conv, coefficient = output[2]
+                hidden = conv.finish(hidden, coefficient)
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            forward_batch = kwargs.get("forward_batch", args[2])
+            backend = get_attn_backend()
+            rail = backend._window_rail_of(layer.self_attn.attn)
+            window_locs = backend._window_write_locs()
+            slots = rail.out_cache_loc if rail is not None else None
+            if slots is None and window_locs:
+                slots = next(iter(window_locs.values()))
+            if slots is None:
+                slots = forward_batch.out_cache_loc
+            key, value = backend.token_to_kv_pool.get_kv_buffer(
+                layer.self_attn.attn.layer_id
+            )
+            states[layer_id] = {
+                "hidden": hidden.detach().clone(),
+                "raw_hidden": output[0].detach().clone(),
+                "residual": output[1].detach().clone(),
+                "kv_key": key[slots.long()].float().clone(),
+                "kv_value": value[slots.long()].float().clone(),
+            }
+            return output
+
+        layer.forward = observe
+        handles.append(_Restore(layer, original))
+    return handles
+
+
+def _installed_mono(model):
+    """Return the object captured by SGLang's installed Mono forward closure."""
+    try:
+        built = inspect.getclosurevars(model.forward).nonlocals["built"]
+    except (KeyError, TypeError) as error:
+        raise RuntimeError("Unable to inspect the installed Draft Mono runner.") from error
+    if not hasattr(built, "runner") or built.runner is None:
+        raise RuntimeError("Installed Draft Mono forward has no runner.")
+    return built
+
+
+def _install_mono_state_observer(
+    model,
+    states: dict[int, dict[str, Any]],
+    conv_captures: dict[int, Any],
+    *,
+    use_reference_attn: bool = False,
+    use_reference_mlp: bool = False,
+):
+    """Capture D-MLP outputs and its output-convolution coefficients.
+
+    The fused D-MLP stores all four projected coefficient groups as tagged
+    ``(float32 value, launch tag)`` mailbox pairs. The last two groups are the
+    carry consumed by the output convolution and match ``mlp_conv.prepare``.
+    """
+    import torch
+
+    from sgl_amd_mono.muse_spark.gfx1250 import draft_mlp
+
+    built = _installed_mono(model)
+    runner = built.runner
+    original_attn = runner.launch_attn
+    original_mlp = runner.launch
+    offset, nbytes = draft_mlp.dm_scratch_layout()["dm_coef"]
+
+    def observe_attn(
+        i, rows, hidden, residual, first, positions, forward_batch, stream, trace=False
+    ):
+        layer = built.model.layers[i]
+        reference_input = hidden.clone()
+        if first:
+            reference_residual = reference_input
+            reference_input = layer.input_layernorm(reference_input)
+        else:
+            reference_input, reference_residual = layer.input_layernorm(
+                reference_input, residual.clone()
+            )
+        reference_pre, reference_coefficient = layer.attention_conv.prepare(
+            reference_input
+        )
+        attention_op = layer.self_attn.attn
+        original_attention_forward = attention_op.forward
+        reference_raw = None
+        reference_qkv = None
+        reference_call = None
+
+        def capture_attention(*args, **kwargs):
+            nonlocal reference_raw, reference_qkv, reference_call
+            reference_qkv = tuple(value.detach().clone() for value in args[:3])
+            reference_call = (args[3:], kwargs)
+            output = original_attention_forward(*args, **kwargs)
+            reference_raw = output.detach().clone()
+            return output
+
+        attention_op.forward = capture_attention
+        try:
+            reference_o = layer.self_attn(
+                positions=positions,
+                hidden_states=reference_pre,
+                forward_batch=forward_batch,
+            )
+        finally:
+            attention_op.forward = original_attention_forward
+        if reference_raw is None or reference_qkv is None:
+            raise RuntimeError(f"Draft layer {i} did not execute native attention.")
+        reference_attention = layer.attention_conv.finish(
+            reference_o, reference_coefficient
+        )
+        backend = runner._backend()
+        rail = backend._window_rail_of(layer.self_attn.attn)
+        window_locs = backend._window_write_locs()
+        slots = rail.out_cache_loc if rail is not None else None
+        if slots is None and window_locs:
+            slots = next(iter(window_locs.values()))
+        if slots is None:
+            slots = forward_batch.out_cache_loc
+        slots = slots[:rows].long()
+        reference_k, reference_v = backend.token_to_kv_pool.get_kv_buffer(
+            layer.self_attn.attn.layer_id
+        )
+        reference_k = reference_k[slots].float().clone()
+        reference_v = reference_v[slots].float().clone()
+        output = original_attn(
+            i,
+            rows,
+            hidden,
+            residual,
+            first,
+            positions,
+            forward_batch,
+            stream,
+            trace=trace,
+        )
+        if reference_call is None:
+            raise RuntimeError(f"Draft layer {i} did not capture native attention call.")
+        reference_tail, reference_kwargs = reference_call
+        same_input_reference = original_attention_forward(
+            runner.q[:rows],
+            runner.k[:rows],
+            runner.v[:rows],
+            *reference_tail,
+            **reference_kwargs,
+        )
+        mono_k, mono_v = backend.token_to_kv_pool.get_kv_buffer(
+            layer.self_attn.attn.layer_id
+        )
+        states.setdefault(i, {}).update(
+            {
+                "attention": output[0].detach().clone(),
+                "attention_residual": output[1].detach().clone(),
+                "reference_attention": reference_attention.detach().clone(),
+                "reference_attention_residual": reference_residual.detach().clone(),
+                "attention_pre": runner.q[:rows].detach().clone(),
+                "reference_q": reference_qkv[0],
+                "reference_k": reference_qkv[1],
+                "reference_v": reference_qkv[2],
+                "attention_o": runner.o[:rows].detach().clone(),
+                "reference_attention_o": reference_raw.detach().clone(),
+                "same_input_reference_attention_o": same_input_reference.detach().clone(),
+                "attention_coefficient": runner.coef[:rows, 2 * draft_mlp.GROUPS :]
+                .reshape(rows, 2, draft_mlp.GROUPS)
+                .detach()
+                .clone(),
+                "reference_attention_coefficient": reference_coefficient.detach().clone(),
+                "kv_key": mono_k[slots].float().clone(),
+                "kv_value": mono_v[slots].float().clone(),
+                "reference_kv_key": reference_k,
+                "reference_kv_value": reference_v,
+            }
+        )
+        if i == 0:
+            prefix_len = int(forward_batch.seq_lens[0].item())
+            request = int(forward_batch.req_pool_indices[0].item())
+            prefix_slots = backend.req_to_token_pool.req_to_token[
+                request, :prefix_len
+            ].long()
+            states[i].update(
+                {
+                    "prefix_key": mono_k[prefix_slots].float().clone(),
+                    "prefix_value": mono_v[prefix_slots].float().clone(),
+                }
+            )
+        if use_reference_attn:
+            return reference_attention, reference_residual
+        return output
+
+    def observe_mlp(i, rows, attn_out, residual, stream):
+        reference = built._reference(
+            built.model.layers[i], attn_out, residual
+        )
+        output = original_mlp(i, rows, attn_out, residual, stream)
+        pairs = runner.scratch[offset : offset + nbytes].view(torch.int32).view(-1, 2)
+        coefficient = (
+            pairs[:, 0]
+            .contiguous()
+            .view(torch.float32)
+            .view(draft_mlp.MAX_TOKENS, draft_mlp.COEF_ROWS)[:rows]
+        )
+        groups = draft_mlp.GROUPS
+        conv_captures[i] = coefficient[:, 2 * groups :].reshape(
+            rows, 2, groups
+        ).clone()
+        states.setdefault(i, {}).update(
+            {
+                "hidden": output[0].detach().clone(),
+                "residual": output[1].detach().clone(),
+                "reference_hidden": reference[0].detach().clone(),
+                "reference_residual": reference[1].detach().clone(),
+            }
+        )
+        return reference if use_reference_mlp else output
+
+    runner.launch_attn = observe_attn
+    runner.launch = observe_mlp
+
+    class _Restore:
+        def remove(self):
+            runner.launch_attn = original_attn
+            runner.launch = original_mlp
+
+    return _Restore()
+
+
+def _cpu_snapshot(tensor):
+    return tensor.detach().float().cpu().contiguous()
+
+
+def _allocate_standalone_draft_pool(runner, pool_rows: int) -> None:
     """Allocate a private pool for a Draft-only ModelRunner.
 
     DFlashWorkerV2 normally passes the already-created Target allocator into
@@ -347,11 +601,16 @@ def _allocate_standalone_draft_pool(runner) -> None:
     """
     if not runner.is_draft_worker or runner.token_to_kv_pool_allocator is not None:
         raise RuntimeError("Standalone Draft pool bootstrap received an invalid runner.")
-    runner.is_draft_worker = False
-    try:
-        runner.alloc_memory_pool()
-    finally:
-        runner.is_draft_worker = True
+    from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+
+    runner.alloc_memory_pool(
+        memory_pool_config=MemoryPoolConfig(
+            # The paged allocator contributes one guard page to the physical
+            # tensor; the capture descriptor records that physical extent.
+            max_total_num_tokens=pool_rows - PAGE_SIZE,
+            max_running_requests=128,
+        )
+    )
 
 
 def _make_forward_batch(runner, descriptor: ReplayDescriptor, rank: int):
@@ -437,6 +696,8 @@ def _rank_worker(
     iterations: int,
     trace_dir: str | None,
     record_shapes: bool,
+    mode: str,
+    output_dir: str,
     queue,
 ) -> None:
     try:
@@ -445,9 +706,23 @@ def _rank_worker(
             MASTER_PORT=str(port),
             HIP_VISIBLE_DEVICES="0,1,2,3",
             HSA_CU_MASK="0-3:0-95",
-            SGLANG_ENABLE_AMD_MONOKERNEL="0",
+            SGLANG_ENABLE_AMD_MONOKERNEL="1" if mode == "mono" else "0",
+            SGLANG_AMD_MONO_DRAFT_KERNELS="1",
+            SGLANG_AMD_MONO_DRAFT_STAGE="2",
+            SGLANG_AMD_MONO_CHECK=os.environ.get("SGLANG_AMD_MONO_CHECK", "0"),
             SGLANG_MUSE_MONO_GFX1250_CONFIG="cu96_tp4",
+            SGLANG_MUSE_REPLAY_MARKERS="1" if trace_dir is not None else "0",
+            SGLANG_USE_AITER="1",
+            SGLANG_USE_AITER_UNIFIED_ATTN="1",
+            AITER_CUSTOM_AR_FORCE_VMM="1",
+            AITER_CUSTOM_AR_MAX_SIZE="1048576",
+            SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2="1",
+            SGLANG_OPT_SCHEDULER_SHM_SYNC="1",
         )
+        if mode == "mono":
+            import sgl_amd_mono
+
+            sgl_amd_mono.register_specs()
         import torch
         import torch.distributed as dist
 
@@ -461,6 +736,7 @@ def _rank_worker(
         )
         from sglang.srt.entrypoints.engine import _set_envs_and_config
         from sglang.srt.model_executor.model_runner import ModelRunner
+        from sglang.srt.rocm_muse_spark.replay_capture import replay_scope
         from sglang.srt.runtime_context import (
             SpawnRanks,
             get_device,
@@ -469,7 +745,7 @@ def _rank_worker(
         )
 
         torch.cuda.set_device(rank)
-        server_args = _server_args(descriptor)
+        server_args = _server_args(descriptor, mode)
         server_args.resolve_once()
         _set_envs_and_config(server_args)
         publish(
@@ -498,17 +774,19 @@ def _rank_worker(
             is_draft_worker=True,
             draft_attention_backend="triton",
         )
-        _allocate_standalone_draft_pool(runner)
+        _allocate_standalone_draft_pool(runner, descriptor.kv_shape[0])
         runner.init_attention_backends()
         # This initializes the eager runner too; graphs remain disabled by the
         # ServerArgs and every replay batch explicitly rejects graph dispatch.
         runner.init_cuda_graphs()
+        mono_attached = hasattr(runner.model, "_monokernel_unread_metadata")
+        if mode == "mono" and not mono_attached:
+            raise RuntimeError("Draft Mono mode requested but plugin did not attach.")
         batch = _make_forward_batch(runner, descriptor, rank)
-        conv_captures: dict[int, Any] = {}
-        handles = _install_conv_observers(runner.model, conv_captures)
 
         def run_once():
-            output = runner.forward(batch).logits_output.hidden_states
+            with replay_scope("draft/forward"):
+                output = runner.forward(batch).logits_output.hidden_states
             if output is None:
                 raise RuntimeError("DFlash2 Draft ModelRunner returned no hidden states.")
             return output
@@ -541,18 +819,90 @@ def _rank_worker(
             trace_file = str(trace_path)
         assert output is not None
 
-        cache_state = {}
-        active = torch.arange(
-            1, descriptor.seq_len + 1, dtype=torch.int64, device=output.device
+        # Run one unprofiled snapshot iteration. Capturing clones must not alter
+        # the trace whose kernel sequence is compared separately in Gate 1.
+        layer_states: dict[int, dict[str, Any]] = {}
+        conv_captures: dict[int, Any] = {}
+        reference_conv_captures: dict[int, Any] = {}
+        handles = (
+            [
+                _install_mono_state_observer(
+                    runner.model,
+                    layer_states,
+                    conv_captures,
+                    use_reference_attn=(
+                        os.environ.get("SGLANG_MUSE_REPLAY_REFERENCE_ATTN") == "1"
+                    ),
+                    use_reference_mlp=(
+                        os.environ.get("SGLANG_MUSE_REPLAY_REFERENCE_MLP") == "1"
+                    ),
+                ),
+                *_install_conv_observers(
+                    runner.model, reference_conv_captures
+                ),
+            ]
+            if mode == "mono"
+            else _install_baseline_state_observers(runner.model, layer_states)
+            + _install_conv_observers(runner.model, conv_captures)
         )
+        output = run_once()
+        torch.cuda.synchronize()
+        for handle in handles:
+            handle.remove()
+        if set(layer_states) != set(range(LAYERS)):
+            raise RuntimeError(
+                f"Draft {mode} layer snapshots are incomplete: {sorted(layer_states)}"
+            )
+        if set(conv_captures) != set(range(LAYERS)):
+            raise RuntimeError(
+                f"Draft {mode} convolution snapshots are incomplete: "
+                f"{sorted(conv_captures)}"
+            )
+        if mode == "mono" and set(reference_conv_captures) != set(range(LAYERS)):
+            raise RuntimeError(
+                "Draft Mono reference convolution snapshots are incomplete: "
+                f"{sorted(reference_conv_captures)}"
+            )
+
+        cache_state = {}
+        snapshot = {
+            "rank": rank,
+            "mode": mode,
+            "output": _cpu_snapshot(output),
+            "layers": {
+                layer: {
+                    name: _cpu_snapshot(value)
+                    for name, value in layer_states[layer].items()
+                }
+                for layer in range(LAYERS)
+            },
+            "convolution_carry": {
+                layer: _cpu_snapshot(conv_captures[layer])
+                for layer in range(LAYERS)
+            },
+            "reference_convolution_carry": {
+                layer: _cpu_snapshot(reference_conv_captures[layer])
+                for layer in sorted(reference_conv_captures)
+            },
+            "kv_cache": {},
+        }
         for layer_id in range(LAYERS):
-            key, value = runner.token_to_kv_pool.get_kv_buffer(layer_id)
-            cache_state[str(layer_id)] = {
-                "key": _tensor_summary(key[active]),
-                "value": _tensor_summary(value[active]),
+            written_key = layer_states[layer_id]["kv_key"]
+            written_value = layer_states[layer_id]["kv_value"]
+            snapshot["kv_cache"][layer_id] = {
+                "written_key": _cpu_snapshot(written_key),
+                "written_value": _cpu_snapshot(written_value),
             }
+            cache_state[str(layer_id)] = {
+                "written_key": _tensor_summary(written_key),
+                "written_value": _tensor_summary(written_value),
+            }
+        snapshot_path = Path(output_dir) / f"rank_{rank:04d}.snapshot.pt"
+        torch.save(snapshot, snapshot_path)
         result = {
             "rank": rank,
+            "mode": mode,
+            "mono_attached": mono_attached,
             "workload": "sglang-dflash2-draft-modelrunner-eager",
             "tp_size": WORLD_SIZE,
             "warmup": warmup,
@@ -565,10 +915,9 @@ def _rank_worker(
                 str(layer): _tensor_summary(conv_captures[layer])
                 for layer in range(LAYERS)
             },
+            "snapshot": str(snapshot_path),
             "trace": trace_file,
         }
-        for handle in handles:
-            handle.remove()
         if dist.is_initialized():
             dist.barrier()
         destroy_model_parallel()
@@ -587,15 +936,14 @@ def run_replay(
     trace: bool,
     record_shapes: bool,
     timeout: int,
+    mode: str = "baseline",
 ) -> dict[str, Any]:
     if warmup < 0:
         raise ReplayInputError("--warmup must be non-negative.")
     if iterations <= 0:
         raise ReplayInputError("--iterations must be positive.")
-    if os.environ.get("SGLANG_ENABLE_AMD_MONOKERNEL") not in (None, "", "0"):
-        raise ReplayInputError(
-            "Baseline replay refuses SGLANG_ENABLE_AMD_MONOKERNEL != 0."
-        )
+    if mode not in {"baseline", "mono"}:
+        raise ReplayInputError("--mode must be baseline or mono.")
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -614,6 +962,8 @@ def run_replay(
                 iterations,
                 trace_dir,
                 record_shapes,
+                mode,
+                str(output_dir),
                 queue,
             ),
         )
@@ -637,6 +987,7 @@ def run_replay(
     summary = {
         "descriptor": descriptor.summary(),
         "workload": "sglang-dflash2-draft-modelrunner-eager",
+        "mode": mode,
         "world_size": WORLD_SIZE,
         "ranks": ranks,
     }
@@ -657,6 +1008,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default="draft-replay-output")
     parser.add_argument("--trace", action="store_true")
     parser.add_argument("--record-shapes", action="store_true")
+    parser.add_argument("--mode", choices=("baseline", "mono"), default="baseline")
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument(
         "--preflight-only",
@@ -683,6 +1035,7 @@ def main(argv: list[str] | None = None) -> int:
             trace=args.trace,
             record_shapes=args.record_shapes,
             timeout=args.timeout,
+            mode=args.mode,
         )
         print(json.dumps(summary, indent=2, sort_keys=True))
         return 0

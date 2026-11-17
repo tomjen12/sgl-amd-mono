@@ -295,6 +295,8 @@ class DraftRunner:
             )
             self.peers_post.bytes.zero_()
             self.q = torch.empty(MAX_TOKENS, DH.Q_K, dtype=torch.bfloat16, device=dev)
+            self.k = torch.empty(MAX_TOKENS, DH.KV_K, dtype=torch.bfloat16, device=dev)
+            self.v = torch.empty(MAX_TOKENS, DH.KV_K, dtype=torch.bfloat16, device=dev)
             self.o = torch.empty(MAX_TOKENS, DH.Q_K, dtype=torch.bfloat16, device=dev)
             self.coef = torch.empty(
                 MAX_TOKENS, D.COEF_ROWS, dtype=torch.float32, device=dev
@@ -412,10 +414,53 @@ class DraftRunner:
         v = self.aviews[i]
         attn = self.layers[i].self_attn.attn
         k_cache, v_cache = backend.token_to_kv_pool.get_kv_buffer(attn.layer_id)
-        slots = forward_batch.out_cache_loc
-        table = backend.req_to_token_pool.req_to_token
-        rpi = forward_batch.req_pool_indices
         lens = forward_batch.seq_lens
+        if self.gfx1250:
+            rail = backend._window_rail_of(attn)
+            if rail is not None:
+                slots = rail.out_cache_loc
+                kv_indices, kv_indptr = rail.kv_indices, rail.kv_indptr
+            else:
+                window_locs = backend._window_write_locs()
+                slots = (
+                    next(iter(window_locs.values()))
+                    if window_locs
+                    else forward_batch.out_cache_loc
+                )
+                kv_indices = backend.forward_metadata.kv_indices
+                kv_indptr = backend.forward_metadata.kv_indptr
+            table = backend.req_to_token_pool.req_to_token
+            rpi = forward_batch.req_pool_indices.to(torch.long)
+            if slots is None:
+                token_offsets = torch.arange(
+                    DRAFT_TOKENS, device=lens.device, dtype=lens.dtype
+                )
+                token_positions = lens[:, None] + token_offsets[None, :]
+                slots = table.index_select(0, rpi).gather(
+                    1, token_positions.to(torch.long)
+                ).reshape(-1).to(torch.int64)
+            # Triton's TARGET_VERIFY metadata uses an int64 work buffer whose
+            # allocation/layout is private to that backend.  Build a compact
+            # int32 physical request table for Mono D-attn from the
+            # authoritative mapping instead of reinterpreting that buffer.
+            request_rows = table.index_select(0, rpi)
+            mono_table_width = int((lens + DRAFT_TOKENS).max().item())
+            mono_table = (
+                request_rows[:, :mono_table_width]
+                .to(dtype=torch.int32)
+                .contiguous()
+            )
+            mono_rpi = torch.arange(
+                lens.numel(), dtype=torch.int32, device=lens.device
+            )
+            if slots is None:
+                raise RuntimeError(
+                    f"Muse Spark draft layer {i}: no physical KV rail"
+                )
+        else:
+            slots = forward_batch.out_cache_loc
+            table = backend.req_to_token_pool.req_to_token
+            rpi = forward_batch.req_pool_indices
         if (
             slots.numel() < rows
             or positions.numel() < rows
@@ -423,9 +468,11 @@ class DraftRunner:
         ):
             raise RuntimeError(f"Muse Spark draft: slots {tuple(slots.shape)} positions {tuple(positions.shape)} seq_lens {tuple(lens.shape)} for {rows} rows")  # fmt: skip
         pre, dattn, post = self.attn_kernels(rows)
-        res_pre, q, o, coef, attn_out = (
+        res_pre, q, k, value, o, coef, attn_out = (
             self.res_pre[:rows],
             self.q[:rows],
+            self.k[:rows],
+            self.v[:rows],
             self.o[:rows],
             self.coef[:rows],
             self.attn_out[:rows],
@@ -433,7 +480,7 @@ class DraftRunner:
         pre(
             _ptr(hidden), _ptr(residual), int(first), _ptr(v["w_in"]), _ptr(v["w_kpa"]), _ptr(v["base_a"]), _ptr(v["w_qkv"]),
             _ptr(v["q_norm"]), _ptr(v["k_norm"]), _ptr(v["cos_sin"]), _ptr(positions), int(positions.dtype == torch.int64),
-            _ptr(slots), int(slots.dtype == torch.int64), _ptr(k_cache), _ptr(v_cache), _ptr(res_pre), _ptr(q), _ptr(coef),
+            _ptr(slots), int(slots.dtype == torch.int64), _ptr(k_cache), _ptr(v_cache), _ptr(res_pre), _ptr(q), _ptr(k), _ptr(value), _ptr(coef),
             _ptr(self.scratch_pre), _ptr(self.epoch), i, stream=stream,
         )  # fmt: skip
         mark("D-pre")
@@ -442,9 +489,10 @@ class DraftRunner:
         # window mask (the window is the cache)
         if self.gfx1250:
             dattn(
-                _ptr(q), _ptr(o), _ptr(k_cache), _ptr(v_cache), _ptr(table),
-                table.shape[1], table.numel() * 4, _ptr(rpi),
-                int(rpi.dtype == torch.int64), _ptr(lens),
+                _ptr(q), _ptr(o), _ptr(k_cache), _ptr(v_cache),
+                _ptr(k), _ptr(value),
+                _ptr(mono_table), mono_table.shape[1], mono_table.numel() * 4,
+                _ptr(mono_rpi), 0, _ptr(lens),
                 int(lens.dtype == torch.int64), DRAFT_CONFIG["sliding_window"],
                 _f32_bits(float(attn.scaling)), _ptr(self.scratch_attn),
                 _ptr(self.epoch), i, stream=stream,

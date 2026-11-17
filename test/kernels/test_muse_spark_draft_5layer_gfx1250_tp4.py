@@ -356,6 +356,10 @@ def _worker(rank, port, queue, rows, checkpoint=None):
             q = torch.empty(
                 rows, Q_K, dtype=torch.bfloat16, device=device
             )
+            k_new = torch.empty(
+                rows, LOCAL_KV_HEADS * HEAD_DIM, dtype=torch.bfloat16, device=device
+            )
+            v_new = torch.empty_like(k_new)
             coef = torch.empty(
                 rows, COEF_ROWS, dtype=torch.float32, device=device
             )
@@ -367,7 +371,8 @@ def _worker(rank, port, queue, rows, checkpoint=None):
                 cos_sin.data_ptr(), positions.data_ptr(), 0,
                 current_slots.data_ptr(), 0, k_cache.data_ptr(),
                 v_cache.data_ptr(), res_pre.data_ptr(), q.data_ptr(),
-                coef.data_ptr(), pre_scratch.data_ptr(), epoch.data_ptr(),
+                k_new.data_ptr(), v_new.data_ptr(), coef.data_ptr(),
+                pre_scratch.data_ptr(), epoch.data_ptr(),
                 layer, stream=torch.cuda.current_stream(),
             )
             torch.cuda.synchronize()
@@ -407,6 +412,12 @@ def _worker(rank, port, queue, rows, checkpoint=None):
                         PREFIX,
                         WINDOW,
                         scale,
+                        k_new[request * 8 : (request + 1) * 8].reshape(
+                            8, LOCAL_KV_HEADS, HEAD_DIM
+                        ),
+                        v_new[request * 8 : (request + 1) * 8].reshape(
+                            8, LOCAL_KV_HEADS, HEAD_DIM
+                        ),
                     )
                     for request in range(requests)
                 ]
@@ -414,9 +425,11 @@ def _worker(rank, port, queue, rows, checkpoint=None):
             o = torch.empty_like(q)
             dattn(
                 q.data_ptr(), o.data_ptr(), k_cache.data_ptr(),
-                v_cache.data_ptr(), table.data_ptr(), TABLE_STRIDE,
-                table.numel() * table.element_size(), request_pool.data_ptr(),
-                1, prefix_lens.data_ptr(), 0, WINDOW, scale_bits,
+                v_cache.data_ptr(), k_new.data_ptr(), v_new.data_ptr(),
+                table.data_ptr(), TABLE_STRIDE,
+                table.numel() * table.element_size(),
+                request_pool.data_ptr(), 1,
+                prefix_lens.data_ptr(), 0, WINDOW, scale_bits,
                 attn_scratch.data_ptr(), epoch.data_ptr(), layer,
                 stream=torch.cuda.current_stream(),
             )

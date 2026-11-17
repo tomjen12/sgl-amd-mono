@@ -148,6 +148,8 @@ def test_gfx1250_dpre_matches_torch(rows):
     v_cache = torch.zeros_like(k_cache)
     res_out = torch.empty_like(x)
     q = torch.empty(rows, Q_K, device=device, dtype=torch.bfloat16)
+    k = torch.empty(rows, LOCAL_KV_HEADS * HEAD_DIM, device=device, dtype=torch.bfloat16)
+    v = torch.empty_like(k)
     coef = torch.empty(rows, COEF_ROWS, device=device)
     scratch = torch.zeros(D.dp_scratch_bytes(), dtype=torch.uint8, device=device)
     epoch = _epoch(device)
@@ -158,7 +160,8 @@ def test_gfx1250_dpre_matches_torch(rows):
         weights["w_qkv"].data_ptr(), weights["q_norm"].data_ptr(),
         weights["k_norm"].data_ptr(), cos_sin.data_ptr(), positions.data_ptr(), 0,
         slots.data_ptr(), 0, k_cache.data_ptr(), v_cache.data_ptr(),
-        res_out.data_ptr(), q.data_ptr(), coef.data_ptr(), scratch.data_ptr(),
+        res_out.data_ptr(), q.data_ptr(), k.data_ptr(), v.data_ptr(),
+        coef.data_ptr(), scratch.data_ptr(),
         epoch.data_ptr(), LAYER, stream=torch.cuda.current_stream(),
     )
     torch.cuda.synchronize()
@@ -166,6 +169,8 @@ def test_gfx1250_dpre_matches_torch(rows):
     expected = _pre_reference(x, res, False, weights, cos_sin, positions)
     assert torch.equal(res_out, expected[0])
     _close(q, expected[1], "q", bad_max=0.08, cosine=0.995)
+    _close(k, expected[2], "bf16 k", bad_max=0.08, cosine=0.995)
+    _close(v, expected[3], "bf16 v", bad_max=0.08, cosine=0.995)
     _close(k_cache[slots.long()], expected[2].reshape(rows, LOCAL_KV_HEADS, HEAD_DIM), "fp8 k", rtol=1 / 8, atol=0.06, cosine=0.995)
     _close(v_cache[slots.long()], expected[3].reshape(rows, LOCAL_KV_HEADS, HEAD_DIM), "fp8 v", rtol=1 / 8, atol=0.06, cosine=0.995)
     # The scalar fixed-order dot intentionally differs from rocBLAS's reduction

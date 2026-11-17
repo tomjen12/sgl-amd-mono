@@ -27,6 +27,31 @@ WIDTH = 8
 WORLD_SIZE = 4
 TARGET_LAYERS = 10
 DEFAULT_SEED = 300959315
+KV_GUARD_ROWS = 16
+BASELINE_ENVIRONMENT = {
+    "HIP_VISIBLE_DEVICES": "0,1,2,3",
+    "HSA_CU_MASK": "0-3:0-95",
+    "SGLANG_ENABLE_AMD_MONOKERNEL": "0",
+    "SGLANG_MUSE_MONO_GFX1250_CONFIG": "cu96_tp4",
+    "SGLANG_USE_AITER": "1",
+    "SGLANG_USE_AITER_UNIFIED_ATTN": "1",
+    "MUSE_MOE_BACKEND": "triton",
+    "SGLANG_ROCM_MUSE_FINALIZE_AR_PUSH": "0",
+    "SGLANG_ROCM_MUSE_A4W4_MOE": "0",
+    "SGLANG_ROCM_MUSE_COMPACT_A4_VERIFY": "0",
+    "SGLANG_ROCM_MUSE_GFX1250_TRY_GFX95": "1",
+    "SGLANG_ROCM_MUSE_EXTEND_GLUON": "0",
+    "SGLANG_ROCM_MUSE_EXTEND_SWA_GLUON": "0",
+    "SGLANG_ROCM_MUSE_EXTEND_FLYDSL": "0",
+    "SGLANG_ROCM_MUSE_VERIFY_FLYDSL": "0",
+    "SGLANG_ROCM_MUSE_VERIFY_BALANCED": "0",
+    "SGLANG_ROCM_MUSE_VERIFY_SWA_FLYDSL": "0",
+    "HIP_FORCE_DEV_KERNARG": "1",
+    "SGLANG_ROCM_MUSE_GFX1250_EXTEND": "1",
+    "SGLANG_ROCM_MUSE_PUSH_AR": "0",
+    "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "1",
+    "SGLANG_OPT_SCHEDULER_SHM_SYNC": "1",
+}
 ROUTING_BLOCKER = (
     "Seeded synthetic router weights did not reproduce the captured per-expert "
     "token counts. The row/top-k workload is preserved, but exact grouped-GEMM "
@@ -45,12 +70,20 @@ class RankDescriptor:
     prefix_len: int
     seq_lens_sum: int
     vocab_size: int
+    full_kv_physical_rows: int
+    swa_kv_physical_rows: int
     captured_routing: tuple[tuple[int, ...], ...]
 
 
 def _read_json(path: str | Path) -> dict[str, Any]:
     with Path(path).open(encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def write_output(path: str | Path, text: str) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(text, encoding="utf-8")
 
 
 def deterministic_seed(base_seed: int, rank: int, name: str) -> int:
@@ -97,6 +130,19 @@ def load_rank_descriptor(
     if list(Path(target_config).glob("*.safetensors")):
         raise ReplayInputError("Target directory must be config-only (no checkpoint)")
 
+    cache = verify.get("cache", {})
+    cache_rows: dict[str, int] = {}
+    for cache_name in ("kv.full", "kv.swa"):
+        cache_entry = cache.get(cache_name, {})
+        layers_entry = cache_entry.get("layers", {})
+        layer_entry = next(iter(layers_entry.values()), {})
+        shape = layer_entry.get("k", {}).get("shape", ())
+        if not shape or int(shape[0]) <= KV_GUARD_ROWS:
+            raise ReplayInputError(
+                f"rank {rank}: capture has no valid {cache_name} physical extent"
+            )
+        cache_rows[cache_name] = int(shape[0])
+
     lower_bound = int(verify.get("attention_kv_len_lower_bound") or 0)
     if lower_bound < 8192:
         raise ReplayInputError(f"rank {rank}: captured prefix is shorter than 8192")
@@ -125,6 +171,8 @@ def load_rank_descriptor(
         prefix_len=lower_bound,
         seq_lens_sum=int(verify.get("seq_lens_sum", lower_bound + WIDTH)),
         vocab_size=int(text.get("vocab_size", 0)),
+        full_kv_physical_rows=cache_rows["kv.full"],
+        swa_kv_physical_rows=cache_rows["kv.swa"],
         captured_routing=tuple(routing),
     )
 
@@ -138,13 +186,39 @@ def validate_inputs(
     )
     seeds = {item.seed for item in descriptors}
     prefixes = {item.prefix_len for item in descriptors}
+    pool_extents = {
+        (item.full_kv_physical_rows, item.swa_kv_physical_rows)
+        for item in descriptors
+    }
     if len(seeds) != 1 or min(seeds) < 0:
         raise ReplayInputError("all four ranks must share a valid synthetic seed")
     if len(prefixes) != 1:
         raise ReplayInputError("all four ranks must share the captured prefix length")
+    if len(pool_extents) != 1:
+        raise ReplayInputError("all four ranks must share captured KV pool extents")
     if any(item.vocab_size <= 0 for item in descriptors):
         raise ReplayInputError("Target config has no valid vocabulary")
     return descriptors
+
+
+def routing_ids_from_counts(counts: Iterable[int]) -> tuple[tuple[int, ...], ...]:
+    """Build a deterministic [8, 8] routing table with unique ids per row."""
+    counts = tuple(int(value) for value in counts)
+    if len(counts) != 256 or sum(counts) != WIDTH * WIDTH:
+        raise ReplayInputError("routing counts must contain 64 assignments")
+    if any(value < 0 or value > WIDTH for value in counts):
+        raise ReplayInputError("an expert may appear at most once per routing row")
+
+    rows: list[list[int]] = [[] for _ in range(WIDTH)]
+    for expert, count in sorted(
+        enumerate(counts), key=lambda item: (-item[1], item[0])
+    ):
+        candidates = sorted(range(WIDTH), key=lambda row: (len(rows[row]), row))
+        for row in candidates[:count]:
+            rows[row].append(expert)
+    if any(len(row) != WIDTH or len(set(row)) != WIDTH for row in rows):
+        raise ReplayInputError("captured routing counts cannot form an [8, 8] table")
+    return tuple(tuple(sorted(row)) for row in rows)
 
 
 def compare_routing(
@@ -202,6 +276,8 @@ def _output_checksum(output) -> dict[str, Any]:
 
 
 def _kv_state_summary(runner, layer_ids: Iterable[int], out_cache_loc) -> dict[str, Any]:
+    import torch
+
     state: dict[str, Any] = {"write_ids": [int(v) for v in out_cache_loc.cpu().tolist()]}
     for layer in layer_ids:
         try:
@@ -234,13 +310,27 @@ def _build_server_args(args):
         tp_size=WORLD_SIZE,
         ep_size=WORLD_SIZE,
         mem_fraction_static=args.mem_fraction_static,
+        max_running_requests=2,
+        max_total_tokens=16384,
+        context_length=16384,
+        attention_backend="aiter",
+        page_size=16,
+        kv_cache_dtype="fp8_e4m3",
         disable_radix_cache=True,
+        enable_amd_monokernel=args.mode == "mono",
         cuda_graph_backend_decode="disabled",
         cuda_graph_backend_prefill="disabled",
     )
 
 
-def _load_runner(server_args, port_args, gpu_id: int, rank: int, weight_seed: int):
+def _load_runner(
+    server_args,
+    port_args,
+    gpu_id: int,
+    rank: int,
+    weight_seed: int,
+    descriptor: RankDescriptor,
+):
     import torch
     import torch.distributed as dist
     from sglang.benchmark.one_batch import _init_process_global_configs
@@ -248,6 +338,7 @@ def _load_runner(server_args, port_args, gpu_id: int, rank: int, weight_seed: in
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed import bootstrap
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
     from sglang.srt.runtime_context import get_device
 
     _init_process_global_configs()
@@ -268,8 +359,24 @@ def _load_runner(server_args, port_args, gpu_id: int, rank: int, weight_seed: in
         nccl_port=port_args.nccl_port,
         server_args=server_args,
     )
-    runner.alloc_memory_pool()
+    runner.alloc_memory_pool(
+        memory_pool_config=MemoryPoolConfig(
+            max_total_num_tokens=(
+                descriptor.full_kv_physical_rows - KV_GUARD_ROWS
+            ),
+            full_max_total_num_tokens=(
+                descriptor.full_kv_physical_rows - KV_GUARD_ROWS
+            ),
+            swa_max_total_num_tokens=(
+                descriptor.swa_kv_physical_rows - KV_GUARD_ROWS
+            ),
+            max_running_requests=128,
+        )
+    )
     runner.init_attention_backends()
+    # Even with both graph families disabled, ModelRunner.forward expects
+    # init_cuda_graphs() to install the eager runner attributes.
+    runner.init_cuda_graphs()
     if cfg.tp_size > 1:
         dist.barrier()
     return runner
@@ -282,7 +389,10 @@ def _prepare_verify_batch(runner, descriptor: RankDescriptor):
         prepare_synthetic_inputs_for_latency_test,
     )
     from sglang.srt.managers.schedule_batch import ScheduleBatch
-    from sglang.srt.mem_cache.allocation import alloc_for_decode
+    from sglang.srt.mem_cache.allocation import (
+        alloc_paged_token_slots_decode,
+        assign_req_to_token_pool_func,
+    )
     from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
     from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
@@ -320,7 +430,26 @@ def _prepare_verify_batch(runner, descriptor: RankDescriptor):
         dtype=torch.int64,
         device=runner.device,
     )
-    out_cache_loc = alloc_for_decode(batch, token_per_req=WIDTH)
+    last_loc = batch.req_to_token_pool.req_to_token[
+        batch.req_pool_indices, batch.seq_lens - 1
+    ]
+    out_cache_loc = alloc_paged_token_slots_decode(
+        tree_cache=batch.tree_cache,
+        seq_lens=batch.seq_lens + WIDTH,
+        seq_lens_cpu=batch.seq_lens_cpu + WIDTH,
+        last_loc=last_loc,
+        token_per_req=WIDTH,
+        req_pool_indices=batch.req_pool_indices,
+        batch=batch,
+    )
+    assign_req_to_token_pool_func(
+        batch.req_pool_indices,
+        batch.req_to_token_pool.req_to_token,
+        prefix_lens,
+        prefix_lens + WIDTH,
+        out_cache_loc,
+        batch_size=1,
+    )
     plan = runner.runner_ids.plan(
         req_pool_indices=batch.req_pool_indices,
         seq_lens=prefix_lens,
@@ -367,11 +496,14 @@ def _trace_context(enabled: bool):
 def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: str):
     result: dict[str, Any] = {"rank": rank, "status": "error"}
     try:
-        os.environ.update(
-            HIP_VISIBLE_DEVICES="0,1,2,3",
-            HSA_CU_MASK="0-3:0-95",
-            SGLANG_ENABLE_AMD_MONOKERNEL="0",
-            SGLANG_MUSE_MONO_GFX1250_CONFIG="cu96_tp4",
+        os.environ.update(BASELINE_ENVIRONMENT)
+        os.environ["SGLANG_ENABLE_AMD_MONOKERNEL"] = (
+            "1" if args.mode == "mono" else "0"
+        )
+        os.environ["SGLANG_AMD_MONO_MUSE_KERNELS"] = "1"
+        os.environ["SGLANG_AMD_MONO_CHECK"] = "0"
+        os.environ["SGLANG_MUSE_REPLAY_MARKERS"] = (
+            "1" if args.trace_dir is not None else "0"
         )
         import torch
         import torch.distributed as dist
@@ -380,6 +512,8 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
             destroy_model_parallel,
         )
         from sglang.srt.rocm_muse_spark.replay_capture import (
+            replay_scope,
+            routing_override,
             runtime_metadata_capture,
         )
         from sglang.srt.runtime_context import SpawnRanks, publish, spawn_world_rank
@@ -397,24 +531,50 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
         )
         weight_seed = deterministic_seed(descriptor.seed, rank, "target")
         os.environ["SGLANG_DUMMY_WEIGHT_SEED"] = str(weight_seed)
-        runner = _load_runner(server_args, port_args, gpu_id, rank, weight_seed)
+        runner = _load_runner(
+            server_args,
+            port_args,
+            gpu_id,
+            rank,
+            weight_seed,
+            descriptor,
+        )
+        mono_attached = hasattr(runner.model, "_monokernel_unread_metadata")
+        if args.mode == "mono" and not mono_attached:
+            raise RuntimeError("Target Mono mode requested but plugin did not attach.")
         forward_batch, out_cache_loc, positions = _prepare_verify_batch(
             runner, descriptor
         )
+        route_ids = {
+            layer: torch.tensor(
+                routing_ids_from_counts(counts),
+                dtype=torch.int32,
+                device=runner.device,
+            )
+            for layer, counts in enumerate(descriptor.captured_routing)
+        }
 
-        for _ in range(args.warmup):
-            runner.forward(forward_batch)
-        torch.cuda.synchronize()
+        def run_once():
+            with replay_scope("target/verify"):
+                return runner.forward(forward_batch)
 
-        writer = _CaptureWriter()
-        profiler = _trace_context(args.trace_dir is not None)
-        checksums = []
-        elapsed = []
-        with runtime_metadata_capture(writer, "target_layers"):
+        with routing_override(route_ids):
+            for _ in range(args.warmup):
+                run_once()
+            torch.cuda.synchronize()
+
+            writer = _CaptureWriter()
+            with runtime_metadata_capture(writer, "target_layers"):
+                run_once()
+            torch.cuda.synchronize()
+
+            profiler = _trace_context(args.trace_dir is not None)
+            checksums = []
+            elapsed = []
             for _ in range(args.iterations):
                 torch.cuda.synchronize()
                 start = time.perf_counter()
-                output = runner.forward(forward_batch)
+                output = run_once()
                 torch.cuda.synchronize()
                 elapsed.append(time.perf_counter() - start)
                 checksums.append(_output_checksum(output))
@@ -433,6 +593,8 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
         result = {
             "rank": rank,
             "status": "ok",
+            "mode": args.mode,
+            "mono_attached": mono_attached,
             "tp_size": WORLD_SIZE,
             "ep_size": WORLD_SIZE,
             "weight_seed": weight_seed,
@@ -463,6 +625,15 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
 
 
 def execute(args) -> tuple[int, dict[str, Any]]:
+    os.environ.update(BASELINE_ENVIRONMENT)
+    os.environ["SGLANG_ENABLE_AMD_MONOKERNEL"] = (
+        "1" if args.mode == "mono" else "0"
+    )
+    if args.mode == "mono":
+        import sgl_amd_mono
+
+        sgl_amd_mono.register_specs()
+
     from sglang.srt.arg_groups.overrides import declare_resolution
     from sglang.srt.entrypoints.engine import _set_envs_and_config
     from sglang.srt.server_args import PortArgs
@@ -510,6 +681,7 @@ def execute(args) -> tuple[int, dict[str, Any]]:
     ]
     summary = {
         "workload": "synthetic-target-layers-0-9-width8",
+        "mode": args.mode,
         "tp_size": WORLD_SIZE,
         "ep_size": WORLD_SIZE,
         "processes": WORLD_SIZE,
@@ -534,6 +706,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trace-dir")
     parser.add_argument("--output")
     parser.add_argument("--mem-fraction-static", type=float, default=0.88)
+    parser.add_argument("--mode", choices=("baseline", "mono"), default="baseline")
     parser.add_argument(
         "--allow-routing-mismatch",
         action="store_true",
@@ -555,7 +728,7 @@ def main(argv: list[str] | None = None) -> int:
         create_parser().error(str(error))
     text = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.output:
-        Path(args.output).write_text(text, encoding="utf-8")
+        write_output(args.output, text)
     print(text, end="")
     return code
 

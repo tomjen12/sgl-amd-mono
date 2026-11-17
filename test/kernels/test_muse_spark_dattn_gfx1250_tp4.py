@@ -29,7 +29,9 @@ def _epoch(device):
     return epoch
 
 
-def _reference(q, k_cache, v_cache, slots, prefix, window, scale):
+def _reference(
+    q, k_cache, v_cache, slots, prefix, window, scale, k_new=None, v_new=None
+):
     from sgl_amd_mono.muse_spark.gfx1250.draft_attn import (
         GQA,
         HEAD_DIM,
@@ -42,6 +44,10 @@ def _reference(q, k_cache, v_cache, slots, prefix, window, scale):
     selected = slots[first:keys].long()
     k = k_cache[selected].float()
     v = v_cache[selected].float()
+    if k_new is not None:
+        k[-q.shape[0] :] = k_new.float()
+    if v_new is not None:
+        v[-q.shape[0] :] = v_new.float()
     out = torch.empty_like(q)
     for token in range(q.shape[0]):
         queries = q[token].float().reshape(LOCAL_Q_HEADS, HEAD_DIM)
@@ -57,16 +63,30 @@ def _reference(q, k_cache, v_cache, slots, prefix, window, scale):
 
 @pytest.mark.parametrize("resident_blocks", [96])
 @pytest.mark.parametrize("total_rows", [8, 16, 32, 64])
-@pytest.mark.parametrize("base_prefix,window", [(300, 0), (3000, 2048)])
+@pytest.mark.parametrize(
+    "base_prefix,window",
+    [
+        (0, 0),
+        (8, 0),
+        (128, 0),
+        (300, 0),
+        (1024, 0),
+        (2048, 2048),
+        (3000, 2048),
+    ],
+)
+@pytest.mark.parametrize("q_scale", [0.4, 2.0])
 def test_gfx1250_dflash2_tp4_dattn(
-    resident_blocks, total_rows, base_prefix, window
+    resident_blocks, total_rows, base_prefix, window, q_scale
 ):
     from sgl_amd_mono.muse_spark.gfx1250 import draft_attn as D
 
     torch.manual_seed(0xDFA1250)
     device = torch.device("cuda")
     requests = total_rows // D.BLOCK
-    q = (torch.randn(total_rows, D.Q_K, device=device) * 0.4).to(torch.bfloat16)
+    q = (torch.randn(total_rows, D.Q_K, device=device) * q_scale).to(
+        torch.bfloat16
+    )
     k_cache = (
         torch.randn(SLOTS, D.LOCAL_KV_HEADS, D.HEAD_DIM, device=device) * 1.5
     ).to(torch.float8_e4m3fn)
@@ -74,7 +94,7 @@ def test_gfx1250_dflash2_tp4_dattn(
         SLOTS, D.LOCAL_KV_HEADS, D.HEAD_DIM, device=device
     ).to(torch.float8_e4m3fn)
 
-    prefixes = [base_prefix - 7 * request for request in range(requests)]
+    prefixes = [max(base_prefix - 7 * request, 0) for request in range(requests)]
     req_to_token = torch.zeros(
         requests + 2, TABLE_STRIDE, dtype=torch.int32, device=device
     )
@@ -88,6 +108,11 @@ def test_gfx1250_dflash2_tp4_dattn(
     req_pool = torch.tensor(req_pool_values, dtype=torch.int64, device=device)
     seq_lens = torch.tensor(prefixes, dtype=torch.int32, device=device)
     out = torch.full_like(q, float("nan"))
+    current_slots = torch.cat(
+        [slots[-D.BLOCK :] for slots in request_slots]
+    )
+    k_new = k_cache[current_slots].to(torch.bfloat16)
+    v_new = v_cache[current_slots].to(torch.bfloat16)
     scratch = torch.zeros(
         D.dattn_scratch_bytes(), dtype=torch.uint8, device=device
     )
@@ -107,6 +132,8 @@ def test_gfx1250_dflash2_tp4_dattn(
         out.data_ptr(),
         k_cache.data_ptr(),
         v_cache.data_ptr(),
+        k_new.data_ptr(),
+        v_new.data_ptr(),
         req_to_token.data_ptr(),
         TABLE_STRIDE,
         req_to_token.numel() * req_to_token.element_size(),
@@ -133,6 +160,12 @@ def test_gfx1250_dflash2_tp4_dattn(
                 prefixes[request],
                 window,
                 scale,
+                k_new[
+                    request * D.BLOCK : (request + 1) * D.BLOCK
+                ],
+                v_new[
+                    request * D.BLOCK : (request + 1) * D.BLOCK
+                ],
             )
             for request in range(requests)
         ]

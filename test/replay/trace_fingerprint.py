@@ -4,6 +4,8 @@
 The comparison intentionally ignores timestamps, addresses, process/thread IDs,
 correlation IDs and generated compile hashes.  It keeps operator/kernel order,
 launch geometry, shape/dtype metadata and CPU-to-GPU correlation structure.
+Checkpoint-only FP4 storage reinterpretations are also ignored because the
+config-only Target replay starts from the equivalent packed uint8 weights.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ CPU_CATEGORIES = frozenset(
     {"cpu_op", "python_function", "user_annotation", "operator"}
 )
 KERNEL_CATEGORIES = frozenset({"kernel", "gpu_kernel", "cuda_kernel", "hip_kernel"})
+RUNTIME_CATEGORIES = frozenset({"cuda_runtime", "hip_runtime"})
 _ADDRESS = re.compile(r"0x[0-9a-fA-F]+")
 _HASH = re.compile(r"(?<=[_.-])[0-9a-fA-F]{12,64}(?=($|[_.-]))")
 _HIP_CLONE = re.compile(r"\s*\[clone\s+\.kd\]\s*$")
@@ -74,6 +77,11 @@ def _external_id(event: dict[str, Any]) -> str | None:
     return None if value is None else str(value)
 
 
+def _correlation_id(event: dict[str, Any]) -> str | None:
+    value = _arg(event.get("args") or {}, "correlation", "correlation id")
+    return None if value is None else str(value)
+
+
 def _selected_cpu_args(event: dict[str, Any]) -> dict[str, Any]:
     args = event.get("args") or {}
     selected = {}
@@ -99,6 +107,22 @@ def _selected_cpu_args(event: dict[str, Any]) -> dict[str, Any]:
         if value is not None:
             selected[output] = value
     return selected
+
+
+def _is_checkpoint_fp4_storage_view(
+    name: str, selected_args: dict[str, Any]
+) -> bool:
+    """Ignore a storage-only view absent from config-only packed dummy weights."""
+    if name != "aten::view":
+        return False
+    input_types = selected_args.get("input_types") or ()
+    concrete_inputs = selected_args.get("concrete_inputs") or ()
+    return (
+        bool(input_types)
+        and str(input_types[0]).startswith("c10::Float4_")
+        and len(concrete_inputs) > 1
+        and str(concrete_inputs[1]) == "0"
+    )
 
 
 def _selected_kernel_args(event: dict[str, Any]) -> dict[str, Any]:
@@ -131,9 +155,14 @@ def _ordered(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def fingerprint_trace(
-    trace: dict[str, Any], *, scope_pattern: str = r"^muse_replay/"
+    trace: dict[str, Any],
+    *,
+    scope_pattern: str = r"^muse_replay/",
+    scope_occurrence: int | None = None,
 ) -> dict[str, Any]:
     """Return deterministic fingerprints for matching user-annotation scopes."""
+    if scope_occurrence is not None and scope_occurrence < 0:
+        raise ValueError("scope_occurrence must be non-negative")
     events = _complete_events(trace)
     scope_re = re.compile(scope_pattern)
     scopes = [
@@ -142,6 +171,16 @@ def fingerprint_trace(
         if scope_re.search(str(event.get("name", "")))
         and _category(event) in CPU_CATEGORIES
     ]
+    if scope_occurrence is not None:
+        occurrences: dict[str, int] = defaultdict(int)
+        selected = []
+        for scope in _ordered(scopes):
+            name = normalize_name(scope.get("name", ""))
+            occurrence = occurrences[name]
+            occurrences[name] += 1
+            if occurrence == scope_occurrence:
+                selected.append(scope)
+        scopes = selected
     result: list[dict[str, Any]] = []
     for scope in _ordered(scopes):
         cpu_events = [
@@ -156,24 +195,46 @@ def fingerprint_trace(
         cpu_sequence = []
         for event in cpu_events:
             name = normalize_name(event.get("name", ""))
+            selected_args = _selected_cpu_args(event)
+            if _is_checkpoint_fp4_storage_view(name, selected_args):
+                continue
             external_id = _external_id(event)
             if external_id is not None:
                 parents[external_id].append(name)
             cpu_sequence.append(
                 {
                     "name": name,
-                    "args": _selected_cpu_args(event),
+                    "args": selected_args,
                 }
             )
 
-        # PyTorch kernels normally carry the originating CPU op's External id.
-        # Keep interval-contained kernels too so traces without that field remain useful.
+        # ROCm kernels can execute well after the CPU scope closes. Associate
+        # them through the runtime launch's correlation id; use the interval
+        # fallback only for traces that do not expose launch correlations.
+        launch_parents: dict[str, str | None] = {}
+        for event in events:
+            if _category(event) not in RUNTIME_CATEGORIES or not _inside(event, scope):
+                continue
+            correlation = _correlation_id(event)
+            if correlation is None or "launch" not in str(event.get("name", "")).lower():
+                continue
+            cpu_id = _arg(event.get("args") or {}, "cid", "external id")
+            launch_parents[correlation] = (
+                parents.get(str(cpu_id), [])[-1]
+                if cpu_id is not None and str(cpu_id) in parents
+                else None
+            )
+
         kernel_events = [
             event
             for event in events
             if _category(event) in KERNEL_CATEGORIES
             and (
-                _inside(event, scope)
+                (
+                    _correlation_id(event) in launch_parents
+                    if launch_parents
+                    else _inside(event, scope)
+                )
                 or (
                     _external_id(event) is not None
                     and _external_id(event) in parents
@@ -184,13 +245,14 @@ def fingerprint_trace(
         ordered_kernels = _ordered(kernel_events)
         for event in ordered_kernels:
             external_id = _external_id(event)
+            correlation = _correlation_id(event)
             kernel_sequence.append(
                 {
                     "name": normalize_name(event.get("name", "")),
                     "args": _selected_kernel_args(event),
                     "cpu_parent": parents.get(external_id, [])[-1]
                     if external_id in parents
-                    else None,
+                    else launch_parents.get(correlation),
                 }
             )
         result.append(
@@ -228,6 +290,19 @@ def compare_fingerprints(
     failures: list[str] = []
     expected_scopes = expected.get("scopes", [])
     actual_scopes = actual.get("scopes", [])
+
+    def events_match(want_event: dict[str, Any], got_event: dict[str, Any]) -> bool:
+        if want_event.get("name") != got_event.get("name"):
+            return False
+        if want_event.get("args", {}) != got_event.get("args", {}):
+            return False
+        # Some ROCm profiler runs omit the runtime launch's CPU linkage even
+        # when kernel order and geometry are intact. Compare the parent when
+        # both traces report one; absence on one side is missing telemetry.
+        want_parent = want_event.get("cpu_parent")
+        got_parent = got_event.get("cpu_parent")
+        return not (want_parent and got_parent and want_parent != got_parent)
+
     if len(expected_scopes) != len(actual_scopes):
         failures.append(
             f"scope count: expected {len(expected_scopes)}, got {len(actual_scopes)}"
@@ -248,7 +323,7 @@ def compare_fingerprints(
             for event_index, (want_event, got_event) in enumerate(
                 zip(want_events, got_events)
             ):
-                if want_event != got_event:
+                if not events_match(want_event, got_event):
                     failures.append(
                         f"{want['scope']} {field}[{event_index}]: "
                         f"expected {want_event!r}, got {got_event!r}"
@@ -294,6 +369,7 @@ def main() -> int:
     extract.add_argument("trace")
     extract.add_argument("output")
     extract.add_argument("--scope-pattern", default=r"^muse_replay/")
+    extract.add_argument("--scope-occurrence", type=int)
     compare = subparsers.add_parser("compare")
     compare.add_argument("expected")
     compare.add_argument("actual")
@@ -308,7 +384,11 @@ def main() -> int:
     if args.command == "extract":
         _write(
             args.output,
-            fingerprint_trace(_load(args.trace), scope_pattern=args.scope_pattern),
+            fingerprint_trace(
+                _load(args.trace),
+                scope_pattern=args.scope_pattern,
+                scope_occurrence=args.scope_occurrence,
+            ),
         )
         return 0
     failures = compare_fingerprints(

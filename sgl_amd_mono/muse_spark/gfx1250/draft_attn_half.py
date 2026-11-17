@@ -396,7 +396,7 @@ def _cs(ptr, pos, index):
 
 @flyc.jit
 def stage_heads(c):
-    """Per-head q/k RMSNorm, neox RoPE, and q plus fp8 K/V publication."""
+    """Per-head q/k RMSNorm, RoPE, BF16 current K/V and fp8 cache publication."""
     job = c["bid"]
     while job < c["S"] * QKV_HEADS:
         token, head = job // QKV_HEADS, job % QKV_HEADS
@@ -435,6 +435,15 @@ def stage_heads(c):
                     token * Q_K + head * HEAD_DIM + dim,
                 )
             else:
+                bo.buffer_store(
+                    fx.Vector.from_elements(out, fx.Float32).to(fx.BFloat16),
+                    rsrc(
+                        is_k.select(
+                            c["args"]["k_out"], c["args"]["v_out"]
+                        )
+                    ),
+                    token * KV_K + kv_head * HEAD_DIM + dim,
+                )
                 slot = fx.Int32(bo.buffer_load(rsrc(c["args"]["slots"]), (c["args"]["slot64"] != 0).select(2 * token, token), vec_width=1, dtype=T.i32))
                 packed = fp8_pack4(clamp_fp8(out[0]), clamp_fp8(out[1]), clamp_fp8(out[2]), clamp_fp8(out[3]))
                 index = (slot * LOCAL_KV_HEADS + kv_head) * (HEAD_DIM // 4) + dim // 4
@@ -560,6 +569,7 @@ def build_dpre(key: DPreBuild):
         w_qkv: Int64, q_norm: Int64, k_norm: Int64, cos_sin: Int64,
         positions: Int64, pos64: Int32, slots: Int64, slot64: Int32,
         k_cache: Int64, v_cache: Int64, res_out: Int64, q: Int64,
+        k_out: Int64, v_out: Int64,
         coef_out: Int64, scratch: Int64, epoch: Int64, layer: Int32,
     ):
         tid, bid = fx.thread_idx.x, fx.block_idx.x
@@ -588,7 +598,8 @@ def build_dpre(key: DPreBuild):
                 "base": base, "w_qkv": w_qkv, "q_norm": q_norm, "k_norm": k_norm,
                 "cos_sin": cos_sin, "positions": positions, "pos64": pos64,
                 "slots": slots, "slot64": slot64, "k_cache": k_cache,
-                "v_cache": v_cache, "res_out": res_out, "q": q, "coef_out": coef_out,
+                "v_cache": v_cache, "res_out": res_out, "q": q,
+                "k_out": k_out, "v_out": v_out, "coef_out": coef_out,
             },
         }
         run_dpre(c)
@@ -599,6 +610,7 @@ def build_dpre(key: DPreBuild):
         w_qkv: Int64, q_norm: Int64, k_norm: Int64, cos_sin: Int64,
         positions: Int64, pos64: Int32, slots: Int64, slot64: Int32,
         k_cache: Int64, v_cache: Int64, res_out: Int64, q: Int64,
+        k_out: Int64, v_out: Int64,
         coef_out: Int64, scratch: Int64, epoch: Int64, layer: Int32,
         stream: fx.Stream = _STREAM,
     ):
@@ -606,6 +618,7 @@ def build_dpre(key: DPreBuild):
         dpre(
             x, res, first, w_in, w_kp, base, w_qkv, q_norm, k_norm, cos_sin,
             positions, pos64, slots, slot64, k_cache, v_cache, res_out, q,
+            k_out, v_out,
             coef_out, scratch, epoch, layer,
         ).launch(grid=(key.resident_blocks,), block=(THREADS,), stream=stream)
 

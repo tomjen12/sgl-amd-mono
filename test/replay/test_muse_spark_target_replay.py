@@ -10,7 +10,9 @@ from muse_spark_target_replay import (
     create_parser,
     deterministic_seed,
     deterministic_values,
+    routing_ids_from_counts,
     validate_inputs,
+    write_output,
 )
 
 
@@ -34,6 +36,14 @@ def _write_rank(bundle, rank, *, seed=42, prefix=8192):
                 "attention_kv_len_lower_bound": prefix,
                 "seq_lens_sum": prefix + 48,
                 "tensors": {"input_ids": {"shape": [WIDTH]}},
+                "cache": {
+                    "kv.full": {
+                        "layers": {"1": {"k": {"shape": [13763008, 4, 64]}}}
+                    },
+                    "kv.swa": {
+                        "layers": {"0": {"k": {"shape": [2752608, 4, 64]}}}
+                    },
+                },
             }
         )
     )
@@ -93,6 +103,8 @@ def test_validate_real_geometry_contract(tmp_path):
     assert len(descriptors) == 4
     assert descriptors[0].prefix_len == 8192
     assert descriptors[0].seq_lens_sum == 8240
+    assert descriptors[0].full_kv_physical_rows == 13763008
+    assert descriptors[0].swa_kv_physical_rows == 2752608
     assert len(descriptors[3].captured_routing) == 10
 
 
@@ -144,6 +156,34 @@ def test_routing_match_and_explicit_override_blocker():
     assert mismatch["blocker"] == ROUTING_BLOCKER
 
 
+def test_routing_ids_reproduce_counts_without_row_duplicates():
+    counts = [0] * 256
+    counts[3] = 8
+    counts[7] = 7
+    counts[11] = 6
+    for expert in range(12, 55):
+        counts[expert] = 1
+
+    rows = routing_ids_from_counts(counts)
+
+    assert len(rows) == WIDTH
+    assert all(len(row) == WIDTH and len(set(row)) == WIDTH for row in rows)
+    observed = [0] * 256
+    for row in rows:
+        for expert in row:
+            observed[expert] += 1
+    assert observed == counts
+
+
+def test_routing_ids_reject_duplicate_expert_within_row():
+    counts = [0] * 256
+    counts[0] = 9
+    counts[1] = 55
+
+    with pytest.raises(ReplayInputError, match="at most once"):
+        routing_ids_from_counts(counts)
+
+
 def test_cli_requires_explicit_routing_mismatch_opt_in():
     parser = create_parser()
     defaults = parser.parse_args(["bundle", "target"])
@@ -155,3 +195,11 @@ def test_cli_requires_explicit_routing_mismatch_opt_in():
     assert defaults.iterations == 5
     assert opted_in.allow_routing_mismatch is True
     assert opted_in.warmup == 3
+
+
+def test_output_writer_creates_parent_directories(tmp_path):
+    destination = tmp_path / "nested" / "summary.json"
+
+    write_output(destination, '{"status":"ok"}\n')
+
+    assert destination.read_text() == '{"status":"ok"}\n'
