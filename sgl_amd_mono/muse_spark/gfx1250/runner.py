@@ -170,8 +170,10 @@ class MuseMonoRunner:
             )
         return self._k1[rows]
 
-    def layer_kernel(self, rows: int, q_len: int, next_k1: bool, last: bool):
-        key = rows, q_len, next_k1, last
+    def layer_kernel(
+        self, rows: int, q_len: int, next_k1: bool, last: bool, shuffled: bool
+    ):
+        key = rows, q_len, next_k1, last, shuffled
         if key not in self._layer:
             from sgl_amd_mono.muse_spark.gfx1250.build_layer import (
                 LayerBuild,
@@ -186,6 +188,7 @@ class MuseMonoRunner:
                     npes=self.npes,
                     next_k1=next_k1,
                     last=last,
+                    shuffled=shuffled,
                     fault_site=self.fault_site,
                     fault_after=self.fault_after,
                 )
@@ -208,12 +211,14 @@ class MuseMonoRunner:
             )
         compile_only(self.k1_kernel(rows))
         variants = {
-            (self._next_k1(i), i == len(self.views) - 1)
+            (self._next_k1(i), i == len(self.views) - 1, view.shuffled)
             for i, view in enumerate(self.views)
             if view.kind == "mxfp4"
         }
-        for next_k1, last in variants:
-            compile_only(self.layer_kernel(rows, q_len, next_k1, last))
+        for next_k1, last, shuffled in variants:
+            compile_only(
+                self.layer_kernel(rows, q_len, next_k1, last, shuffled)
+            )
 
     def cache_reasons(self, backend, pool) -> list[str]:
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
@@ -467,7 +472,7 @@ class MuseMonoRunner:
             i, rows, q_len, forward_batch
         )
         last = i == len(self.modules) - 1
-        self.layer_kernel(rows, q_len, next_k1, last)(
+        self.layer_kernel(rows, q_len, next_k1, last, view.shuffled)(
             _ptr(self.q),
             _ptr(self.o),
             k_cache,

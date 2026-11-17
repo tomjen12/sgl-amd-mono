@@ -150,8 +150,9 @@ def _picks(device):
     return ids
 
 
+@pytest.mark.parametrize("shuffled", [False, True])
 @pytest.mark.parametrize("last", [False, True])
-def test_k3_matches_explicit_native_quark_reference(last):
+def test_k3_matches_explicit_native_quark_reference(last, shuffled):
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
     from sgl_amd_mono.muse_spark.gfx1250.build_k3 import (
@@ -176,6 +177,20 @@ def test_k3_matches_explicit_native_quark_reference(last):
     w2, s2, d2 = _native_weight(
         TABLE_EXPERTS, MOE_HIDDEN, INTER, device, gen
     )
+    if shuffled:
+        from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
+
+        w13 = moe_shuffle_weight(
+            w13, is_guinterleave=True, gate_up=True
+        ).view(torch.uint8)
+        s13 = moe_shuffle_scale(
+            s13, experts_cnt=TABLE_EXPERTS,
+            is_guinterleave=True, gate_up=True,
+        ).view(torch.uint8)
+        w2 = moe_shuffle_weight(w2).view(torch.uint8)
+        s2 = moe_shuffle_scale(
+            s2, experts_cnt=TABLE_EXPERTS
+        ).view(torch.uint8)
     xin = (torch.randn(8, MOE_HIDDEN, device=device) * 0.25).to(bf16)
     ids = _picks(device)
     scores = torch.rand(8, TOP_K, device=device, generator=gen) * 0.25
@@ -206,7 +221,7 @@ def test_k3_matches_explicit_native_quark_reference(last):
         (8, HIDDEN), float("nan"), dtype=bf16, device=device
     )
     got = base_stream.clone()
-    launch = build_k3(K3Build(npes=1))
+    launch = build_k3(K3Build(npes=1, shuffled=shuffled))
     try:
         for _ in range(2):
             got.copy_(base_stream)

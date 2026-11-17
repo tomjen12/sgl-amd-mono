@@ -261,6 +261,28 @@ def _experts_reasons(experts, i: int, config) -> list[str]:
         ) + _tensor_reasons(
             experts.w2_weight, torch.bfloat16, (E, MOE_HIDDEN, INTER), f"{what} w2"
         )
+    shuffled = getattr(experts, "gfx1250_a8w4", None)
+    if getattr(experts, "native_dropped", False) and shuffled is not None:
+        w13, w2, s13, s2, _ = shuffled
+        why = _tensor_reasons(
+            w13.view(torch.uint8), torch.uint8,
+            (E, 2 * INTER, MOE_HIDDEN // 2), f"{what} shuffled w13",
+        )
+        why += _tensor_reasons(
+            w2.view(torch.uint8), torch.uint8,
+            (E, MOE_HIDDEN, INTER // 2), f"{what} shuffled w2",
+        )
+        why += _tensor_reasons(
+            s13.view(torch.uint8), torch.uint8,
+            (E, (2 * INTER) // 32, (MOE_HIDDEN // MXFP4_GROUP) * 32),
+            f"{what} shuffled w13 scale",
+        )
+        why += _tensor_reasons(
+            s2.view(torch.uint8), torch.uint8,
+            (E, MOE_HIDDEN // 32, (INTER // MXFP4_GROUP) * 32),
+            f"{what} shuffled w2 scale",
+        )
+        return why
     why = _tensor_reasons(
         experts.w13_weight, torch.uint8, (E, 2 * INTER, MOE_HIDDEN // 2), f"{what} w13"
     )
@@ -470,6 +492,7 @@ class LayerViews(msgspec.Struct, frozen=True):
     npw: (
         torch.Tensor
     )  # bf16 [HIDDEN]: the next layer's pre_attn_norm (+1), or the final norm's
+    shuffled: bool = False  # AITER gfx1250 16x16 weights + n32k4 scales
     quantized: bool = False  # bf16 experts quantized online (kind is then "mxfp4")
     w_pool_fp8: object = None  # packed FP8 copy of w_pool (``pack_fp8_rows``), or None
     w_unpool_fp8: object = None  # packed FP8 copy of w_unpool, or None
@@ -482,10 +505,26 @@ class LayerViews(msgspec.Struct, frozen=True):
         if quantized:
             w13, s13, w2, s2 = _quantized_experts(experts, i, copies)
             kind = "mxfp4"
+            shuffled = False
         elif kind == "mxfp4":
-            w13, s13, w2, s2 = experts.w13_weight.data, experts.w13_weight_scale.data, experts.w2_weight.data, experts.w2_weight_scale.data  # fmt: skip
+            aiter_weights = getattr(experts, "gfx1250_a8w4", None)
+            shuffled = bool(
+                getattr(experts, "native_dropped", False)
+                and aiter_weights is not None
+            )
+            if shuffled:
+                aw13, aw2, as13, as2, _ = aiter_weights
+                w13, s13, w2, s2 = (
+                    aw13.view(torch.uint8),
+                    as13.view(torch.uint8),
+                    aw2.view(torch.uint8),
+                    as2.view(torch.uint8),
+                )
+            else:
+                w13, s13, w2, s2 = experts.w13_weight.data, experts.w13_weight_scale.data, experts.w2_weight.data, experts.w2_weight_scale.data  # fmt: skip
         else:
             w13 = s13 = w2 = s2 = None
+            shuffled = False
         alpha, beta = _gate_coefficients(
             layer.post_attention_residual_gate, i, "post_attention", copies
         )
@@ -532,6 +571,7 @@ class LayerViews(msgspec.Struct, frozen=True):
             alpha2=alpha2,
             beta2=beta2,
             npw=_effective_norm_weight(next_pre_norm, i, "next pre_attn_norm", copies),
+            shuffled=shuffled,
             quantized=quantized,
             w_pool_fp8=_fp8_dense(moe.pre_expert_proj.weight, i, "pooler", copies)
             if FP8_DENSE

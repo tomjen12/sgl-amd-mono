@@ -140,6 +140,7 @@ class LayerBuild(msgspec.Struct, frozen=True):
     npes: int = 4
     next_k1: bool = False
     last: bool = False
+    shuffled: bool = False
     resident_blocks: int = RESIDENT_BLOCKS
     fault_site: int = 0
     fault_after: int = 0
@@ -233,6 +234,7 @@ def build_layer(key: LayerBuild):
         w=W,
         n=int(key.next_k1),
         l=int(key.last),
+        a=int(key.shuffled),
         c=key.resident_blocks,
         f=key.fault_site,
     )
@@ -576,6 +578,7 @@ def build_layer(key: LayerBuild):
             "lane": lane,
             "wave": wave,
             "rank": rank,
+            "shuffled": key.shuffled,
             "args": k3_args,
             "red": lds.k3.red.ptr,
             "aux": lds.k3.aux.ptr,

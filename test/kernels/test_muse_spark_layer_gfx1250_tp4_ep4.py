@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 NP = 4
 LAYER = 19
-CASES = ((300, 0, False), (3000, 2047, True))
+CASES = ((300, 0, False, False), (3000, 2047, True, True))
 
 
 def _worker(rank, port, queue):
@@ -82,7 +82,7 @@ def _worker(rank, port, queue):
     device = torch.device("cuda", rank)
     active_peers = []
     try:
-        for case_index, (keys, window, last) in enumerate(CASES):
+        for case_index, (keys, window, last, shuffled) in enumerate(CASES):
             # All boundary data is replicated.  TP projection and EP expert
             # weights are rank-local, and their BF16 oracle partials are
             # gathered and added strictly in rank order.
@@ -111,6 +111,20 @@ def _worker(rank, port, queue):
                 device,
                 local_generator,
             )
+            if shuffled:
+                from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
+
+                case["w13"] = moe_shuffle_weight(
+                    case["w13"], is_guinterleave=True, gate_up=True
+                ).view(torch.uint8)
+                case["s13"] = moe_shuffle_scale(
+                    case["s13"], experts_cnt=TABLE_EXPERTS,
+                    is_guinterleave=True, gate_up=True,
+                ).view(torch.uint8)
+                case["w2"] = moe_shuffle_weight(case["w2"]).view(torch.uint8)
+                case["s2"] = moe_shuffle_scale(
+                    case["s2"], experts_cnt=TABLE_EXPERTS
+                ).view(torch.uint8)
             next_w = (
                 torch.randn(
                     QKVG_ROWS,
@@ -206,7 +220,9 @@ def _worker(rank, port, queue):
                 KAttnBuild(tokens=MAX_TOKENS, q_len=MAX_TOKENS)
             )
             k2_launch = build_k2(K2Build(tokens=MAX_TOKENS, npes=NP))
-            k3_launch = build_k3(K3Build(npes=NP, last=last))
+            k3_launch = build_k3(
+                K3Build(npes=NP, last=last, shuffled=shuffled)
+            )
             k1_launch = build_k1(K1Build(tokens=MAX_TOKENS))
             fused_launch = build_layer(
                 LayerBuild(
@@ -215,6 +231,7 @@ def _worker(rank, port, queue):
                     npes=NP,
                     next_k1=True,
                     last=last,
+                    shuffled=shuffled,
                 )
             )
             stream = torch.cuda.current_stream()

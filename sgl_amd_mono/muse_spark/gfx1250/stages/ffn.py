@@ -109,16 +109,47 @@ def _decode_e2m1(code):
     return ((code & 8) != 0).select(-mag, mag)
 
 
-def _decode_weight_fragment(r_w, r_s, row, k0, lane):
-    """One native Quark row fragment as the WMMA v16bf16 A operand."""
+def _shuffled_weight_offset(row, k_byte):
+    """AITER shuffle_weight((16, 16)) byte offset within one expert."""
+    return (
+        (((row // 16) * (W13_ROW_BYTES // 32) + k_byte // 32) * 2
+          + (k_byte % 32) // 16)
+        * 16
+        + row % 16
+    ) * 16 + k_byte % 16
+
+
+def _shuffled_scale_offset(row, k_group):
+    """AITER n32k4 scale byte offset within one expert."""
+    return (
+        (row // 32) * (W13_SCALE_COLS * 32)
+        + (k_group // 4) * 128
+        + (row % 32) * 4
+        + k_group % 4
+    )
+
+
+def _decode_weight_fragment(r_w, r_s, row, k0, lane, shuffled):
+    """One native-Quark or AITER-shuffled row fragment for WMMA."""
     kh = (lane // 16) * 8
     vals = []
     for half in range_constexpr(2):
         for i in range_constexpr(8):
             k = k0 + half * 16 + kh + i
-            byte = _load_u8(r_w, row * W13_ROW_BYTES + k // 2)
+            k_byte = k // 2
+            weight_offset = (
+                _shuffled_weight_offset(row, k_byte)
+                if shuffled
+                else row * W13_ROW_BYTES + k_byte
+            )
+            scale_offset = (
+                _shuffled_scale_offset(row, k // 32)
+                if shuffled
+                else row * W13_SCALE_COLS + k // 32
+            )
+            byte = _load_u8(r_w, weight_offset)
             code = (k & 1).select(byte >> 4, byte & 0xF)
-            scale = _load_u8(r_s, row * W13_SCALE_COLS + k // 32)
+            scale = _load_u8(r_s, scale_offset)
             vals.append(_decode_e2m1(code) * _e8m0_f32(scale))
     return fx.Vector.from_elements(vals, fx.Float32).to(fx.BFloat16)
 
@@ -165,16 +196,19 @@ def _tile_value(red, row):
 
 
 @flyc.jit
-def _mx_weight_gemv_tile(c, r_w, r_s, row0, x_addr, k):
+def _mx_weight_gemv_tile(c, r_w, r_s, row0, x_addr, k, gate_up=0):
     """Sixteen weight rows times one dynamically-quantized BF16 row."""
     lane, wave, red = c["lane"], c["wave"], c["red"]
     row = row0 + lane % 16
+    if c["shuffled"] and gate_up:
+        # AITER interleaves stage-1 rows as g0,u0,g1,u1,...
+        row = row * 2 + (gate_up - 1)
     r_x = rsrc(x_addr)
     acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
     for step in range(0, k // (WAVES * WMMA_K)):
         k0 = (wave * (k // WAVES)) + step * WMMA_K
         acc = _wmma(
-            _decode_weight_fragment(r_w, r_s, row, k0, lane),
+            _decode_weight_fragment(r_w, r_s, row, k0, lane, c["shuffled"]),
             _bf_fragment(r_x, 0, k0, lane),
             acc,
         )
@@ -259,14 +293,22 @@ def stage_expert_pick(c, task=None):
         for block in range(0, INTER // 32):
             for half in range_constexpr(2):
                 row0 = block * 32 + half * 16
-                _mx_weight_gemv_tile(c, r13, rs13, row0, qx, MOE_HIDDEN)
+                _mx_weight_gemv_tile(
+                    c, r13, rs13, row0, qx, MOE_HIDDEN, gate_up=1
+                )
                 if tid < 16:
                     fx.ptr_store(
                         _tile_value(c["red"], tid), c["aux"] + 32 + tid
                     )
                 gpu.barrier()
                 _mx_weight_gemv_tile(
-                    c, r13, rs13, INTER + row0, qx, MOE_HIDDEN
+                    c,
+                    r13,
+                    rs13,
+                    row0 if c["shuffled"] else INTER + row0,
+                    qx,
+                    MOE_HIDDEN,
+                    gate_up=2,
                 )
                 if tid < 16:
                     gate = fx.ptr_load(c["aux"] + 32 + tid)

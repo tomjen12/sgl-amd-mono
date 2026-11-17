@@ -8,8 +8,9 @@ attention with RoPE.  Three paths are checked:
 * split K1 -> K-attn -> K2 -> K3 for every layer, and
 * standalone first K1, Layer V2 for layers 1/2, then Layer V1 for layer 3.
 
-All 64 rank-local experts are present in native packed MXFP4 storage.  The
-reference dequantizes only routed expert slices, never a dense expert table.
+All 64 rank-local experts start in native packed MXFP4 storage for the
+reference, then are converted to AITER's shuffled gfx1250 layout for both
+kernel paths.  The reference dequantizes only routed expert slices.
 """
 
 import os
@@ -111,8 +112,14 @@ def _local_expert_reference(xin, ids, scores, local_start, layer):
     routed = torch.unique(local_ids[(local_ids >= 0) & (local_ids < LOCAL_EXPERTS)])
     for expert_tensor in routed:
         expert = int(expert_tensor)
-        dense13 = _dequant_expert(layer["w13"][expert], layer["s13"][expert])
-        dense2 = _dequant_expert(layer["w2"][expert], layer["s2"][expert])
+        dense13 = _dequant_expert(
+            layer.get("ref_w13", layer["w13"])[expert],
+            layer.get("ref_s13", layer["s13"])[expert],
+        )
+        dense2 = _dequant_expert(
+            layer.get("ref_w2", layer["w2"])[expert],
+            layer.get("ref_s2", layer["s2"])[expert],
+        )
         locations = (local_ids == expert).nonzero()
         tokens, slots = locations[:, 0], locations[:, 1]
         gate_up = quantized_input[tokens] @ dense13.float().T
@@ -571,14 +578,35 @@ def _worker(rank, port, queue, rows):
             )
             oracle_layers.append(reference)
 
+        from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
+
+        for layer in layers:
+            for name in ("w13", "s13", "w2", "s2"):
+                layer[f"ref_{name}"] = layer[name]
+            layer["w13"] = moe_shuffle_weight(
+                layer["w13"], is_guinterleave=True, gate_up=True
+            ).view(torch.uint8)
+            layer["s13"] = moe_shuffle_scale(
+                layer["s13"], experts_cnt=64,
+                is_guinterleave=True, gate_up=True,
+            ).view(torch.uint8)
+            layer["w2"] = moe_shuffle_weight(layer["w2"]).view(torch.uint8)
+            layer["s2"] = moe_shuffle_scale(
+                layer["s2"], experts_cnt=64
+            ).view(torch.uint8)
+
         k1 = build_k1(K1Build(tokens=rows))
         kattn = build_kattn(
             KAttnBuild(tokens=rows, q_len=8)
         )
         k2 = build_k2(K2Build(tokens=rows, npes=NP))
         k3_variants = {
-            False: build_k3(K3Build(tokens=rows, npes=NP, last=False)),
-            True: build_k3(K3Build(tokens=rows, npes=NP, last=True)),
+            False: build_k3(
+                K3Build(tokens=rows, npes=NP, last=False, shuffled=True)
+            ),
+            True: build_k3(
+                K3Build(tokens=rows, npes=NP, last=True, shuffled=True)
+            ),
         }
         layer_v2 = build_layer(
             LayerBuild(
@@ -587,6 +615,7 @@ def _worker(rank, port, queue, rows):
                 npes=NP,
                 next_k1=True,
                 last=False,
+                shuffled=True,
             )
         )
         layer_v1_last = build_layer(
@@ -596,6 +625,7 @@ def _worker(rank, port, queue, rows):
                 npes=NP,
                 next_k1=False,
                 last=True,
+                shuffled=True,
             )
         )
         split_k1_scratch = torch.zeros(

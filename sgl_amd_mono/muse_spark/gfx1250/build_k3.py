@@ -32,6 +32,7 @@ class K3Build(msgspec.Struct, frozen=True):
     tokens: int = DRAFT_TOKENS
     npes: int = 4
     last: bool = False
+    shuffled: bool = False
     fault_site: int = 0
     fault_after: int = 0
 
@@ -98,6 +99,7 @@ def _context(key, lds, args, scratch, sym, peers, rank, epoch, tag):
         "lane": fx.thread_idx.x % 32,
         "wave": fx.thread_idx.x // 32,
         "rank": rank,
+        "shuffled": key.shuffled,
         "args": args,
         "red": lds.red.ptr,
         "aux": lds.aux.ptr,
@@ -130,6 +132,7 @@ def build_k3(key: K3Build):
         s=key.tokens,
         w=key.npes,
         l=int(key.last),
+        a=int(key.shuffled),
         f=key.fault_site,
     )
 
