@@ -14,8 +14,8 @@ pytestmark = pytest.mark.skipif(
     reason="needs a gfx1250 GPU",
 )
 
-PAGES = 512
-MAX_BLOCKS = 512
+PAGES = 1024
+MAX_BLOCKS = 1024
 TABLE_EXPERTS = 2
 LAYER = 17
 ROUTED_IDS = (0, 1, 64, 65, 128, 129, 192, 193)
@@ -492,9 +492,16 @@ def test_gfx1250_fused_target_normal_and_fault_variants_compile():
 
 
 @pytest.mark.parametrize(
-    "keys,window,last", [(300, 0, False), (3000, 2047, True)]
+    "keys,window,last,zero_q",
+    [
+        (300, 0, False, False),
+        (3000, 2047, True, False),
+        (8200, 0, False, True),
+    ],
 )
-def test_gfx1250_fused_layer_matches_oracle_and_split(keys, window, last):
+def test_gfx1250_fused_layer_matches_oracle_and_split(
+    keys, window, last, zero_q
+):
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
     from sgl_amd_mono.muse_spark.gfx1250.build_k2 import (
@@ -523,6 +530,8 @@ def test_gfx1250_fused_layer_matches_oracle_and_split(keys, window, last):
 
     device = torch.device("cuda")
     case = _make_case(device, 125000 + keys + window, keys)
+    if zero_q:
+        case["q"].zero_()
     weights = case["weights"]
     oracle_o = _attention_reference(
         case["q"],
@@ -613,7 +622,8 @@ def test_gfx1250_fused_layer_matches_oracle_and_split(keys, window, last):
                 weights["w_hi"].data_ptr(), weights["w_lo"].data_ptr(),
                 weights["bias"].data_ptr(), weights["w_pool"].data_ptr(),
                 weights["xn_w"].data_ptr(), fused["ids"].data_ptr(),
-                fused["scores"].data_ptr(), fused["xin"].data_ptr(), 0,
+                fused["scores"].data_ptr(), 0, 0,
+                fused["xin"].data_ptr(), 0,
                 case["w13"].data_ptr(), case["s13"].data_ptr(),
                 case["w2"].data_ptr(), case["s2"].data_ptr(),
                 weights["pen_w"].data_ptr(), weights["pfw"].data_ptr(),

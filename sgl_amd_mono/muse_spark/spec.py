@@ -312,16 +312,58 @@ class _Built:
             pre_norm_dtype = torch.bfloat16 if i == last else None
             ref = self._reference(i, positions, forward_batch, stream, attn_input, pre_norm_dtype) if check else None  # fmt: skip
             kv_ref = self._kv_rows(i, forward_batch, rows) if check else None
-            # the layer's q (its K1 ran in the previous launch): the merged launch's next K1
-            # overwrites it before the attention check reads it
-            q_i = self.runner.q[:rows].clone() if check else None
+            q_before = self.runner.q[:rows].clone() if check else None
             stream, attn_input = r.launch(
                 i=i, rows=rows, q_len=q_len, positions=positions, forward_batch=forward_batch,
                 stream=stream, attn_input=attn_input, pre_norm_dtype=pre_norm_dtype,
             )  # fmt: skip
             if ref is not None:
+                # Captured inside runner after any standalone K1 and before the
+                # fused layer can reuse the Q buffer for next-K1.
+                q_i = r.check_q_input
+                if q_i is None:
+                    q_i = q_before
                 _log_check(i, live, (stream, attn_input), ref)
                 _log_kv_check(i, live, self._kv_rows(i, forward_batch, rows), kv_ref)
+                if r.check_q_input is not None:
+                    layer_debug = r.layer_debug(rows)
+                    _log_stage_check(
+                        i,
+                        live,
+                        "k2_x",
+                        layer_debug["k2_x"],
+                        self._reference_stages.get("k2_x"),
+                    )
+                    _log_stage_check(
+                        i,
+                        live,
+                        "xin",
+                        layer_debug["xin"],
+                        self._reference_stages.get("xin"),
+                    )
+                    _log_stage_check(
+                        i,
+                        live,
+                        "k3_fbuf",
+                        layer_debug["k3_fbuf"],
+                        self._reference_stages.get("k3_fbuf"),
+                    )
+                    _log_routed_stage_check(
+                        i,
+                        live,
+                        "k3_y",
+                        layer_debug["k3_y"],
+                        self._reference_stages.get("k3_y"),
+                        self._reference_stages.get("k3_rows"),
+                    )
+                    _log_pick_stage_check(
+                        i,
+                        live,
+                        "k3_qmid",
+                        layer_debug["k3_qmid"],
+                        self._reference_stages.get("k3_qmid"),
+                        self._reference_stages.get("k3_rows"),
+                    )
                 self._attn_check(i, rows, q_len, forward_batch, q_i)
             if i in m.layers_to_capture:  # set after attach: read per step
                 aux.append(stream.to(torch.bfloat16))
@@ -538,10 +580,95 @@ class _Built:
         (stream, next attention input) as the launch does. It writes the same KV
         slots with the same values, which the launch then writes again."""
         m = self.model
-        return m.layers[i](
+        layer = m.layers[i]
+        # The ROCm fused boundary is not an nn.Module, so compute its native
+        # same-input output explicitly instead of relying on a forward hook.
+        ref_attn = layer.self_attn(
+            positions, attn_input.clone(), forward_batch
+        )
+        k2_x, k2_stream, _ = layer._fused_attn_boundary.forward(
+            stream.clone(), ref_attn, branch_dtype=torch.bfloat16
+        )
+        self._reference_stages = {
+            "k2_x": k2_x.detach().clone(),
+            "k2_stream": k2_stream.detach().clone(),
+        }
+        if layer.is_moe_layer and hasattr(layer.mlp, "route"):
+            route_scores, route_ids, expert_input, _ = layer.mlp.route(k2_x)
+            import importlib
+
+            import sglang.srt.rocm_muse_spark.mxfp4_moe as mxfp4_moe
+
+            aiter_fused_moe = importlib.import_module("aiter.fused_moe")
+            capture = {}
+            original_finalize = mxfp4_moe._finalize_rows
+            original_mx_quant = (
+                aiter_fused_moe.fused_dynamic_mxfp8_quant_moe_sort
+            )
+
+            def capture_finalize(y, rows, *args, **kwargs):
+                capture["y"], capture["rows"] = y, rows
+                return original_finalize(y, rows, *args, **kwargs)
+
+            def capture_mx_quant(input, *args, **kwargs):
+                capture["stage1"] = input.detach().clone()
+                return original_mx_quant(input, *args, **kwargs)
+
+            mxfp4_moe._finalize_rows = capture_finalize
+            aiter_fused_moe.fused_dynamic_mxfp8_quant_moe_sort = capture_mx_quant
+            try:
+                expert_output = layer.mlp(
+                    k2_x,
+                    skip_post_expert_proj=True,
+                    target_verify=forward_batch.forward_mode.is_target_verify(),
+                )
+                k3_y = capture.get("y")
+                k3_rows = capture.get("rows")
+                if k3_y is not None:
+                    k3_y = k3_y.detach().clone().reshape(
+                        -1, expert_output.shape[-1]
+                    )
+                    k3_rows = k3_rows.detach().clone().reshape(-1).long()
+                stage1 = capture.get("stage1")
+                k3_qmid = None
+                if stage1 is not None:
+                    from aiter.ops.flydsl.kernels.mega_moe.quant import (
+                        per_1x32_mx_quant,
+                    )
+
+                    stage1 = stage1.reshape(-1, expert_output.shape[-1])
+                    payload, scales = per_1x32_mx_quant(
+                        stage1, quant_mode="fp8"
+                    )
+                    dequant_scale = torch.ldexp(
+                        torch.ones_like(scales, dtype=torch.float32),
+                        scales.to(torch.int32) - 127,
+                    )
+                    k3_qmid = (
+                        payload.float().reshape(stage1.shape[0], -1, 32)
+                        * dequant_scale[..., None]
+                    ).reshape_as(stage1).to(torch.bfloat16)
+            finally:
+                mxfp4_moe._finalize_rows = original_finalize
+                aiter_fused_moe.fused_dynamic_mxfp8_quant_moe_sort = (
+                    original_mx_quant
+                )
+            self._reference_stages.update(
+                {
+                    "xin": expert_input.detach().clone(),
+                    "ids": route_ids.detach().clone(),
+                    "scores": route_scores.detach().clone(),
+                    "k3_fbuf": expert_output.detach().clone(),
+                    "k3_qmid": k3_qmid,
+                    "k3_y": k3_y,
+                    "k3_rows": k3_rows,
+                }
+            )
+        result = layer(
             positions, stream.clone(), forward_batch, attn_input=attn_input.clone(),
             ffn_boundary=m._ffn_boundaries[i], pre_norm_dtype=pre_norm_dtype,
         )  # fmt: skip
+        return result
 
     def _bind(self) -> None:
         """At the first routed forward, which every rank runs eagerly together: the
@@ -594,6 +721,67 @@ def _log_kv_check(lid: int, live: torch.Tensor, got, ref) -> None:
             f"{name} equal {same:.4f} maxdiff {diff:.3f} ref|max| {r.abs().amax().item():.3f}"
         )
     logger.info("monokernel kv check layer %d: %s", lid, "; ".join(stats))
+
+
+def _log_stage_check(lid, live, name, got, ref) -> None:
+    """Compare one fused-layer intermediate against the native same-input path."""
+    if ref is None or not bool(live.any()):
+        return
+    got, ref = got[live].float(), ref[live].float()
+    rel = ((got - ref).abs().amax() / ref.abs().amax().clamp_min(1e-30)).item()
+    cos = torch.nn.functional.cosine_similarity(got, ref, dim=-1)
+    logger.info(
+        "monokernel stage check layer %d %s: rel %.5f cosine %.6f mean %.6f",
+        lid,
+        name,
+        rel,
+        cos.min().item(),
+        cos.mean().item(),
+    )
+
+
+def _log_routed_stage_check(lid, live, name, got, ref, rows) -> None:
+    """Compare per-route Mono scratch with AITER's grouped expert rows."""
+    if ref is None or rows is None or not bool(live.any()):
+        return
+    live_picks = live.repeat_interleave(rows.numel() // live.numel())
+    valid = (rows >= 0) & live_picks
+    if not bool(valid.any()):
+        return
+    picks = valid.nonzero(as_tuple=False).flatten()
+    got = got[picks].float()
+    ref = ref[rows[picks]].float()
+    rel = ((got - ref).abs().amax() / ref.abs().amax().clamp_min(1e-30)).item()
+    cos = torch.nn.functional.cosine_similarity(got, ref, dim=-1)
+    logger.info(
+        "monokernel stage check layer %d %s: rel %.5f cosine %.6f mean %.6f",
+        lid,
+        name,
+        rel,
+        cos.min().item(),
+        cos.mean().item(),
+    )
+
+
+def _log_pick_stage_check(lid, live, name, got, ref, rows) -> None:
+    """Compare tensors indexed directly by original token/top-k pick."""
+    if ref is None or rows is None or not bool(live.any()):
+        return
+    live_picks = live.repeat_interleave(rows.numel() // live.numel())
+    valid = (rows >= 0) & live_picks
+    if not bool(valid.any()):
+        return
+    got, ref = got[valid].float(), ref[valid].float()
+    rel = ((got - ref).abs().amax() / ref.abs().amax().clamp_min(1e-30)).item()
+    cos = torch.nn.functional.cosine_similarity(got, ref, dim=-1)
+    logger.info(
+        "monokernel stage check layer %d %s: rel %.5f cosine %.6f mean %.6f",
+        lid,
+        name,
+        rel,
+        cos.min().item(),
+        cos.mean().item(),
+    )
 
 
 def _build(model, hf_config, ctx) -> _Built:

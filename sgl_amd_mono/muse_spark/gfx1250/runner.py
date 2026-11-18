@@ -227,6 +227,35 @@ class MuseMonoRunner:
             ].view(tiles, FUSED_SPLITS, FUSED_ROWS, HEAD_DIM),
         }
 
+    def layer_debug(self, rows: int):
+        """Views of K2 outputs that remain live after the fused layer."""
+        from sgl_amd_mono.muse_spark.gfx1250.build_layer import _private_layout
+
+        layout = _private_layout()
+
+        def bf16(name, columns):
+            offset, _ = layout[name]
+            count = rows * columns
+            return self.scratch_layer[offset : offset + count * 2].view(
+                torch.bfloat16
+            ).view(rows, columns)
+
+        return {
+            "k2_x": bf16("k2_x", HIDDEN),
+            "k2_pool": bf16("k2_pool", MOE_HIDDEN),
+            "k3_qmid": bf16("k3_qmid", TOP_K * MOE_HIDDEN).view(
+                rows * TOP_K, MOE_HIDDEN
+            ),
+            "k3_y": bf16("k3_y", TOP_K * MOE_HIDDEN).view(
+                rows * TOP_K, MOE_HIDDEN
+            ),
+            "k3_fbuf": bf16("k3_fbuf", MOE_HIDDEN),
+            "k3_branch": bf16("k3_branch", HIDDEN),
+            "xin": self.xin[:rows],
+            "ids": self.ids[:rows],
+            "scores": self.scores[:rows],
+        }
+
     def k1_kernel(self, rows: int):
         if rows not in self._k1:
             from sgl_amd_mono.muse_spark.gfx1250.layer import K1Build, build_k1
@@ -558,6 +587,8 @@ class MuseMonoRunner:
         pre_norm_dtype,
     ):
         view = self.views[i]
+        if os.environ.get("SGLANG_AMD_MONO_CHECK", "0") == "1":
+            self.check_q_input = None
         if (
             not self.use_kernels
             or view.kind != "mxfp4"
@@ -621,6 +652,11 @@ class MuseMonoRunner:
                 int(mapping.dtype == torch.int64),
                 stream=current,
             )
+        if os.environ.get("SGLANG_AMD_MONO_CHECK", "0") == "1":
+            # Preserve the exact Q consumed by the fused layer.  The prior
+            # layer's pipelined K1 may be replaced by standalone K1 here, and
+            # this same buffer is reused by next-K1 before check mode runs.
+            self.check_q_input = self.q[:rows].clone()
         self._k1_done = -1
 
         next_k1 = self._next_k1(i)

@@ -1,5 +1,7 @@
 """Standalone gfx1250 K3 against an explicit native-Quark PyTorch reference."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -13,7 +15,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-TABLE_EXPERTS = 2
+TABLE_EXPERTS = 64
+ROUTED_EXPERTS = 2
 LAYER = 11
 
 
@@ -49,45 +52,67 @@ def _native_weight(experts, rows, k, device, gen):
         device=device,
         generator=gen,
     )
-    codes = torch.stack((packed & 0xF, packed >> 4), -1).reshape(
-        experts, rows, k
+    dense_packed = packed[:ROUTED_EXPERTS]
+    dense_scales = scales[:ROUTED_EXPERTS]
+    codes = torch.stack(
+        (dense_packed & 0xF, dense_packed >> 4), -1
+    ).reshape(
+        ROUTED_EXPERTS, rows, k
     )
     mag = E2M1.to(device)[(codes & 7).long()]
     value = torch.where((codes & 8) != 0, -mag, mag)
-    scale = (scales.to(torch.int32) << 23).view(torch.float32)
+    scale = (dense_scales.to(torch.int32) << 23).view(torch.float32)
     dense = (
-        value.reshape(experts, rows, k // 32, 32) * scale[..., None]
-    ).reshape(experts, rows, k)
+        value.reshape(ROUTED_EXPERTS, rows, k // 32, 32)
+        * scale[..., None]
+    ).reshape(ROUTED_EXPERTS, rows, k)
     return packed, scales, dense.to(torch.bfloat16)
 
 
 def _mx_dequant(x):
-    """Exact explicit form of Quark's dynamic 32-value MXFP4 quantizer."""
+    """Exact explicit form of AITER's per-1x32 MXFP8 activation quantizer."""
     shape = x.shape
     blocks = x.float().reshape(*shape[:-1], -1, 32)
-    amax = blocks.abs().amax(-1, keepdim=True)
-    bits = (amax.view(torch.int32) + 0x200000) & -0x800000
-    exponent = (((bits >> 23) & 0xFF) - 129).clamp(min=-127)
-    scaled = blocks * torch.ldexp(torch.ones_like(amax), -exponent)
-    absolute = scaled.abs()
-    abits = absolute.view(torch.int32)
-    den = ((absolute + 4194304.0).view(torch.int32) - (149 << 23)) & 0xFF
-    normal = (
-        (abits + ((-126 << 23) + 0x1FFFFF) + ((abits >> 22) & 1)) >> 22
-    ) & 0xFF
-    code = torch.where(
-        absolute >= 6.0,
-        torch.full_like(den, 7),
-        torch.where(absolute < 1.0, den, normal),
+    amax = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-10)
+    inv_max = torch.tensor(
+        0x3B124925, dtype=torch.int32, device=x.device
+    ).view(torch.float32)
+    working = (amax * inv_max).view(torch.int32)
+    exponent = (working >> 23) & 0xFF
+    e8m0 = (exponent + ((working & 0x7FFFFF) != 0)).clamp_max(255)
+    dequant_scale = torch.ldexp(
+        torch.ones_like(amax), e8m0 - 127
     )
-    mag = E2M1.to(x.device)[code.long()]
-    quantized = torch.where(scaled < 0, -mag, mag)
     return (
-        quantized * torch.ldexp(torch.ones_like(amax), exponent)
+        (blocks / dequant_scale)
+        .to(torch.float8_e4m3fn)
+        .float()
+        * dequant_scale
     ).reshape(shape)
 
 
-def _local_partial(xin, ids, scores, local_start, d13, d2, pen_w):
+def test_mxfp8_reference_matches_aiter_quantizer():
+    from aiter.ops.flydsl.kernels.mega_moe.quant import per_1x32_mx_quant
+
+    device = torch.device("cuda")
+    x = (
+        torch.randn(8, 4096, device=device)
+        * torch.linspace(0.01, 8.0, 8, device=device)[:, None]
+    ).to(torch.bfloat16)
+    payload, scales = per_1x32_mx_quant(x, quant_mode="fp8")
+    dequant_scale = torch.ldexp(
+        torch.ones_like(scales, dtype=torch.float32),
+        scales.to(torch.int32) - 127,
+    )
+    got = (
+        payload.float().reshape(8, -1, 32) * dequant_scale[..., None]
+    ).reshape_as(x)
+    torch.testing.assert_close(got, _mx_dequant(x), rtol=0, atol=0)
+
+
+def _local_partial(
+    xin, ids, scores, local_start, d13, d2, pen_w, diagnostics=False
+):
     from sgl_amd_mono.muse_spark.gfx1250.config import (
         INTER,
         LOCAL_EXPERTS,
@@ -98,21 +123,38 @@ def _local_partial(xin, ids, scores, local_start, d13, d2, pen_w):
 
     out = torch.zeros(xin.shape[0], MOE_HIDDEN, device=xin.device)
     xq = _mx_dequant(xin.float())
+    diag = None
+    if diagnostics:
+        shape = (xin.shape[0] * TOP_K, MOE_HIDDEN)
+        diag = {
+            "qx": torch.zeros(shape, dtype=torch.bfloat16, device=xin.device),
+            "qmid": torch.zeros(shape, dtype=torch.bfloat16, device=xin.device),
+            "y": torch.zeros(shape, dtype=torch.bfloat16, device=xin.device),
+        }
     for token in range(xin.shape[0]):
         for slot in range(TOP_K):
             expert = int(ids[token, slot]) - local_start
             if not 0 <= expert < LOCAL_EXPERTS:
                 continue
+            pick = token * TOP_K + slot
             gate_up = xq[token] @ d13[expert].float().T
             gate, up = gate_up[:INTER], gate_up[INTER:]
             mid = _mx_dequant(_bf(gate * torch.sigmoid(gate) * up))
             y = _bf(mid @ d2[expert].float().T)
+            if diag is not None:
+                diag["qx"][pick] = xq[token]
+                diag["qmid"][pick] = mid
+                diag["y"][pick] = y
             value = _bf(y * pen_w.float())
             scale = scores[token, slot] * torch.rsqrt(
                 value.square().mean() + POST_EPS
             )
             out[token] += scale * value
-    return _bf(out)
+    partial = _bf(out)
+    if diag is not None:
+        diag["fbuf"] = partial
+        return partial, diag
+    return partial
 
 
 def _boundary(partials, weights, stream, last):
@@ -165,6 +207,7 @@ def test_k3_matches_explicit_native_quark_reference(last, shuffled):
         HIDDEN,
         INTER,
         MOE_HIDDEN,
+        POST_EPS,
         TOP_K,
     )
 
@@ -206,9 +249,53 @@ def test_k3_matches_explicit_native_quark_reference(last, shuffled):
             * 0.01
         ).to(bf16),
     }
-    partial = _local_partial(
-        xin, ids, scores, 0, d13, d2, weights["pen_w"]
+    partial, diag = _local_partial(
+        xin,
+        ids,
+        scores,
+        0,
+        d13,
+        d2,
+        weights["pen_w"],
+        diagnostics=True,
     )
+    aiter_fbuf = None
+    aiter_rows = None
+    aiter_y = None
+    if shuffled:
+        import sglang.srt.rocm_muse_spark.mxfp4_moe as mxfp4_moe
+
+        mask = torch.zeros(256, dtype=torch.int32, device=device)
+        mask[:TABLE_EXPERTS] = 1
+        experts = SimpleNamespace(
+            gfx1250_a8w4=(w13, w2, s13, s2, mask),
+            num_local_experts=TABLE_EXPERTS,
+            expert_hidden_size=MOE_HIDDEN,
+        )
+        capture = {}
+        original_finalize = mxfp4_moe._finalize_rows
+
+        def capture_finalize(y, rows, *args, **kwargs):
+            capture["y"], capture["rows"] = y, rows
+            return original_finalize(y, rows, *args, **kwargs)
+
+        mxfp4_moe._finalize_rows = capture_finalize
+        try:
+            aiter_fbuf = mxfp4_moe.run_gfx1250_a8w4(
+                xin,
+                scores,
+                ids,
+                experts,
+                0,
+                weights["pen_w"],
+                POST_EPS,
+                0.0,
+            )
+            torch.cuda.synchronize()
+            aiter_y = capture["y"].detach().clone().reshape(-1, MOE_HIDDEN)
+            aiter_rows = capture["rows"].detach().clone().reshape(-1).long()
+        finally:
+            mxfp4_moe._finalize_rows = original_finalize
     ref_stream, ref_attn = _boundary([partial], weights, base_stream, last)
 
     scratch = torch.zeros(k3_scratch_bytes(), dtype=torch.uint8, device=device)
@@ -253,6 +340,54 @@ def test_k3_matches_explicit_native_quark_reference(last, shuffled):
             )
             epoch[0] += 1
         torch.cuda.synchronize()
+        from sgl_amd_mono.muse_spark.gfx1250.build_k3 import _scratch_layout
+
+        layout = _scratch_layout()
+
+        def scratch_bf16(name, shape):
+            offset, _ = layout[name]
+            size = torch.tensor(shape).prod().item()
+            return scratch[offset : offset + size * 2].view(bf16).view(shape)
+
+        held = ((ids >= 0) & (ids < ROUTED_EXPERTS)).reshape(-1)
+        for name in ("qx", "qmid", "y"):
+            got_stage = scratch_bf16(
+                f"k3_{name}", (8 * TOP_K, MOE_HIDDEN)
+            )[held].float()
+            ref_stage = diag[name][held].float()
+            cosine = torch.nn.functional.cosine_similarity(
+                got_stage, ref_stage, dim=-1
+            )
+            assert cosine.min() > 0.997, (
+                f"{name} cosine {cosine.min().item():.6f}"
+            )
+        got_fbuf = scratch_bf16("k3_fbuf", (8, MOE_HIDDEN)).float()
+        fbuf_cosine = torch.nn.functional.cosine_similarity(
+            got_fbuf, diag["fbuf"].float(), dim=-1
+        )
+        assert fbuf_cosine.min() > 0.997, (
+            f"fbuf cosine {fbuf_cosine.min().item():.6f}"
+        )
+        if aiter_fbuf is not None:
+            local_picks = held.nonzero(as_tuple=False).flatten()
+            rows = aiter_rows[local_picks]
+            valid = rows >= 0
+            aiter_y_cosine = torch.nn.functional.cosine_similarity(
+                scratch_bf16("k3_y", (8 * TOP_K, MOE_HIDDEN))[
+                    local_picks[valid]
+                ].float(),
+                aiter_y[rows[valid]].float(),
+                dim=-1,
+            )
+            assert aiter_y_cosine.min() > 0.997, (
+                f"AITER y cosine {aiter_y_cosine.min().item():.6f}"
+            )
+            aiter_cosine = torch.nn.functional.cosine_similarity(
+                got_fbuf, aiter_fbuf.float(), dim=-1
+            )
+            assert aiter_cosine.min() > 0.997, (
+                f"AITER fbuf cosine {aiter_cosine.min().item():.6f}"
+            )
         assert (
             epoch[guard.ERR_DEADLINE : guard.ERR_FAULT + 1] == 0
         ).all()

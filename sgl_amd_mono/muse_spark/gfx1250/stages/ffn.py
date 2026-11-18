@@ -40,6 +40,7 @@ WMMA_ACC = 8
 RED_FLOATS = WAVES * WAVE_SIZE * WMMA_ACC
 ELEMS = 16
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+FP8_INV_MAX = 0x3B124925
 W13_ROW_BYTES = MOE_HIDDEN // 2
 W13_SCALE_COLS = MOE_HIDDEN // 32
 W2_ROW_BYTES = INTER // 2
@@ -53,35 +54,30 @@ def _e8m0_f32(byte):
     return ((fx.Int32(byte) & 0xFF) << 23).bitcast(fx.Float32)
 
 
-def _mxfp4_scale(amax):
-    bits = (amax.bitcast(fx.Int32) + fx.Int32(0x200000)) & fx.Int32(-0x800000)
-    unbiased = fx.max(((bits >> 23) & 0xFF) - 129, fx.Int32(-127))
-    return unbiased + 127, ((fx.Int32(127) - unbiased) << 23).bitcast(
-        fx.Float32
+def _mxfp8_value(x, amax):
+    """AITER per-1x32 MXFP8 quantization, returned as its dequantized f32."""
+    safe_max = fx.max(amax, fx.Float32(1e-10))
+    working = (safe_max * fx.Int32(FP8_INV_MAX).bitcast(fx.Float32)).bitcast(
+        fx.Int32
     )
-
-
-def _e2m1_code(x, qscale):
-    bits = (x * qscale).bitcast(fx.Int32)
-    negative = bits < 0
-    absolute_bits = bits & fx.Int32(0x7FFFFFFF)
-    absolute = absolute_bits.bitcast(fx.Float32)
-    denormal = (
-        (absolute + fx.Float32(4194304.0)).bitcast(fx.Int32)
-        - fx.Int32(149 << 23)
-    ) & 0xFF
-    normal = (
-        (
-            absolute_bits
-            + fx.Int32((-126 << 23) + 0x1FFFFF)
-            + ((absolute_bits >> 22) & 1)
-        )
-        >> 22
-    ) & 0xFF
-    code = (absolute >= fx.Float32(6.0)).select(
-        fx.Int32(7), (absolute < fx.Float32(1.0)).select(denormal, normal)
+    mantissa = working & fx.Int32(0x7FFFFF)
+    exponent = (working >> 23) & fx.Int32(0xFF)
+    e8m0 = (mantissa != 0).select(exponent + 1, exponent)
+    e8m0 = fx.min(e8m0, fx.Int32(255))
+    quant_scale = ((fx.Int32(254) - e8m0) << 23).bitcast(fx.Float32)
+    dequant_scale = (e8m0 << 23).bitcast(fx.Float32)
+    packed = rocdl.cvt_pk_fp8_f32(
+        T.i32, x * quant_scale, fx.Float32(0.0), fx.Int32(0), 0
     )
-    return code | negative.select(fx.Int32(8), fx.Int32(0))
+    code = fx.Int32(packed) & 0xFF
+    exponent, mantissa = (code >> 3) & 0xF, code & 7
+    normal = ((exponent + 120) << 23) | (mantissa << 20)
+    decoded = (exponent == 0).select(
+        fx.Float32(mantissa) * fx.Float32(1.0 / 512.0),
+        normal.bitcast(fx.Float32),
+    )
+    decoded = ((code & 0x80) != 0).select(-decoded, decoded)
+    return decoded * dequant_scale
 
 
 def k3_lds():
@@ -236,8 +232,8 @@ def _bf_gemv_tile(c, r_w, row0, x_addr, k):
 
 @flyc.jit
 def _quantize_row(c, src_addr, dst_addr, n):
-    """Apply the exact Quark dynamic MXFP4 rule and store its BF16 dequantization."""
-    tid, lane = c["tid"], c["lane"]
+    """Apply AITER's per-1x32 MXFP8 rule and store its BF16 dequantization."""
+    tid = c["tid"]
     r_src, r_dst = rsrc(src_addr), rsrc(dst_addr)
     for it in range_constexpr(n // THREADS):
         i = tid + it * THREADS
@@ -245,8 +241,7 @@ def _quantize_row(c, src_addr, dst_addr, n):
             bo.buffer_load(r_src, i, vec_width=1, dtype=T.bf16)
         )
         amax = fx.coop.warp_reduce(abs(x), fx.ReductionOp.MAX, width=32)
-        byte, qs = _mxfp4_scale(amax)
-        value = _decode_e2m1(_e2m1_code(x, qs)) * _e8m0_f32(byte)
+        value = _mxfp8_value(x, amax)
         bo.buffer_store(
             value.to(fx.BFloat16), r_dst, i, cache_modifier=16
         )
@@ -323,8 +318,7 @@ def stage_expert_pick(c, task=None):
             if tid < 32:
                 v = fx.ptr_load(c["aux"] + tid)
                 amax = fx.coop.warp_reduce(abs(v), fx.ReductionOp.MAX, width=32)
-                byte, qs = _mxfp4_scale(amax)
-                qv = _decode_e2m1(_e2m1_code(v, qs)) * _e8m0_f32(byte)
+                qv = _mxfp8_value(v, amax)
                 bo.buffer_store(
                     qv.to(fx.BFloat16),
                     rsrc(qmid),
