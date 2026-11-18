@@ -12,7 +12,9 @@ import argparse
 import dataclasses
 import gzip
 import hashlib
+import inspect
 import json
+import logging
 import multiprocessing
 import os
 import random
@@ -275,6 +277,15 @@ def _output_checksum(output) -> dict[str, Any]:
     return tensors
 
 
+def _output_hidden(output):
+    logits = getattr(output, "logits_output", None)
+    for owner in (output, logits):
+        value = getattr(owner, "hidden_states", None)
+        if hasattr(value, "detach"):
+            return value
+    raise RuntimeError("Target replay output has no hidden states tensor.")
+
+
 def _kv_state_summary(runner, layer_ids: Iterable[int], out_cache_loc) -> dict[str, Any]:
     import torch
 
@@ -289,6 +300,86 @@ def _kv_state_summary(runner, layer_ids: Iterable[int], out_cache_loc) -> dict[s
         except (AttributeError, KeyError, TypeError, RuntimeError) as error:
             state[f"layer_{layer}.unavailable"] = str(error)
     return state
+
+
+def _cpu_snapshot(tensor):
+    return tensor.detach().to(device="cpu").clone()
+
+
+class _Restore:
+    def __init__(self, owner, name: str, original):
+        self.owner = owner
+        self.name = name
+        self.original = original
+
+    def remove(self) -> None:
+        setattr(self.owner, self.name, self.original)
+
+
+def _target_model(model):
+    return model.model.language_model
+
+
+def _installed_mono(model):
+    try:
+        built = inspect.getclosurevars(model.forward).nonlocals["built"]
+    except (KeyError, TypeError) as error:
+        raise RuntimeError("Unable to inspect installed Target Mono runner.") from error
+    if not hasattr(built, "runner") or built.runner is None:
+        raise RuntimeError("Installed Target Mono forward has no runner.")
+    return built
+
+
+def _install_baseline_state_observers(model, states: dict[int, dict[str, Any]]):
+    handles = []
+    for layer_id, layer in enumerate(_target_model(model).layers):
+        original = layer.forward
+
+        def observe(*args, layer_id=layer_id, original=original, **kwargs):
+            output = original(*args, **kwargs)
+            states[layer_id] = {
+                "hidden": output[0].detach().clone(),
+                "residual": output[1].detach().clone(),
+            }
+            return output
+
+        layer.forward = observe
+        handles.append(_Restore(layer, "forward", original))
+    return handles
+
+
+def _install_mono_state_observer(model, states: dict[int, dict[str, Any]]):
+    built = _installed_mono(model)
+    runner = built.runner
+    original = runner.launch
+
+    def observe(*args, **kwargs):
+        layer_id = int(kwargs["i"])
+        output = original(*args, **kwargs)
+        states[layer_id] = {
+            "hidden": output[0].detach().clone(),
+            "residual": output[1].detach().clone(),
+            "routing_ids": runner.ids[: kwargs["rows"]].detach().clone(),
+        }
+        return output
+
+    runner.launch = observe
+    return [_Restore(runner, "launch", original)]
+
+
+def _snapshot_kv(runner, out_cache_loc) -> dict[int, dict[str, Any]]:
+    import torch
+
+    snapshots = {}
+    for layer_id in range(TARGET_LAYERS):
+        key = runner.token_to_kv_pool.get_key_buffer(layer_id)
+        value = runner.token_to_kv_pool.get_value_buffer(layer_id)
+        ids = out_cache_loc.to(device=key.device, dtype=torch.int64)
+        snapshots[layer_id] = {
+            "key": _cpu_snapshot(key[ids]),
+            "value": _cpu_snapshot(value[ids]),
+        }
+    return snapshots
 
 
 class _CaptureWriter:
@@ -497,14 +588,29 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
     result: dict[str, Any] = {"rank": rank, "status": "error"}
     try:
         os.environ.update(BASELINE_ENVIRONMENT)
+        os.environ["SGLANG_MUSE_REPLAY_TARGET_LAYERS"] = str(TARGET_LAYERS)
         os.environ["SGLANG_ENABLE_AMD_MONOKERNEL"] = (
             "1" if args.mode == "mono" else "0"
         )
         os.environ["SGLANG_AMD_MONO_MUSE_KERNELS"] = "1"
-        os.environ["SGLANG_AMD_MONO_CHECK"] = "0"
+        os.environ["SGLANG_AMD_MONO_CHECK"] = "1" if args.check else "0"
+        if args.attn_dump_dir is not None:
+            os.environ["SGLANG_AMD_MONO_ATTN_DUMP"] = args.attn_dump_dir
+        if args.check:
+            logging.basicConfig(level=logging.INFO)
+            logging.getLogger("sgl_amd_mono.muse_spark.spec").setLevel(logging.INFO)
         os.environ["SGLANG_MUSE_REPLAY_MARKERS"] = (
             "1" if args.trace_dir is not None else "0"
         )
+        if args.mode == "mono":
+            import sgl_amd_mono
+            from sglang.srt.kernel_plugins.amd import binding as mono_binding
+
+            sgl_amd_mono.register_specs()
+            # This tool replays one captured Target Verify scope independently;
+            # enabling the full DFLASH server would incorrectly require taps
+            # outside synthetic Target layers 0-9.
+            mono_binding._server_step = lambda: ("target_verify", WIDTH)
         import torch
         import torch.distributed as dist
         from sglang.srt.distributed.parallel_state import (
@@ -541,7 +647,17 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
         )
         mono_attached = hasattr(runner.model, "_monokernel_unread_metadata")
         if args.mode == "mono" and not mono_attached:
-            raise RuntimeError("Target Mono mode requested but plugin did not attach.")
+            from sglang.srt.kernel_plugins.amd.binding import _selection
+
+            forward = getattr(runner.model.forward, "__func__", runner.model.forward)
+            raise RuntimeError(
+                "Target Mono mode requested but plugin did not attach: "
+                f"selection={_selection()!r}, "
+                f"model={type(runner.model).__module__}.{type(runner.model).__name__}, "
+                f"forward={getattr(forward, '__module__', None)}."
+                f"{getattr(forward, '__qualname__', type(forward).__name__)}, "
+                f"attrs={sorted(runner.model.__dict__)}"
+            )
         forward_batch, out_cache_loc, positions = _prepare_verify_batch(
             runner, descriptor
         )
@@ -553,12 +669,26 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
             )
             for layer, counts in enumerate(descriptor.captured_routing)
         }
+        route_scores = None
+        if args.routing_snapshot_dir is not None:
+            routing_snapshot = torch.load(
+                Path(args.routing_snapshot_dir)
+                / f"rank_{rank:04d}.snapshot.pt",
+                map_location="cpu",
+                weights_only=False,
+            )
+            route_scores = {
+                layer: routing_snapshot["routing_scores"][layer]
+                .to(device=runner.device, dtype=torch.float32)
+                .contiguous()
+                for layer in range(TARGET_LAYERS)
+            }
 
         def run_once():
             with replay_scope("target/verify"):
                 return runner.forward(forward_batch)
 
-        with routing_override(route_ids):
+        with routing_override(route_ids, route_scores):
             for _ in range(args.warmup):
                 run_once()
             torch.cuda.synchronize()
@@ -578,6 +708,57 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
                 torch.cuda.synchronize()
                 elapsed.append(time.perf_counter() - start)
                 checksums.append(_output_checksum(output))
+
+            snapshot_path = None
+            if args.snapshot_dir is not None:
+                layer_states: dict[int, dict[str, Any]] = {}
+                handles = (
+                    _install_mono_state_observer(runner.model, layer_states)
+                    if args.mode == "mono"
+                    else _install_baseline_state_observers(
+                        runner.model, layer_states
+                    )
+                )
+                output = run_once()
+                torch.cuda.synchronize()
+                for handle in handles:
+                    handle.remove()
+                if set(layer_states) != set(range(TARGET_LAYERS)):
+                    raise RuntimeError(
+                        f"Target {args.mode} layer snapshots are incomplete: "
+                        f"{sorted(layer_states)}"
+                    )
+                snapshot = {
+                    "rank": rank,
+                    "mode": args.mode,
+                    "output": _cpu_snapshot(_output_hidden(output)),
+                    "layers": {
+                        layer: {
+                            name: _cpu_snapshot(value)
+                            for name, value in layer_states[layer].items()
+                        }
+                        for layer in range(TARGET_LAYERS)
+                    },
+                    "routing_ids": {
+                        layer: _cpu_snapshot(route_ids[layer])
+                        for layer in range(TARGET_LAYERS)
+                    },
+                    "routing_scores": {
+                        layer: torch.tensor(
+                            writer.values["target_layers"][
+                                f"layer_{layer}.routing"
+                            ]["topk_scores"],
+                            dtype=torch.float32,
+                        )
+                        for layer in range(TARGET_LAYERS)
+                    },
+                    "kv_cache": _snapshot_kv(runner, out_cache_loc),
+                }
+                snapshot_path = (
+                    Path(args.snapshot_dir) / f"rank_{rank:04d}.snapshot.pt"
+                )
+                snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(snapshot, snapshot_path)
         if profiler is not None:
             profiler.stop()
             trace = Path(args.trace_dir) / f"target.rank_{rank:04d}.trace.json.gz"
@@ -607,6 +788,7 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
             "iterations": args.iterations,
             "latency_seconds": elapsed,
             "output_checksums": checksums,
+            "snapshot": str(snapshot_path) if snapshot_path is not None else None,
             "state": _kv_state_summary(
                 runner, range(TARGET_LAYERS), out_cache_loc
             ),
@@ -626,6 +808,7 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
 
 def execute(args) -> tuple[int, dict[str, Any]]:
     os.environ.update(BASELINE_ENVIRONMENT)
+    os.environ["SGLANG_MUSE_REPLAY_TARGET_LAYERS"] = str(TARGET_LAYERS)
     os.environ["SGLANG_ENABLE_AMD_MONOKERNEL"] = (
         "1" if args.mode == "mono" else "0"
     )
@@ -704,9 +887,13 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--trace-dir")
+    parser.add_argument("--snapshot-dir")
+    parser.add_argument("--routing-snapshot-dir")
     parser.add_argument("--output")
     parser.add_argument("--mem-fraction-static", type=float, default=0.88)
     parser.add_argument("--mode", choices=("baseline", "mono"), default="baseline")
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--attn-dump-dir")
     parser.add_argument(
         "--allow-routing-mismatch",
         action="store_true",
@@ -722,6 +909,10 @@ def main(argv: list[str] | None = None) -> int:
     args = create_parser().parse_args(argv)
     if args.warmup < 0 or args.iterations <= 0:
         raise SystemExit("--warmup must be non-negative and --iterations positive")
+    if args.mode == "mono" and args.routing_snapshot_dir is None:
+        raise SystemExit(
+            "Target Mono replay requires --routing-snapshot-dir from baseline."
+        )
     try:
         code, result = execute(args)
     except (ReplayInputError, FileNotFoundError, ValueError) as error:

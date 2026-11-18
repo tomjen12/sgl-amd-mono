@@ -20,10 +20,12 @@ from sgl_amd_mono.muse_spark.gfx1250.build_layer import (
 )
 from sgl_amd_mono.muse_spark.gfx1250.config import (
     DRAFT_TOKENS,
+    EXPERTS,
     HEAD_DIM,
     HIDDEN,
     KV_K,
     LAYER_SLOTS,
+    LOCAL_EXPERTS,
     LOCAL_KV_HEADS,
     MAX_TOKENS,
     MOE_HIDDEN,
@@ -155,6 +157,39 @@ class MuseMonoRunner:
             lo - (1 << 32) if lo >= 1 << 31 else lo
         )
         self.epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
+
+    def attention_debug(self, rows: int):
+        """Views of the most recent fused-attention intermediates.
+
+        The regions are dedicated to attention and remain valid after the
+        remainder of the fused layer launch.  This is diagnostics-only: callers
+        must consume or clone the views before launching another layer.
+        """
+        from sgl_amd_mono.muse_spark.gfx1250.build_layer import _private_layout
+        from sgl_amd_mono.muse_spark.gfx1250.layout import (
+            FUSED_ROWS,
+            FUSED_SPLITS,
+            fused_tiles,
+        )
+
+        layout = _private_layout()
+        tiles = fused_tiles(rows)
+
+        def floats(name):
+            offset, size = layout[name]
+            return self.scratch_layer[offset : offset + size].view(torch.float32)
+
+        return {
+            "stats": floats("attn_stats")[
+                : tiles * FUSED_SPLITS * FUSED_ROWS * 2
+            ].view(tiles, FUSED_SPLITS, FUSED_ROWS, 2),
+            "global": floats("attn_global")[
+                : tiles * FUSED_ROWS * 2
+            ].view(tiles, FUSED_ROWS, 2),
+            "part": floats("attn_part")[
+                : tiles * FUSED_SPLITS * FUSED_ROWS * HEAD_DIM
+            ].view(tiles, FUSED_SPLITS, FUSED_ROWS, HEAD_DIM),
+        }
 
     def k1_kernel(self, rows: int):
         if rows not in self._k1:
@@ -471,6 +506,47 @@ class MuseMonoRunner:
         table, table_stride, prefix, window, scale_bits = self._attention_args(
             i, rows, q_len, forward_batch
         )
+        from sglang.srt.rocm_muse_spark.replay_capture import (
+            get_routing_override,
+            get_routing_score_override,
+            record_route_workload,
+        )
+
+        override_ids = get_routing_override(i)
+        override_scores = get_routing_score_override(i)
+        if (override_ids is None) != (override_scores is None):
+            raise ValueError(
+                f"gfx1250 replay layer {i} must override routing ids and scores together."
+            )
+        if override_ids is not None:
+            expected = (rows, TOP_K)
+            if (
+                tuple(override_ids.shape) != expected
+                or override_ids.dtype != torch.int32
+                or override_ids.device != self.ids.device
+                or not override_ids.is_contiguous()
+            ):
+                raise ValueError(
+                    f"gfx1250 replay routing override layer {i} must be a "
+                    f"contiguous {expected} int32 tensor on {self.ids.device}, got "
+                    f"{tuple(override_ids.shape)} {override_ids.dtype} "
+                    f"{override_ids.device} contiguous={override_ids.is_contiguous()}."
+                )
+        if override_scores is not None:
+            expected = (rows, TOP_K)
+            if (
+                tuple(override_scores.shape) != expected
+                or override_scores.dtype != torch.float32
+                or override_scores.device != self.scores.device
+                or not override_scores.is_contiguous()
+            ):
+                raise ValueError(
+                    f"gfx1250 replay routing score override layer {i} must be a "
+                    f"contiguous {expected} float32 tensor on {self.scores.device}, got "
+                    f"{tuple(override_scores.shape)} {override_scores.dtype} "
+                    f"{override_scores.device} "
+                    f"contiguous={override_scores.is_contiguous()}."
+                )
         last = i == len(self.modules) - 1
         self.layer_kernel(rows, q_len, next_k1, last, view.shuffled)(
             _ptr(self.q),
@@ -495,6 +571,8 @@ class MuseMonoRunner:
             _ptr(view.xn_w),
             _ptr(self.ids),
             _ptr(self.scores),
+            _ptr(override_ids) if override_ids is not None else 0,
+            _ptr(override_scores) if override_scores is not None else 0,
             _ptr(self.xin),
             int(self.modules[i].mlp.local_expert_start),
             _ptr(view.w13),
@@ -529,6 +607,14 @@ class MuseMonoRunner:
             i,
             int(last),
             stream=current,
+        )
+        record_route_workload(
+            layer=i,
+            topk_ids=self.ids[:rows],
+            topk_scores=self.scores[:rows],
+            num_experts=EXPERTS,
+            local_start=int(self.modules[i].mlp.local_expert_start),
+            local_experts=LOCAL_EXPERTS,
         )
         if next_k1:
             self._k1_done = i + 1

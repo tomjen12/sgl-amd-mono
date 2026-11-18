@@ -178,13 +178,21 @@ def _same(got, want) -> bool:
     return got == want
 
 
+def _expected_num_hidden_layers() -> int:
+    """Allow the explicit config-only Target 0-9 replay, never normal serving."""
+    if os.environ.get("SGLANG_MUSE_REPLAY_TARGET_LAYERS") == "10":
+        return 10
+    return HF_CONFIG["num_hidden_layers"]
+
+
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     """What ``SPEC.requires`` cannot state: the nested text config, the layer
     kinds, the draft block, architecture-specific attention backend, FlyDSL."""
     t = _text(hf_config)
+    expected = {**HF_CONFIG, "num_hidden_layers": _expected_num_hidden_layers()}
     reasons = [
         f"config {k}={getattr(t, k, None)!r}, the kernels are built for {v!r}"
-        for k, v in HF_CONFIG.items()
+        for k, v in expected.items()
         if not _same(getattr(t, k, None), v)
     ]
     kinds = set(getattr(t, "mlp_layer_types", None) or ())
@@ -243,9 +251,10 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
             f"attention TP {p.attn_tp_size} / MoE TP {p.moe_tp_size} / EP {p.moe_ep_size}: "
             f"the kernels shard attention over TP {config.TP} and experts over EP {config.EP}"
         )
-    if len(lm.layers) != HF_CONFIG["num_hidden_layers"]:
+    expected_layers = _expected_num_hidden_layers()
+    if len(lm.layers) != expected_layers:
         reasons.append(
-            f"{len(lm.layers)} layers, built for {HF_CONFIG['num_hidden_layers']}"
+            f"{len(lm.layers)} layers, built for {expected_layers}"
         )
     for i, layer in enumerate(lm.layers):
         reasons += layer_reasons(layer, i, config=config)
@@ -329,11 +338,17 @@ class _Built:
         if (
             r.windows[i] != 0
             or getattr(self, "_attn_checks", 0) >= 6 * 16
-            or int(forward_batch.seq_lens.max()) < 50000
+            or (
+                int(forward_batch.seq_lens.max()) < 50000
+                and os.environ.get("SGLANG_MUSE_REPLAY_TARGET_LAYERS") != "10"
+            )
         ):
             return
         self._attn_checks = getattr(self, "_attn_checks", 0) + 1
-        from sgl_amd_mono.muse_spark.gfx950.config import HEAD_DIM, LOCAL_KV_HEADS, Q_K
+        config, _ = _target()
+        HEAD_DIM = config.HEAD_DIM
+        LOCAL_KV_HEADS = config.LOCAL_KV_HEADS
+        Q_K = config.Q_K
 
         attn = self.model.layers[i].self_attn.attn
         k, v = r.pool.get_kv_buffer(attn.layer_id)
@@ -399,7 +414,13 @@ class _Built:
         except Exception as e:  # noqa: BLE001 - a diagnostic
             nat = f"native attention not run: {e!r}"[:200]
         dump_dir = os.environ.get("SGLANG_AMD_MONO_ATTN_DUMP", "")
-        if dump_dir and cos.min().item() < 0.9 and getattr(self, "_attn_dumps", 0) < 4:
+        if i == 1 and dump_dir:
+            logger.info("monokernel attention dump directory: %s", dump_dir)
+        if (
+            dump_dir
+            and i == 1
+            and getattr(self, "_attn_dumps", 0) < 4
+        ):
             # the failing case's inputs, for an offline reproduction: the request's K / V rows
             # in key order, its pages, q, our output and the exact one
             self._attn_dumps = getattr(self, "_attn_dumps", 0) + 1
@@ -414,10 +435,87 @@ class _Built:
                  "lens": lens.cpu(), "extra": extra, "scale": scale, "o": r.o[:rows].cpu(), "ref": ref.cpu(), "rows": rows, "q_len": q_len},
                 os.path.join(dump_dir, f"attn_r{r.rank}_l{i}_{self._attn_dumps}.pt"),
             )  # fmt: skip
+        if i == 1 and not torch.count_nonzero(q_i):
+            self._attn_intermediate_check(
+                rows=rows,
+                q_len=q_len,
+                forward_batch=forward_batch,
+                v_cache=v,
+                table=table,
+            )
         logger.info(
             "monokernel attn check layer %d: %d rows, lens %s, table %s; ours vs exact head cosine min %.5f mean %.5f; low (row, head) %s; %s",
             i, rows, lens.tolist()[:4], tuple(table.shape), cos.min().item(), cos.mean().item(), low[:24], nat,
         )  # fmt: skip
+
+    def _attn_intermediate_check(
+        self, *, rows, q_len, forward_batch, v_cache, table
+    ):
+        """Locate the first bad stage for layer 1's zero-Q uniform attention."""
+        from sgl_amd_mono.muse_spark.gfx1250.config import HEAD_DIM
+        from sgl_amd_mono.muse_spark.gfx1250.layout import (
+            FUSED_BLOCK_STRIDE,
+            FUSED_KEY_BLOCK,
+            FUSED_SPLITS,
+            WAVES,
+        )
+
+        debug = self.runner.attention_debug(rows)
+        prefix = int(forward_batch.seq_lens[0])
+        end = prefix + 1  # tile 0 / row 0 maps to request 0 / token 0
+        pages = table[0, : (prefix + q_len + 15) // 16].long()
+        slots = (
+            pages[:, None] * 16
+            + torch.arange(16, device=pages.device)[None, :]
+        ).reshape(-1)
+        values = v_cache[slots[: prefix + q_len], 0].float()
+        probability = torch.tensor(
+            1.0 / end, device=values.device, dtype=torch.float32
+        ).to(torch.bfloat16).float()
+
+        expected_counts, expected_parts = [], []
+        for split in range(FUSED_SPLITS):
+            pieces = []
+            block = split * WAVES
+            while block * FUSED_KEY_BLOCK < end:
+                for wave in range(WAVES):
+                    first = (block + wave) * FUSED_KEY_BLOCK
+                    last = min(first + FUSED_KEY_BLOCK, end)
+                    if first < last:
+                        pieces.append(torch.arange(first, last, device=values.device))
+                block += FUSED_BLOCK_STRIDE
+            keys = torch.cat(pieces)
+            expected_counts.append(keys.numel())
+            expected_parts.append(values[keys].sum(0) * probability)
+        expected_parts = torch.stack(expected_parts)
+
+        stats = debug["stats"][0, :, 0]
+        glob = debug["global"][0, 0]
+        parts = debug["part"][0, :, 0, :HEAD_DIM]
+        part_cos = torch.nn.functional.cosine_similarity(
+            parts, expected_parts, dim=-1
+        )
+        part_max = (parts - expected_parts).abs().amax(dim=-1)
+        merged = parts.sum(0)
+        exact = expected_parts.sum(0)
+        logger.info(
+            "monokernel attn intermediate layer 1 rank %d row0: "
+            "split max=%s sum=%s expected_counts=%s; "
+            "global=(%.6g, %.6g) expected=(0, %d); "
+            "part cosine=%s maxdiff=%s; merged cosine=%.6f norms=(%.6g, %.6g)",
+            self.runner.rank,
+            [round(x, 6) for x in stats[:, 0].tolist()],
+            [round(x, 3) for x in stats[:, 1].tolist()],
+            expected_counts,
+            float(glob[0]),
+            float(glob[1]),
+            end,
+            [round(x, 6) for x in part_cos.tolist()],
+            [round(x, 6) for x in part_max.tolist()],
+            float(torch.nn.functional.cosine_similarity(merged, exact, dim=0)),
+            float(merged.norm()),
+            float(exact.norm()),
+        )
 
     def _kv_rows(self, i, forward_batch, rows):
         """Check mode: layer ``i``'s K / V cache rows of this step's slots (through the
@@ -525,9 +623,13 @@ def _build(model, hf_config, ctx) -> _Built:
     runner.set_deadline(ctx.deadline_s)
     spec_config = get_spec()
     q_len = (
-        int(spec_config.speculative_num_draft_tokens or 1)
-        if spec_config.speculative_algorithm is not None
-        else 1
+        DRAFT_TOKENS
+        if _expected_num_hidden_layers() == 10
+        else (
+            int(spec_config.speculative_num_draft_tokens or 1)
+            if spec_config.speculative_algorithm is not None
+            else 1
+        )
     )
     # every rank builds every width; FlyDSL's disk cache hands a rank the kernels
     # another rank built (a lock per kernel), so each rank starts at its own share

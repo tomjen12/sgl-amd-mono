@@ -15,11 +15,12 @@ propagation.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import msgspec
+from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import gpu, range_constexpr
-from flydsl.expr.typing import Int32, Int64
+from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common.epoch import kernel_symbol
-from sgl_amd_mono.common.ops import peer_bases
+from sgl_amd_mono.common.ops import peer_bases, rsrc
 from sgl_amd_mono.common.plan import kernel_sources, key_tuple, pair_layout
 from sgl_amd_mono.common.sync import Mailbox, preg, sreg
 from sgl_amd_mono.muse_spark.gfx1250.build_k2 import k2_scratch_layout
@@ -277,6 +278,8 @@ def build_layer(key: LayerBuild):
         xn_w: Int64,
         ids: Int64,
         scores: Int64,
+        override_ids: Int64,
+        override_scores: Int64,
         xin: Int64,
         local_start: Int32,
         w13: Int64,
@@ -528,6 +531,31 @@ def build_layer(key: LayerBuild):
                     "picked": lds.picked.ptr,
                 }
             )
+            if override_ids != 0 and tid == 0:
+                for pick in range_constexpr(TOP_K):
+                    replacement = fx.Int32(
+                        bo.buffer_load(
+                            rsrc(override_ids),
+                            bid * TOP_K + pick,
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    )
+                    bo.buffer_store(
+                        replacement, rsrc(ids), bid * TOP_K + pick
+                    )
+                    if override_scores != 0:
+                        score = fx.Float32(
+                            bo.buffer_load(
+                                rsrc(override_scores),
+                                bid * TOP_K + pick,
+                                vec_width=1,
+                                dtype=T.f32,
+                            )
+                        )
+                        bo.buffer_store(
+                            score, rsrc(scores), bid * TOP_K + pick
+                        )
             _publish(mb.put, flags["top_done"], bid, tid)
 
             _wait(
@@ -691,6 +719,8 @@ def build_layer(key: LayerBuild):
         xn_w: Int64,
         ids: Int64,
         scores: Int64,
+        override_ids: Int64,
+        override_scores: Int64,
         xin: Int64,
         local_start: Int32,
         w13: Int64,
@@ -750,6 +780,8 @@ def build_layer(key: LayerBuild):
             xn_w,
             ids,
             scores,
+            override_ids,
+            override_scores,
             xin,
             local_start,
             w13,

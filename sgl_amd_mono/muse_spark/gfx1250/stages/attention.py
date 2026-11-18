@@ -316,6 +316,10 @@ def fused_part_index(tile, split, row, dim):
 def _fused_publish(put, region, index, owner):
     wait_stores()
     gpu.barrier()
+    # Split statistics are separate stores from the ready mailbox word.
+    # Release them from every producer thread before the owner publishes the
+    # tag, so the merge CTA cannot read stale max/sum/PV data.
+    fx.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Release)
     if owner:
         put(region, index, fx.Int32(1))
 
@@ -337,6 +341,8 @@ def _fused_poll_splits(mb, region, tile):
         ],
         batch=4,
     )
+    # Pair with _fused_publish before loading the split statistics.
+    fx.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
 
 
 def fused_attn_lds():
@@ -520,6 +526,8 @@ def run_fused_attn(c):
             )
         _fused_publish(mb.put, c["gflag"], tile, tid == 0)
     mb.poll([(c["gflag"], tile, 1)], batch=1)
+    # The global denominator is stored separately from the ready flag.
+    fx.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
 
     # Probabilities are rounded only after the six-way denominator merge.
     pv_acc = [

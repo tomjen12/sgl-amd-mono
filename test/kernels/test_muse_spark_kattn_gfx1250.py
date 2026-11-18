@@ -15,7 +15,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 PAGES = 2048
-MAX_BLOCKS = 512
+MAX_BLOCKS = 1024
 
 
 def _reference(q, k_cache, v_cache, table, keys, q_len, window, scale):
@@ -58,8 +58,13 @@ def _reference(q, k_cache, v_cache, table, keys, q_len, window, scale):
 
 
 @pytest.mark.parametrize("width", [8, 16, 32, 64])
-@pytest.mark.parametrize("keys,window", [(300, 0), (3000, 2047)])
-def test_gfx1250_kattn_matches_paged_attention(width, keys, window):
+@pytest.mark.parametrize(
+    "keys,window,zero_q",
+    [(300, 0, False), (3000, 2047, False), (8200, 0, True)],
+)
+def test_gfx1250_kattn_matches_paged_attention(width, keys, window, zero_q):
+    if zero_q and width != 8:
+        pytest.skip("the 8K uniform-attention regression targets width 8")
     from sgl_amd_mono.muse_spark.gfx1250.config import (
         HEAD_DIM,
         LOCAL_KV_HEADS,
@@ -72,6 +77,8 @@ def test_gfx1250_kattn_matches_paged_attention(width, keys, window):
     torch.manual_seed(keys + window)
     device = torch.device("cuda")
     q = (torch.randn(width, Q_K, device=device) * 5.47).to(torch.bfloat16)
+    if zero_q:
+        q.zero_()
     k_cache = (
         torch.randn(PAGES * 16, LOCAL_KV_HEADS, HEAD_DIM, device=device) * 2
     ).to(torch.float8_e4m3fn)

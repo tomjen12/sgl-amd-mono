@@ -213,6 +213,26 @@ def test_the_recipe_is_accepted():
     assert _config_reasons(hf_config=_replace(OMNI, text_config=rounded)) == []
 
 
+def test_target_replay_explicitly_accepts_config_only_layers_0_to_9(monkeypatch):
+    replay_text = _replace(
+        TEXT,
+        num_hidden_layers=10,
+        layer_types=TEXT.layer_types[:10],
+        mlp_layer_types=TEXT.mlp_layer_types[:10],
+    )
+    assert any(
+        "num_hidden_layers" in reason
+        for reason in _config_reasons(
+            hf_config=_replace(OMNI, text_config=replay_text)
+        )
+    )
+
+    monkeypatch.setenv("SGLANG_MUSE_REPLAY_TARGET_LAYERS", "10")
+    assert (
+        _config_reasons(hf_config=_replace(OMNI, text_config=replay_text)) == []
+    )
+
+
 def test_attention_backend_is_narrowed_only_on_gfx950():
     assert muse.SPEC.requires.attention_backends == {"aiter", "triton"}
     with mock.patch.object(muse, "_device_arch", return_value="gfx1250"):
