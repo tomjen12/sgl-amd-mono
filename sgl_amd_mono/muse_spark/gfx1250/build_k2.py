@@ -5,13 +5,13 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import msgspec
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import range_constexpr
+from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common.epoch import kernel_symbol
 from sgl_amd_mono.common.ops import peer_bases, rsrc
 from sgl_amd_mono.common.plan import kernel_sources, key_tuple, pair_layout
-from sgl_amd_mono.common.sync import Mailbox, preg
+from sgl_amd_mono.common.sync import Mailbox, preg, sreg
 from sgl_amd_mono.muse_spark.gfx1250.config import (
     EXPERTS,
     HEAD_DIM,
@@ -29,6 +29,11 @@ from sgl_amd_mono.muse_spark.gfx1250.stages import post_attn
 SOURCES = kernel_sources(__name__)
 _STREAM = fx.Stream(None)
 THREADS = 256
+WAVES = THREADS // 32
+_ALIGN = 256
+O_GROUPS = HIDDEN // (post_attn.ROWS * post_attn.WAVES)
+ROUTER_GROUPS = EXPERTS // (post_attn.ROWS * post_attn.WAVES)
+POOL_GROUPS = MOE_HIDDEN // (post_attn.ROWS * post_attn.WAVES)
 
 
 def _raw_layout(items):
@@ -52,8 +57,27 @@ def k2_scratch_layout():
     )
 
 
+def _persistent_layout():
+    """K2 data plus tagged device-scope hand-off flags."""
+    out = k2_scratch_layout()
+    offset = max(off + size for off, size in out.values())
+    out.update(
+        pair_layout(
+            [
+                ("k2_norm_done", MAX_TOKENS * (Q_K // HEAD_DIM)),
+                ("k2_boundary_done", MAX_TOKENS),
+                ("k2_router_done", ROUTER_GROUPS),
+                ("k2_pool_done", POOL_GROUPS),
+            ],
+            align=_ALIGN,
+            start=(offset + _ALIGN - 1) // _ALIGN * _ALIGN,
+        )
+    )
+    return out
+
+
 def scratch_bytes(layout=None):
-    layout = k2_scratch_layout() if layout is None else layout
+    layout = _persistent_layout() if layout is None else layout
     return max(offset + size for offset, size in layout.values())
 
 
@@ -75,6 +99,29 @@ class K2Build(msgspec.Struct, frozen=True):
     fault_after: int = 0
 
 
+@flyc.jit
+def _publish(put, flag, index, tid):
+    gpu.barrier()
+    fx.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Release)
+    if tid == 0:
+        put(flag, index, fx.Int32(1))
+
+
+@flyc.jit
+def _publish_wave(put, flag, index, lane):
+    """Publish one wave-owned result without a CTA-wide barrier."""
+    fx.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Release)
+    if lane == 0:
+        put(flag, index, fx.Int32(1))
+
+
+@flyc.jit
+def _wait(poll, specs):
+    values = poll(specs, batch=4)
+    fx.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
+    return values
+
+
 def build_k2(key: K2Build):
     """Build K2 for a supported Target width."""
     if key.tokens not in WIDTHS:
@@ -91,6 +138,7 @@ def build_k2(key: K2Build):
     )
     keyed = key_tuple(key, SOURCES)
     layout = k2_scratch_layout()
+    persistent_layout = _persistent_layout()
     sy = k2_sym_layout(W)
 
     def ptr(base, region):
@@ -137,6 +185,7 @@ def build_k2(key: K2Build):
                 fault_after=key.fault_after,
             ),
         )
+        sync = {"put": mb.put, "put_bf": mb.put_bf, "poll": mb.poll}
         bases = peer_bases(peers, W)
         post_attn.stage_o_projection(
             {
@@ -318,6 +367,240 @@ def build_k2(key: K2Build):
             }
         )
 
+    @fx.struct
+    class PersistentLds:
+        red: fx.Array[fx.Float32, post_attn.RED_FLOATS, 16]
+        picked: fx.Array[fx.Float32, TOP_K, 16]
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def persistent(
+        o: Int64,
+        g: Int64,
+        res: Int64,
+        w_o: Int64,
+        alpha: Int64,
+        beta: Int64,
+        pre_w: Int64,
+        w_hi: Int64,
+        w_lo: Int64,
+        bias: Int64,
+        w_pool: Int64,
+        xn_w: Int64,
+        ids: Int64,
+        scores: Int64,
+        override_ids: Int64,
+        override_scores: Int64,
+        xin: Int64,
+        scratch: Int64,
+        sym: Int64,
+        peers: Int64,
+        rank: Int32,
+        epoch: Int64,
+        layer: Int32,
+    ):
+        lds = fx.SharedAllocator().allocate(PersistentLds).peek()
+        tid, bid = fx.thread_idx.x, fx.block_idx.x
+        lane, wave = tid % 32, tid // 32
+        mb = Mailbox(
+            step_tag(epoch, layer),
+            mailbox_guard(
+                epoch,
+                own=sym,
+                peers=peers,
+                rank=rank,
+                npes=W,
+                flags_offset=sym_bytes(W),
+                fault_site=key.fault_site or None,
+                fault_after=key.fault_after,
+            ),
+        )
+        sync = {"put": mb.put, "put_bf": mb.put_bf, "poll": mb.poll}
+        bases = peer_bases(peers, W)
+        norm_done = sreg(
+            scratch,
+            persistent_layout["k2_norm_done"][0],
+            "k2_norm_done",
+        )
+        boundary_done = sreg(
+            scratch,
+            persistent_layout["k2_boundary_done"][0],
+            "k2_boundary_done",
+        )
+        router_done = sreg(
+            scratch,
+            persistent_layout["k2_router_done"][0],
+            "k2_router_done",
+        )
+        pool_done = sreg(
+            scratch,
+            persistent_layout["k2_pool_done"][0],
+            "k2_pool_done",
+        )
+
+        norm_task = bid * WAVES + wave
+        if norm_task < key.tokens * (Q_K // HEAD_DIM):
+            post_attn.stage_norm_gate(
+                {
+                    "bid": norm_task,
+                    "lane": lane,
+                    "o": o,
+                    "g": g,
+                    "og": ptr(scratch, "k2_og"),
+                }
+            )
+            _publish_wave(sync["put"], norm_done, norm_task, lane)
+
+        if bid < O_GROUPS:
+            _wait(
+                sync["poll"],
+                [
+                    (norm_done, task, 1)
+                    for task in range(key.tokens * (Q_K // HEAD_DIM))
+                ],
+            )
+            post_attn.stage_o_projection(
+                {
+                    "W": W,
+                    "S": key.tokens,
+                    "bid": bid,
+                    "tid": tid,
+                    "lane": lane,
+                    "wave": wave,
+                    "red": lds.red.ptr,
+                    "rank": rank,
+                    "og": ptr(scratch, "k2_og"),
+                    "w_o": w_o,
+                    "put_bf": sync["put_bf"],
+                    "peer_attn": [
+                        preg(base, sy["k2_attn"][0], "k2_attn")
+                        for base in bases
+                    ],
+                }
+            )
+
+        if bid < key.tokens:
+            post_attn.stage_boundary(
+                {
+                    "W": W,
+                    "bid": bid,
+                    "S": key.tokens,
+                    "tid": tid,
+                    "lane": lane,
+                    "wave": wave,
+                    "red": lds.red.ptr,
+                    "res": res,
+                    "alpha": alpha,
+                    "beta": beta,
+                    "pre_w": pre_w,
+                    "x": ptr(scratch, "k2_x"),
+                    "poll": sync["poll"],
+                    "own_attn": preg(sym, sy["k2_attn"][0], "k2_attn"),
+                }
+            )
+            _publish(sync["put"], boundary_done, bid, tid)
+
+        if bid < ROUTER_GROUPS:
+            _wait(
+                sync["poll"],
+                [(boundary_done, token, 1) for token in range(key.tokens)],
+            )
+            post_attn.stage_router_pool(
+                {
+                    "bid": bid,
+                    "S": key.tokens,
+                    "tid": tid,
+                    "lane": lane,
+                    "wave": wave,
+                    "rows": EXPERTS,
+                    "router": True,
+                    "x": ptr(scratch, "k2_x"),
+                    "w0": w_hi,
+                    "w1": w_lo,
+                    "out": ptr(scratch, "k2_logits"),
+                    "red": lds.red.ptr,
+                }
+            )
+            _publish(sync["put"], router_done, bid, tid)
+
+        if bid < POOL_GROUPS:
+            _wait(
+                sync["poll"],
+                [(boundary_done, token, 1) for token in range(key.tokens)],
+            )
+            post_attn.stage_router_pool(
+                {
+                    "bid": bid,
+                    "S": key.tokens,
+                    "tid": tid,
+                    "lane": lane,
+                    "wave": wave,
+                    "rows": MOE_HIDDEN,
+                    "router": False,
+                    "x": ptr(scratch, "k2_x"),
+                    "w0": w_pool,
+                    "w1": fx.Int64(0),
+                    "out": ptr(scratch, "k2_pool"),
+                    "red": lds.red.ptr,
+                }
+            )
+            _publish(sync["put"], pool_done, bid, tid)
+
+        if bid < key.tokens:
+            _wait(
+                sync["poll"],
+                [(router_done, task, 1) for task in range(ROUTER_GROUPS)],
+            )
+            post_attn.stage_top8(
+                {
+                    "bid": bid,
+                    "tid": tid,
+                    "bias": bias,
+                    "ids": ids,
+                    "scores": scores,
+                    "logits": ptr(scratch, "k2_logits"),
+                    "picked": lds.picked.ptr,
+                }
+            )
+            if override_ids != 0 and tid == 0:
+                for pick in range_constexpr(TOP_K):
+                    offset = bid * TOP_K + pick
+                    replacement = fx.Int32(
+                        bo.buffer_load(
+                            rsrc(override_ids),
+                            offset,
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    )
+                    bo.buffer_store(replacement, rsrc(ids), offset)
+                    if override_scores != 0:
+                        score = fx.Float32(
+                            bo.buffer_load(
+                                rsrc(override_scores),
+                                offset,
+                                vec_width=1,
+                                dtype=T.f32,
+                            )
+                        )
+                        bo.buffer_store(score, rsrc(scores), offset)
+
+            _wait(
+                sync["poll"],
+                [(pool_done, task, 1) for task in range(POOL_GROUPS)],
+            )
+            post_attn.stage_pooled_norm(
+                {
+                    "bid": bid,
+                    "tid": tid,
+                    "lane": lane,
+                    "wave": wave,
+                    "red": lds.red.ptr,
+                    "pool": ptr(scratch, "k2_pool"),
+                    "xn_w": xn_w,
+                    "xin": xin,
+                }
+            )
+
     @flyc.jit
     def launch(
         o: Int64,
@@ -346,36 +629,34 @@ def build_k2(key: K2Build):
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
-        norm_gate(o, g, scratch).launch(
-            grid=(key.tokens * (Q_K // HEAD_DIM),),
-            block=(32,),
-            stream=stream,
-        )
-        oproj(w_o, scratch, sym, peers, rank, epoch, layer).launch(
-            grid=(HIDDEN // (post_attn.ROWS * post_attn.WAVES),),
-            block=(THREADS,),
-            stream=stream,
-        )
-        boundary(
-            res, alpha, beta, pre_w, scratch, sym, peers, rank, epoch, layer
-        ).launch(grid=(key.tokens,), block=(THREADS,), stream=stream)
-        router(w_hi, w_lo, scratch).launch(
-            grid=(EXPERTS // (post_attn.ROWS * post_attn.WAVES),),
-            block=(THREADS,),
-            stream=stream,
-        )
-        pool(w_pool, scratch).launch(
-            grid=(MOE_HIDDEN // (post_attn.ROWS * post_attn.WAVES),),
-            block=(THREADS,),
-            stream=stream,
-        )
-        top8(
-            bias, ids, scores, override_ids, override_scores, scratch
+        persistent(
+            o,
+            g,
+            res,
+            w_o,
+            alpha,
+            beta,
+            pre_w,
+            w_hi,
+            w_lo,
+            bias,
+            w_pool,
+            xn_w,
+            ids,
+            scores,
+            override_ids,
+            override_scores,
+            xin,
+            scratch,
+            sym,
+            peers,
+            rank,
+            epoch,
+            layer,
         ).launch(
-            grid=(key.tokens,), block=(THREADS,), stream=stream
-        )
-        pooled_norm(xn_w, xin, scratch).launch(
-            grid=(key.tokens,), block=(THREADS,), stream=stream
+            grid=(RESIDENT_BLOCKS,),
+            block=(THREADS,),
+            stream=stream,
         )
 
     return launch

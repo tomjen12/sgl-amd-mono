@@ -130,22 +130,25 @@ def _decode_weight_fragment(r_w, r_s, row, k0, lane, shuffled):
     kh = (lane // 16) * 8
     vals = []
     for half in range_constexpr(2):
+        k_base = k0 + half * 16 + kh
+        byte_base = k_base // 2
+        weight_offset = (
+            _shuffled_weight_offset(row, byte_base)
+            if shuffled
+            else row * W13_ROW_BYTES + byte_base
+        )
+        packed = fx.Int32(
+            bo.buffer_load(r_w, weight_offset // 4, vec_width=1, dtype=T.i32)
+        )
+        scale_offset = (
+            _shuffled_scale_offset(row, k_base // 32)
+            if shuffled
+            else row * W13_SCALE_COLS + k_base // 32
+        )
+        scale = _load_u8(r_s, scale_offset)
         for i in range_constexpr(8):
-            k = k0 + half * 16 + kh + i
-            k_byte = k // 2
-            weight_offset = (
-                _shuffled_weight_offset(row, k_byte)
-                if shuffled
-                else row * W13_ROW_BYTES + k_byte
-            )
-            scale_offset = (
-                _shuffled_scale_offset(row, k // 32)
-                if shuffled
-                else row * W13_SCALE_COLS + k // 32
-            )
-            byte = _load_u8(r_w, weight_offset)
-            code = (k & 1).select(byte >> 4, byte & 0xF)
-            scale = _load_u8(r_s, scale_offset)
+            byte = (packed >> (8 * (i // 2))) & 0xFF
+            code = byte >> 4 if i & 1 else byte & 0xF
             vals.append(_decode_e2m1(code) * _e8m0_f32(scale))
     return fx.Vector.from_elements(vals, fx.Float32).to(fx.BFloat16)
 
