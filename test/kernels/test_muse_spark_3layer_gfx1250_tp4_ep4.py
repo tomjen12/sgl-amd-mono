@@ -704,7 +704,7 @@ def _worker(rank, port, queue, rows):
                 weights["w_hi"].data_ptr(), weights["w_lo"].data_ptr(),
                 weights["bias"].data_ptr(), weights["w_pool"].data_ptr(),
                 weights["xn_w"].data_ptr(), outputs["ids"].data_ptr(),
-                outputs["scores"].data_ptr(), outputs["xin"].data_ptr(),
+                outputs["scores"].data_ptr(), 0, 0, outputs["xin"].data_ptr(),
                 k2_scratch.data_ptr(), split_k2_peers.local,
                 split_k2_peers.addresses.data_ptr(), rank, split_epoch.data_ptr(),
                 layer["index"], stream=stream,
@@ -1083,15 +1083,46 @@ def test_gfx1250_tp4_ep4_three_checkpoint_layers_match_all_paths(rows):
     reason="needs a gfx1250 GPU",
 )
 def test_gfx1250_tp4_three_layer_synthetic_widths_compile():
-    """Compile first K1, merged middle, and final layer at every Target width."""
+    """Compile split and fused Target chains at every supported width."""
+    from sgl_amd_mono.muse_spark.gfx1250.build_k2 import K2Build, build_k2
+    from sgl_amd_mono.muse_spark.gfx1250.build_k3 import K3Build, build_k3
     from sgl_amd_mono.muse_spark.gfx1250.build_layer import LayerBuild, build_layer
     from sgl_amd_mono.muse_spark.gfx1250.config import DRAFT_TOKENS, WIDTHS
-    from sgl_amd_mono.muse_spark.gfx1250.layer import K1Build, build_k1
+    from sgl_amd_mono.muse_spark.gfx1250.layer import (
+        K1Build,
+        KAttnBuild,
+        build_k1,
+        build_kattn,
+    )
     from sgl_amd_mono.muse_spark.gfx1250.runner import compile_only
 
     assert WIDTHS == (8, 16, 32, 64)
     for width in WIDTHS:
         compile_only(build_k1(K1Build(tokens=width)))
+        compile_only(
+            build_kattn(KAttnBuild(tokens=width, q_len=DRAFT_TOKENS))
+        )
+        compile_only(build_k2(K2Build(tokens=width, npes=NP)))
+        compile_only(
+            build_k3(
+                K3Build(
+                    tokens=width,
+                    npes=NP,
+                    last=False,
+                    shuffled=True,
+                )
+            )
+        )
+        compile_only(
+            build_k3(
+                K3Build(
+                    tokens=width,
+                    npes=NP,
+                    last=True,
+                    shuffled=True,
+                )
+            )
+        )
         compile_only(
             build_layer(
                 LayerBuild(

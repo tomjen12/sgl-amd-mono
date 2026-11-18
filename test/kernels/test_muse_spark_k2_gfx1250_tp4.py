@@ -108,7 +108,7 @@ def _worker(rank, port, queue):
                 w["alpha"].data_ptr(), w["beta"].data_ptr(), w["pre_w"].data_ptr(),
                 w["w_hi"].data_ptr(), w["w_lo"].data_ptr(), w["bias"].data_ptr(),
                 w["w_pool"].data_ptr(), w["xn_w"].data_ptr(), ids.data_ptr(),
-                scores.data_ptr(), xin.data_ptr(), scratch.data_ptr(), peers.local,
+                scores.data_ptr(), 0, 0, xin.data_ptr(), scratch.data_ptr(), peers.local,
                 peers.addresses.data_ptr(), rank, epoch.data_ptr(), LAYER,
                 stream=torch.cuda.current_stream(),
             )  # fmt: skip

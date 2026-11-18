@@ -260,7 +260,7 @@ def _worker(rank, port, queue):
                     weights["w_lo"].data_ptr(), weights["bias"].data_ptr(),
                     weights["w_pool"].data_ptr(), weights["xn_w"].data_ptr(),
                     split["ids"].data_ptr(), split["scores"].data_ptr(),
-                    split["xin"].data_ptr(), split_scratch2.data_ptr(),
+                    0, 0, split["xin"].data_ptr(), split_scratch2.data_ptr(),
                     split_peers2.local, split_peers2.addresses.data_ptr(), rank,
                     split_epoch.data_ptr(), LAYER, stream=stream,
                 )  # fmt: skip

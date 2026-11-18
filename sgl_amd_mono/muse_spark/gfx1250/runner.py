@@ -12,8 +12,14 @@ import torch
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.peer import PeerBuffer
+from sgl_amd_mono.muse_spark.gfx1250.build_k2 import (
+    scratch_bytes as k2_scratch_bytes,
+)
 from sgl_amd_mono.muse_spark.gfx1250.build_k2 import sym_bytes as k2_sym_bytes
-from sgl_amd_mono.muse_spark.gfx1250.build_k3 import k3_sym_bytes
+from sgl_amd_mono.muse_spark.gfx1250.build_k3 import (
+    k3_scratch_bytes,
+    k3_sym_bytes,
+)
 from sgl_amd_mono.muse_spark.gfx1250.build_layer import (
     layer_scratch_bytes,
     layer_sym_bytes,
@@ -42,6 +48,9 @@ from sgl_amd_mono.muse_spark.gfx1250.layout import (
 
 FP8_CACHE = torch.float8_e4m3fn
 USE_KERNELS = os.environ.get("SGLANG_AMD_MONO_MUSE_KERNELS", "1") == "1"
+# The fused layer remains the default. Replay can select the exact standalone
+# K1 -> K-attn -> K2 -> K3 chain used by the TP4 kernel tests.
+USE_LAYER = os.environ.get("SGLANG_AMD_MONO_MUSE_LAYER", "1") == "1"
 
 # SGLang classes imported lazily by cache validation and page-table binding.
 SGLANG_READS = {
@@ -104,6 +113,7 @@ class MuseMonoRunner:
         self.boundaries = list(boundaries)
         self.rank, self.npes, self.device = rank, npes, torch.device(device)
         self.use_kernels = USE_KERNELS
+        self.use_layer = USE_LAYER
         self.fault_site, self.fault_after = guard.fault_injection(rank) or (0, 0)
         self.deadline_s = None
         self.backend = self.pool = None
@@ -111,7 +121,7 @@ class MuseMonoRunner:
         self.slot_row = self.full_page_table = None
         self.swa_page_starts = self.swa_page_table = None
         self._k1_done = -1
-        self._k1, self._layer = {}, {}
+        self._k1, self._kattn, self._k2, self._k3, self._layer = {}, {}, {}, {}, {}
 
         dev, bf16 = self.device, torch.bfloat16
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=dev)
@@ -121,13 +131,39 @@ class MuseMonoRunner:
         self.scratch_layer = torch.zeros(
             layer_scratch_bytes(), dtype=torch.uint8, device=dev
         )
-        symmetric = max(
-            k2_sym_bytes(npes), k3_sym_bytes(npes), layer_sym_bytes(npes)
+        self.scratch_k2 = torch.zeros(
+            k2_scratch_bytes(), dtype=torch.uint8, device=dev
         )
-        self.peers = PeerBuffer(
-            symmetric + guard.FLAG_BYTES, cpu_group, rank, npes, dev
+        self.scratch_k3 = torch.zeros(
+            k3_scratch_bytes(), dtype=torch.uint8, device=dev
         )
-        self.peers.bytes.zero_()
+        self.peers = self.peers_k2 = self.peers_k3 = None
+        if self.use_layer:
+            self.peers = PeerBuffer(
+                layer_sym_bytes(npes) + guard.FLAG_BYTES,
+                cpu_group,
+                rank,
+                npes,
+                dev,
+            )
+            self.peers.bytes.zero_()
+        else:
+            self.peers_k2 = PeerBuffer(
+                k2_sym_bytes(npes) + guard.FLAG_BYTES,
+                cpu_group,
+                rank,
+                npes,
+                dev,
+            )
+            self.peers_k3 = PeerBuffer(
+                k3_sym_bytes(npes) + guard.FLAG_BYTES,
+                cpu_group,
+                rank,
+                npes,
+                dev,
+            )
+            self.peers_k2.bytes.zero_()
+            self.peers_k3.bytes.zero_()
         self.q = torch.empty(MAX_TOKENS, Q_K, dtype=bf16, device=dev)
         self.k = torch.empty(MAX_TOKENS, KV_K, dtype=bf16, device=dev)
         self.v = torch.empty(MAX_TOKENS, KV_K, dtype=bf16, device=dev)
@@ -230,11 +266,92 @@ class MuseMonoRunner:
             )
         return self._layer[key]
 
+    def kattn_kernel(self, rows: int, q_len: int):
+        key = rows, q_len
+        if key not in self._kattn:
+            from sgl_amd_mono.muse_spark.gfx1250.layer import (
+                KAttnBuild,
+                build_kattn,
+            )
+
+            no_capture("K-attn first reached")
+            self._kattn[key] = build_kattn(
+                KAttnBuild(tokens=rows, q_len=q_len)
+            )
+        return self._kattn[key]
+
+    def k2_kernel(self, rows: int):
+        if rows not in self._k2:
+            from sgl_amd_mono.muse_spark.gfx1250.build_k2 import K2Build, build_k2
+
+            no_capture("K2 first reached")
+            self._k2[rows] = build_k2(
+                K2Build(
+                    tokens=rows,
+                    npes=self.npes,
+                    fault_site=self.fault_site,
+                    fault_after=self.fault_after,
+                )
+            )
+        return self._k2[rows]
+
+    def k3_kernel(self, rows: int, last: bool, shuffled: bool):
+        key = rows, last, shuffled
+        if key not in self._k3:
+            from sgl_amd_mono.muse_spark.gfx1250.build_k3 import K3Build, build_k3
+
+            no_capture("K3 first reached")
+            self._k3[key] = build_k3(
+                K3Build(
+                    tokens=rows,
+                    npes=self.npes,
+                    last=last,
+                    shuffled=shuffled,
+                    fault_site=self.fault_site,
+                    fault_after=self.fault_after,
+                )
+            )
+        return self._k3[key]
+
     def _next_k1(self, index: int) -> bool:
         return (
             index + 1 < len(self.views)
             and self.views[index + 1].kind == "mxfp4"
         )
+
+    def _validate_routing_overrides(
+        self, i: int, rows: int, override_ids, override_scores
+    ) -> None:
+        if (override_ids is None) != (override_scores is None):
+            raise ValueError(
+                f"gfx1250 replay layer {i} must override routing ids and scores together."
+            )
+        expected = (rows, TOP_K)
+        if override_ids is not None and (
+            tuple(override_ids.shape) != expected
+            or override_ids.dtype != torch.int32
+            or override_ids.device != self.ids.device
+            or not override_ids.is_contiguous()
+        ):
+            raise ValueError(
+                f"gfx1250 replay routing override layer {i} must be a "
+                f"contiguous {expected} int32 tensor on {self.ids.device}, got "
+                f"{tuple(override_ids.shape)} {override_ids.dtype} "
+                f"{override_ids.device} contiguous={override_ids.is_contiguous()}."
+            )
+        if override_scores is not None and (
+            tuple(override_scores.shape) != expected
+            or override_scores.dtype != torch.float32
+            or override_scores.device != self.scores.device
+            or not override_scores.is_contiguous()
+        ):
+            raise ValueError(
+                f"gfx1250 replay routing score override layer {i} must be a "
+                f"contiguous {expected} float32 tensor on {self.scores.device}, got "
+                f"{tuple(override_scores.shape)} {override_scores.dtype} "
+                f"{override_scores.device} "
+                f"contiguous={override_scores.is_contiguous()}."
+            )
 
     def precompile(self, rows: int, q_len: int = DRAFT_TOKENS) -> None:
         if not self.use_kernels:
@@ -245,15 +362,28 @@ class MuseMonoRunner:
                 f"got {(rows, q_len)}"
             )
         compile_only(self.k1_kernel(rows))
-        variants = {
-            (self._next_k1(i), i == len(self.views) - 1, view.shuffled)
+        eligible = [
+            (i, view)
             for i, view in enumerate(self.views)
             if view.kind == "mxfp4"
-        }
-        for next_k1, last, shuffled in variants:
-            compile_only(
-                self.layer_kernel(rows, q_len, next_k1, last, shuffled)
-            )
+        ]
+        if self.use_layer:
+            variants = {
+                (self._next_k1(i), i == len(self.views) - 1, view.shuffled)
+                for i, view in eligible
+            }
+            for next_k1, last, shuffled in variants:
+                compile_only(
+                    self.layer_kernel(rows, q_len, next_k1, last, shuffled)
+                )
+        else:
+            compile_only(self.kattn_kernel(rows, q_len))
+            compile_only(self.k2_kernel(rows))
+            for last, shuffled in {
+                (i == len(self.views) - 1, view.shuffled)
+                for i, view in eligible
+            }:
+                compile_only(self.k3_kernel(rows, last, shuffled))
 
     def cache_reasons(self, backend, pool) -> list[str]:
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
@@ -514,40 +644,90 @@ class MuseMonoRunner:
 
         override_ids = get_routing_override(i)
         override_scores = get_routing_score_override(i)
-        if (override_ids is None) != (override_scores is None):
-            raise ValueError(
-                f"gfx1250 replay layer {i} must override routing ids and scores together."
-            )
-        if override_ids is not None:
-            expected = (rows, TOP_K)
-            if (
-                tuple(override_ids.shape) != expected
-                or override_ids.dtype != torch.int32
-                or override_ids.device != self.ids.device
-                or not override_ids.is_contiguous()
-            ):
-                raise ValueError(
-                    f"gfx1250 replay routing override layer {i} must be a "
-                    f"contiguous {expected} int32 tensor on {self.ids.device}, got "
-                    f"{tuple(override_ids.shape)} {override_ids.dtype} "
-                    f"{override_ids.device} contiguous={override_ids.is_contiguous()}."
-                )
-        if override_scores is not None:
-            expected = (rows, TOP_K)
-            if (
-                tuple(override_scores.shape) != expected
-                or override_scores.dtype != torch.float32
-                or override_scores.device != self.scores.device
-                or not override_scores.is_contiguous()
-            ):
-                raise ValueError(
-                    f"gfx1250 replay routing score override layer {i} must be a "
-                    f"contiguous {expected} float32 tensor on {self.scores.device}, got "
-                    f"{tuple(override_scores.shape)} {override_scores.dtype} "
-                    f"{override_scores.device} "
-                    f"contiguous={override_scores.is_contiguous()}."
-                )
+        self._validate_routing_overrides(
+            i, rows, override_ids, override_scores
+        )
         last = i == len(self.modules) - 1
+        override_ids_ptr = _ptr(override_ids) if override_ids is not None else 0
+        override_scores_ptr = (
+            _ptr(override_scores) if override_scores is not None else 0
+        )
+        if not self.use_layer:
+            peers_k2, peers_k3 = self.peers_k2, self.peers_k3
+            self.kattn_kernel(rows, q_len)(
+                _ptr(self.q),
+                _ptr(self.o),
+                k_cache,
+                v_cache,
+                table,
+                table_stride,
+                prefix,
+                window,
+                scale_bits,
+                stream=current,
+            )
+            self.k2_kernel(rows)(
+                _ptr(self.o),
+                _ptr(self.g),
+                _ptr(stream),
+                _ptr(view.w_o),
+                _ptr(view.alpha),
+                _ptr(view.beta),
+                _ptr(view.pre_w),
+                _ptr(view.gate_hi),
+                _ptr(view.gate_lo),
+                _ptr(view.bias),
+                _ptr(view.w_pool),
+                _ptr(view.xn_w),
+                _ptr(self.ids),
+                _ptr(self.scores),
+                override_ids_ptr,
+                override_scores_ptr,
+                _ptr(self.xin),
+                _ptr(self.scratch_k2),
+                peers_k2.local,
+                _ptr(peers_k2.addresses),
+                self.rank,
+                _ptr(self.epoch),
+                i,
+                stream=current,
+            )
+            self.k3_kernel(rows, last, view.shuffled)(
+                _ptr(self.xin),
+                _ptr(self.ids),
+                _ptr(self.scores),
+                int(self.modules[i].mlp.local_expert_start),
+                _ptr(view.w13),
+                _ptr(view.s13),
+                _ptr(view.w2),
+                _ptr(view.s2),
+                _ptr(view.pen_w),
+                _ptr(stream),
+                _ptr(view.pfw),
+                _ptr(view.alpha2),
+                _ptr(view.beta2),
+                _ptr(view.npw),
+                _ptr(view.w_unpool),
+                _ptr(self.attn_in),
+                _ptr(self.scratch_k3),
+                peers_k3.local,
+                _ptr(peers_k3.addresses),
+                self.rank,
+                _ptr(self.epoch),
+                i,
+                int(last),
+                stream=current,
+            )
+            record_route_workload(
+                layer=i,
+                topk_ids=self.ids[:rows],
+                topk_scores=self.scores[:rows],
+                num_experts=EXPERTS,
+                local_start=int(self.modules[i].mlp.local_expert_start),
+                local_experts=LOCAL_EXPERTS,
+            )
+            return stream, self.attn_in[:rows]
+
         self.layer_kernel(rows, q_len, next_k1, last, view.shuffled)(
             _ptr(self.q),
             _ptr(self.o),
@@ -571,8 +751,8 @@ class MuseMonoRunner:
             _ptr(view.xn_w),
             _ptr(self.ids),
             _ptr(self.scores),
-            _ptr(override_ids) if override_ids is not None else 0,
-            _ptr(override_scores) if override_scores is not None else 0,
+            override_ids_ptr,
+            override_scores_ptr,
             _ptr(self.xin),
             int(self.modules[i].mlp.local_expert_start),
             _ptr(view.w13),

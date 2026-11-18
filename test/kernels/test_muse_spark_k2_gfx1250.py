@@ -157,7 +157,7 @@ def test_gfx1250_k2_matches_explicit_reference_for_two_epochs():
                 w["alpha"].data_ptr(), w["beta"].data_ptr(), w["pre_w"].data_ptr(),
                 w["w_hi"].data_ptr(), w["w_lo"].data_ptr(), w["bias"].data_ptr(),
                 w["w_pool"].data_ptr(), w["xn_w"].data_ptr(), ids.data_ptr(),
-                scores.data_ptr(), xin.data_ptr(), scratch.data_ptr(), peers.local,
+                scores.data_ptr(), 0, 0, xin.data_ptr(), scratch.data_ptr(), peers.local,
                 peers.addresses.data_ptr(), 0, epoch.data_ptr(), LAYER,
                 stream=torch.cuda.current_stream(),
             )  # fmt: skip
@@ -168,5 +168,23 @@ def test_gfx1250_k2_matches_explicit_reference_for_two_epochs():
         assert torch.equal(ids, reference[1])
         _assert_close(scores, reference[2], 1 / 64, 1e-4, "scores")
         _assert_close(xin, reference[3], 1 / 32, 2e-2, "expert input")
+
+        override_ids = torch.flip(reference[1], dims=(1,)).contiguous()
+        override_scores = torch.flip(reference[2], dims=(1,)).contiguous()
+        got.copy_(stream)
+        launch(
+            o.data_ptr(), g.data_ptr(), got.data_ptr(), w["w_o"].data_ptr(),
+            w["alpha"].data_ptr(), w["beta"].data_ptr(), w["pre_w"].data_ptr(),
+            w["w_hi"].data_ptr(), w["w_lo"].data_ptr(), w["bias"].data_ptr(),
+            w["w_pool"].data_ptr(), w["xn_w"].data_ptr(), ids.data_ptr(),
+            scores.data_ptr(), override_ids.data_ptr(), override_scores.data_ptr(),
+            xin.data_ptr(), scratch.data_ptr(), peers.local,
+            peers.addresses.data_ptr(), 0, epoch.data_ptr(), LAYER,
+            stream=torch.cuda.current_stream(),
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        assert torch.equal(ids, override_ids)
+        assert torch.equal(scores, override_scores)
+        _assert_close(xin, reference[3], 1 / 32, 2e-2, "overridden expert input")
     finally:
         peers.close()

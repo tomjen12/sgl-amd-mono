@@ -698,7 +698,7 @@ def _rank_worker(
     record_shapes: bool,
     mode: str,
     output_dir: str,
-    queue,
+    result_connection,
 ) -> None:
     try:
         os.environ.update(
@@ -922,9 +922,11 @@ def _rank_worker(
             dist.barrier()
         destroy_model_parallel()
         destroy_distributed_environment()
-        queue.put((rank, result, None))
+        result_connection.send((rank, result, None))
     except BaseException:
-        queue.put((rank, None, traceback.format_exc()))
+        result_connection.send((rank, None, traceback.format_exc()))
+    finally:
+        result_connection.close()
 
 
 def run_replay(
@@ -949,7 +951,7 @@ def run_replay(
     output_dir.mkdir(parents=True, exist_ok=True)
     trace_dir = str(output_dir / "traces") if trace else None
     context = multiprocessing.get_context("spawn")
-    queue = context.Queue()
+    connections = [context.Pipe(duplex=False) for _ in range(WORLD_SIZE)]
     port = _free_port()
     processes = [
         context.Process(
@@ -964,16 +966,29 @@ def run_replay(
                 record_shapes,
                 mode,
                 str(output_dir),
-                queue,
+                connections[rank][1],
             ),
         )
         for rank in range(WORLD_SIZE)
     ]
     for process in processes:
         process.start()
-    received = [queue.get(timeout=timeout) for _ in processes]
+    for _, send_connection in connections:
+        send_connection.close()
+    received = []
+    for rank, (receive_connection, _) in enumerate(connections):
+        if not receive_connection.poll(timeout):
+            raise TimeoutError(f"Timed out waiting for Draft replay rank {rank}.")
+        received.append(receive_connection.recv())
+        receive_connection.close()
     for process in processes:
         process.join(timeout=60)
+    # Under rocprof-compute the profiler follows the spawn resource tracker and
+    # waits for it during finalization. Stop it explicitly once all workers and
+    # IPC connections are closed so counter output can be flushed and analyzed.
+    from multiprocessing import resource_tracker
+
+    resource_tracker._resource_tracker._stop()
     errors = [f"rank {rank}:\n{error}" for rank, _, error in received if error]
     errors.extend(
         f"process {index} exited with code {process.exitcode}"

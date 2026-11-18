@@ -4,10 +4,12 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import msgspec
-from flydsl.expr.typing import Int32, Int64
+from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl.expr import range_constexpr
+from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common.epoch import kernel_symbol
-from sgl_amd_mono.common.ops import peer_bases
+from sgl_amd_mono.common.ops import peer_bases, rsrc
 from sgl_amd_mono.common.plan import kernel_sources, key_tuple, pair_layout
 from sgl_amd_mono.common.sync import Mailbox, preg
 from sgl_amd_mono.muse_spark.gfx1250.config import (
@@ -18,6 +20,7 @@ from sgl_amd_mono.muse_spark.gfx1250.config import (
     MOE_HIDDEN,
     Q_K,
     RESIDENT_BLOCKS,
+    TOP_K,
     WIDTHS,
 )
 from sgl_amd_mono.muse_spark.gfx1250.device import mailbox_guard, step_tag
@@ -258,13 +261,19 @@ def build_k2(key: K2Build):
 
     @flyc.kernel(name=f"{name}_top8", known_block_size=[THREADS, 1, 1])
     def top8(
-        bias: Int64, ids: Int64, scores: Int64, scratch: Int64
+        bias: Int64,
+        ids: Int64,
+        scores: Int64,
+        override_ids: Int64,
+        override_scores: Int64,
+        scratch: Int64,
     ):
         lds = fx.SharedAllocator().allocate(TopLds).peek()
+        tid = fx.thread_idx.x
         post_attn.stage_top8(
             {
                 "bid": fx.block_idx.x,
-                "tid": fx.thread_idx.x,
+                "tid": tid,
                 "bias": bias,
                 "ids": ids,
                 "scores": scores,
@@ -272,6 +281,25 @@ def build_k2(key: K2Build):
                 "picked": lds.picked.ptr,
             }
         )
+        if override_ids != 0 and tid == 0:
+            for pick in range_constexpr(TOP_K):
+                offset = fx.block_idx.x * TOP_K + pick
+                replacement = fx.Int32(
+                    bo.buffer_load(
+                        rsrc(override_ids), offset, vec_width=1, dtype=T.i32
+                    )
+                )
+                bo.buffer_store(replacement, rsrc(ids), offset)
+                if override_scores != 0:
+                    score = fx.Float32(
+                        bo.buffer_load(
+                            rsrc(override_scores),
+                            offset,
+                            vec_width=1,
+                            dtype=T.f32,
+                        )
+                    )
+                    bo.buffer_store(score, rsrc(scores), offset)
 
     @flyc.kernel(name=f"{name}_pooled_norm", known_block_size=[THREADS, 1, 1])
     def pooled_norm(xn_w: Int64, xin: Int64, scratch: Int64):
@@ -306,6 +334,8 @@ def build_k2(key: K2Build):
         xn_w: Int64,
         ids: Int64,
         scores: Int64,
+        override_ids: Int64,
+        override_scores: Int64,
         xin: Int64,
         scratch: Int64,
         sym: Int64,
@@ -339,7 +369,9 @@ def build_k2(key: K2Build):
             block=(THREADS,),
             stream=stream,
         )
-        top8(bias, ids, scores, scratch).launch(
+        top8(
+            bias, ids, scores, override_ids, override_scores, scratch
+        ).launch(
             grid=(key.tokens,), block=(THREADS,), stream=stream
         )
         pooled_norm(xn_w, xin, scratch).launch(

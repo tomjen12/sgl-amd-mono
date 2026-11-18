@@ -593,6 +593,9 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
             "1" if args.mode == "mono" else "0"
         )
         os.environ["SGLANG_AMD_MONO_MUSE_KERNELS"] = "1"
+        os.environ["SGLANG_AMD_MONO_MUSE_LAYER"] = (
+            "1" if args.target_kernel_mode == "layer" else "0"
+        )
         os.environ["SGLANG_AMD_MONO_CHECK"] = "1" if args.check else "0"
         if args.attn_dump_dir is not None:
             os.environ["SGLANG_AMD_MONO_ATTN_DUMP"] = args.attn_dump_dir
@@ -812,6 +815,9 @@ def execute(args) -> tuple[int, dict[str, Any]]:
     os.environ["SGLANG_ENABLE_AMD_MONOKERNEL"] = (
         "1" if args.mode == "mono" else "0"
     )
+    os.environ["SGLANG_AMD_MONO_MUSE_LAYER"] = (
+        "1" if args.target_kernel_mode == "layer" else "0"
+    )
     if args.mode == "mono":
         import sgl_amd_mono
 
@@ -865,6 +871,7 @@ def execute(args) -> tuple[int, dict[str, Any]]:
     summary = {
         "workload": "synthetic-target-layers-0-9-width8",
         "mode": args.mode,
+        "target_kernel_mode": args.target_kernel_mode,
         "tp_size": WORLD_SIZE,
         "ep_size": WORLD_SIZE,
         "processes": WORLD_SIZE,
@@ -892,6 +899,12 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output")
     parser.add_argument("--mem-fraction-static", type=float, default=0.88)
     parser.add_argument("--mode", choices=("baseline", "mono"), default="baseline")
+    parser.add_argument(
+        "--target-kernel-mode",
+        choices=("layer", "split"),
+        default="layer",
+        help="Run fused Target Layer kernels or standalone K1/K-attn/K2/K3.",
+    )
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--attn-dump-dir")
     parser.add_argument(
@@ -913,6 +926,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             "Target Mono replay requires --routing-snapshot-dir from baseline."
         )
+    if args.mode != "mono" and args.target_kernel_mode != "layer":
+        raise SystemExit("--target-kernel-mode split requires --mode mono.")
     try:
         code, result = execute(args)
     except (ReplayInputError, FileNotFoundError, ValueError) as error:

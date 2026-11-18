@@ -188,13 +188,23 @@ def test_cli_requires_explicit_routing_mismatch_opt_in():
     parser = create_parser()
     defaults = parser.parse_args(["bundle", "target"])
     opted_in = parser.parse_args(
-        ["bundle", "target", "--allow-routing-mismatch", "--warmup", "3"]
+        [
+            "bundle",
+            "target",
+            "--allow-routing-mismatch",
+            "--warmup",
+            "3",
+            "--target-kernel-mode",
+            "split",
+        ]
     )
 
     assert defaults.allow_routing_mismatch is False
     assert defaults.iterations == 5
+    assert defaults.target_kernel_mode == "layer"
     assert opted_in.allow_routing_mismatch is True
     assert opted_in.warmup == 3
+    assert opted_in.target_kernel_mode == "split"
 
 
 def test_output_writer_creates_parent_directories(tmp_path):
