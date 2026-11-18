@@ -72,7 +72,12 @@ def test_gfx1250_kattn_matches_paged_attention(width, keys, window, zero_q):
         Q_K,
         SOFTMAX_SCALE,
     )
-    from sgl_amd_mono.muse_spark.gfx1250.layer import KAttnBuild, build_kattn
+    from sgl_amd_mono.common import guard
+    from sgl_amd_mono.muse_spark.gfx1250.layer import (
+        KAttnBuild,
+        build_tiled_kattn,
+        tiled_kattn_scratch_bytes,
+    )
 
     torch.manual_seed(keys + window)
     device = torch.device("cuda")
@@ -100,7 +105,13 @@ def test_gfx1250_kattn_matches_paged_attention(width, keys, window, zero_q):
     out = torch.full_like(q, float("nan"))
     scale_bits = struct.unpack("i", struct.pack("f", SOFTMAX_SCALE))[0]
 
-    launch = build_kattn(KAttnBuild(tokens=width, q_len=DRAFT_TOKENS))
+    scratch = torch.zeros(
+        tiled_kattn_scratch_bytes(), dtype=torch.uint8, device=device
+    )
+    epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
+    launch = build_tiled_kattn(
+        KAttnBuild(tokens=width, q_len=DRAFT_TOKENS)
+    )
     launch(
         q.data_ptr(),
         out.data_ptr(),
@@ -111,6 +122,9 @@ def test_gfx1250_kattn_matches_paged_attention(width, keys, window, zero_q):
         prefix_lens.data_ptr(),
         window,
         scale_bits,
+        scratch.data_ptr(),
+        epoch.data_ptr(),
+        0,
         stream=torch.cuda.current_stream(),
     )
     torch.cuda.synchronize()

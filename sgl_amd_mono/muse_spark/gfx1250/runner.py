@@ -45,6 +45,7 @@ from sgl_amd_mono.muse_spark.gfx1250.layout import (
     k1_scratch_layout,
     scratch_bytes,
 )
+from sgl_amd_mono.muse_spark.gfx1250.layer import tiled_kattn_scratch_bytes
 
 FP8_CACHE = torch.float8_e4m3fn
 USE_KERNELS = os.environ.get("SGLANG_AMD_MONO_MUSE_KERNELS", "1") == "1"
@@ -136,6 +137,9 @@ class MuseMonoRunner:
         )
         self.scratch_k3 = torch.zeros(
             k3_scratch_bytes(), dtype=torch.uint8, device=dev
+        )
+        self.scratch_kattn = torch.zeros(
+            tiled_kattn_scratch_bytes(), dtype=torch.uint8, device=dev
         )
         self.peers = self.peers_k2 = self.peers_k3 = None
         if self.use_layer:
@@ -300,11 +304,11 @@ class MuseMonoRunner:
         if key not in self._kattn:
             from sgl_amd_mono.muse_spark.gfx1250.layer import (
                 KAttnBuild,
-                build_kattn,
+                build_tiled_kattn,
             )
 
             no_capture("K-attn first reached")
-            self._kattn[key] = build_kattn(
+            self._kattn[key] = build_tiled_kattn(
                 KAttnBuild(tokens=rows, q_len=q_len)
             )
         return self._kattn[key]
@@ -700,6 +704,9 @@ class MuseMonoRunner:
                 prefix,
                 window,
                 scale_bits,
+                _ptr(self.scratch_kattn),
+                _ptr(self.epoch),
+                i,
                 stream=current,
             )
             self.k2_kernel(rows)(
