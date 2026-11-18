@@ -1,5 +1,7 @@
 """Single-rank numerical test for the correctness-first gfx1250 K2."""
 
+import os
+
 import pytest
 import torch
 
@@ -147,9 +149,31 @@ def test_gfx1250_k2_matches_explicit_reference_for_two_epochs():
     peers = PeerBuffer(sym_bytes(1) + guard.FLAG_BYTES, None, 0, 1, device)
     peers.bytes.zero_()
     epoch = _epoch(device)
-    launch = build_k2(K2Build(tokens=MAX_TOKENS, npes=1))
+    launch = build_k2(
+        K2Build(
+            tokens=MAX_TOKENS,
+            npes=1,
+            staged_profile=os.environ.get("MUSE_K2_STAGED_PROFILE") == "1",
+            lds_og=os.environ.get("MUSE_K2_LDS_OG") == "1",
+            cooperative_rp=os.environ.get("MUSE_K2_COOPERATIVE_RP") == "1",
+            aggregate_boundary=os.environ.get("MUSE_K2_AGGREGATE_BOUNDARY") == "1",
+            single_boundary_wait=os.environ.get("MUSE_K2_SINGLE_BOUNDARY_WAIT") == "1",
+        )
+    )
     got = stream.clone()
+    profiler = None
     try:
+        trace_path = os.environ.get("MUSE_K2_TRACE")
+        if trace_path:
+            profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=False,
+                with_stack=False,
+            )
+            profiler.start()
         for _ in range(2):
             got.copy_(stream)
             launch(
@@ -163,6 +187,10 @@ def test_gfx1250_k2_matches_explicit_reference_for_two_epochs():
             )  # fmt: skip
             epoch[0] += 1
         torch.cuda.synchronize()
+        if profiler is not None:
+            profiler.stop()
+            profiler.export_chrome_trace(trace_path)
+            profiler = None
         assert (epoch[guard.ERR_DEADLINE : guard.ERR_FAULT + 1] == 0).all()
         _assert_close(got, reference[0], 1 / 64, 1e-2, "residual")
         assert torch.equal(ids, reference[1])
@@ -187,4 +215,6 @@ def test_gfx1250_k2_matches_explicit_reference_for_two_epochs():
         assert torch.equal(scores, override_scores)
         _assert_close(xin, reference[3], 1 / 32, 2e-2, "overridden expert input")
     finally:
+        if profiler is not None:
+            profiler.stop()
         peers.close()

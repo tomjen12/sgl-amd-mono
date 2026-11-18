@@ -172,6 +172,7 @@ class KAttnBuild(msgspec.Struct, frozen=True):
     tokens: int
     q_len: int = DRAFT_TOKENS
     resident_blocks: int = RESIDENT_BLOCKS
+    phase_trace: bool = False
 
 
 def build_kattn(key: KAttnBuild):
@@ -276,6 +277,10 @@ def _tiled_kattn_layout():
         ("attn_stats", attention.FUSED_STAT_FLOATS * 4),
         ("attn_global", attention.FUSED_GLOBAL_FLOATS * 4),
         ("attn_part", attention.FUSED_PART_FLOATS * 4),
+        (
+            "attn_phase_ticks",
+            attention.FUSED_TASKS * attention.FUSED_TRACE_WORDS * 8,
+        ),
     ):
         offset = (offset + 255) // 256 * 256
         out[name] = (offset, size)
@@ -316,6 +321,7 @@ def build_tiled_kattn(key: KAttnBuild):
         s=key.tokens,
         q=key.q_len,
         c=key.resident_blocks,
+        t=int(key.phase_trace),
     )
     keyed = key_tuple(key, SOURCES)
     layout = _tiled_kattn_layout()
@@ -383,6 +389,12 @@ def build_tiled_kattn(key: KAttnBuild):
                         "row_stats": lds.row_stats.ptr,
                         "probabilities": lds.probabilities.ptr,
                         "pv": lds.pv.ptr,
+                        "phase_trace": key.phase_trace,
+                        "phase_ticks": sreg(
+                            scratch,
+                            layout["attn_phase_ticks"][0],
+                            "attn_phase_ticks",
+                        ),
                         **regions,
                         "args": args,
                     }

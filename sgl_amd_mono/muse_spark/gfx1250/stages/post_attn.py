@@ -94,6 +94,22 @@ def _fragment(resource, base, k0, lane, cache_modifier=0):
     ).bitcast(fx.BFloat16)
 
 
+def _lds_fragment(pairs, base, k0, lane):
+    """One WMMA B fragment from an LDS row stored as packed bf16 pairs."""
+    V4F = fx.Vector.make_type(4, fx.Float32)
+    kh = (lane // 16) * 8
+    lo = fx.Vector(
+        fx.ptr_load(pairs + (base + k0 + kh) // 2, result_type=V4F)
+    ).bitcast(fx.BFloat16)
+    hi = fx.Vector(
+        fx.ptr_load(pairs + (base + k0 + 16 + kh) // 2, result_type=V4F)
+    ).bitcast(fx.BFloat16)
+    return fx.Vector.from_elements(
+        [lo[i] for i in range(8)] + [hi[i] for i in range(8)],
+        fx.BFloat16,
+    )
+
+
 def _wmma(a, b, acc):
     result = rocdl.wmma_f32_16x16x32_bf16(
         fx.Vector.make_type(WMMA_ACC, fx.Float32),
@@ -110,6 +126,13 @@ def _wave_value(red, wave, row, token):
     lane = ((row % ROWS) // 8) * 16 + token
     elem = row % 8
     return fx.ptr_load(red + (wave * 32 + lane) * WMMA_ACC + elem)
+
+
+def _tile_value(red, row, token):
+    value = fx.Float32(0.0)
+    for wave in range_constexpr(WAVES):
+        value = value + _wave_value(red, wave, row, token)
+    return value
 
 
 @flyc.jit
@@ -145,10 +168,34 @@ def stage_norm_gate(c):
 
 
 @flyc.jit
+def stage_norm_gate_lds(c):
+    """Recompute all norm-gate rows into this CTA's LDS for O projection."""
+    lane, wave = c["lane"], c["wave"]
+    heads = Q_K // HEAD_DIM
+    task = wave
+    while task < c["S"] * heads:
+        token, head = task // heads, task % heads
+        base = token * Q_K + head * HEAD_DIM + 2 * lane
+        o0, o1 = _bf(c["o"], base), _bf(c["o"], base + 1)
+        g0, g1 = _bf(c["g"], base), _bf(c["g"], base + 1)
+        ss = butterfly(o0 * o0 + o1 * o1, (16, 8, 4, 2, 1))
+        rstd = hw_rsq(ss / float(HEAD_DIM) + RMS_EPS)
+        fx.ptr_store(
+            bf16_pair(
+                o0 * rstd * _sigmoid(g0),
+                o1 * rstd * _sigmoid(g1),
+            ),
+            c["og"] + base // 2,
+        )
+        task = task + WAVES
+    gpu.barrier()
+
+
+@flyc.jit
 def stage_o_projection(c):
     """Eight full-K O tiles per CTA: one independent tile per wave."""
     lane, wave = c["lane"], c["wave"]
-    r_w, r_x = rsrc(c["w_o"]), rsrc(c["og"])
+    r_w = rsrc(c["w_o"])
     tile = c["bid"] * WAVES + wave
     row0 = tile * ROWS
     row = row0 + lane % ROWS
@@ -157,9 +204,14 @@ def stage_o_projection(c):
         acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
         for step in range_constexpr(Q_K // WMMA_K):
             k0 = step * WMMA_K
+            x = (
+                _lds_fragment(c["og"], token * Q_K, k0, lane)
+                if c["local_og"]
+                else _fragment(rsrc(c["og"]), token * Q_K, k0, lane)
+            )
             acc = _wmma(
                 _fragment(r_w, row * Q_K, k0, lane, cache_modifier=2),
-                _fragment(r_x, token * Q_K, k0, lane),
+                x,
                 acc,
             )
         fx.ptr_store(acc, c["red"] + (wave * 32 + lane) * WMMA_ACC)
@@ -305,39 +357,125 @@ def stage_router_pool(c):
 
 
 @flyc.jit
+def stage_router_pool_cooperative(c):
+    """One output-row tile per CTA, with K split over its eight waves."""
+    lane, wave = c["lane"], c["wave"]
+    r_x, r_w0 = rsrc(c["x"]), rsrc(c["w0"])
+    r_w1 = rsrc(c["w1"]) if c["router"] else r_w0
+    row0 = c["task"] * ROWS
+    row = row0 + lane % ROWS
+    k_per_wave = HIDDEN // WAVES
+    for token0 in range_constexpr((c["S"] + ROWS - 1) // ROWS):
+        local_token = lane % ROWS
+        token = fx.min(token0 * ROWS + local_token, c["S"] - 1)
+        vacc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+        for step in range_constexpr(k_per_wave // WMMA_K):
+            k0 = wave * k_per_wave + step * WMMA_K
+            x = _fragment(r_x, token * HIDDEN, k0, lane)
+            vacc = _wmma(
+                _fragment(r_w0, row * HIDDEN, k0, lane, cache_modifier=2),
+                x,
+                vacc,
+            )
+            if c["router"]:
+                vacc = _wmma(
+                    _fragment(r_w1, row * HIDDEN, k0, lane, cache_modifier=2),
+                    x,
+                    vacc,
+                )
+        fx.ptr_store(vacc, c["red"] + (wave * 32 + lane) * WMMA_ACC)
+        gpu.barrier()
+        batch = min(ROWS, c["S"] - token0 * ROWS)
+        if c["router"]:
+            for p in range_constexpr(8):
+                out = c["tid"] + p * THREADS
+                if out < batch * ROWS:
+                    out_token = token0 * ROWS + out // ROWS
+                    dim = out % ROWS
+                    bo.buffer_store(
+                        _tile_value(c["red"], dim, out // ROWS),
+                        rsrc(c["out"]),
+                        out_token * EXPERTS + row0 + dim,
+                    )
+        else:
+            for p in range_constexpr(4):
+                out = c["tid"] + p * THREADS
+                if out < batch * (ROWS // 2):
+                    local_out_token = out // (ROWS // 2)
+                    out_token = token0 * ROWS + local_out_token
+                    dim = 2 * (out % (ROWS // 2))
+                    _st_bf2(
+                        c["out"],
+                        (out_token * MOE_HIDDEN + row0 + dim) // 2,
+                        _tile_value(c["red"], dim, local_out_token),
+                        _tile_value(c["red"], dim + 1, local_out_token),
+                    )
+        gpu.barrier()
+
+
+@flyc.jit
 def stage_top8(c):
-    """Stable repeated argmax, preserving the lower-id tie rule."""
-    if c["tid"] == 0:
-        token = c["bid"]
-        selected = [fx.Int32(-1) for _ in range(TOP_K)]
+    """Stable parallel repeated argmax, preserving the lower-id tie rule."""
+    tid, token = c["tid"], c["bid"]
+    score = _sigmoid(
+        _f32(c["logits"], token * EXPERTS + tid)
+        * fx.Float32(ROUTER_MULT)
+    )
+    biased = score + _f32(c["bias"], tid)
+    selected_base = 2 * EXPERTS
+    for pick in range_constexpr(TOP_K):
+        used = fx.Int32(0)
+        for q in range_constexpr(pick):
+            used = used | fx.Int32(
+                tid == fx.Int32(fx.ptr_load(c["red"] + selected_base + q))
+            )
+        fx.ptr_store(
+            (used == 0).select(biased, fx.Float32(-1.0e30)),
+            c["red"] + tid,
+        )
+        fx.ptr_store(fx.Float32(tid), c["red"] + EXPERTS + tid)
+        gpu.barrier()
+        for stride in (128, 64, 32, 16, 8, 4, 2, 1):
+            if tid < stride:
+                left = fx.ptr_load(c["red"] + tid)
+                right = fx.ptr_load(c["red"] + tid + stride)
+                left_id = fx.ptr_load(c["red"] + EXPERTS + tid)
+                right_id = fx.ptr_load(c["red"] + EXPERTS + tid + stride)
+                take_right = (right > left) | (
+                    (right == left) & (right_id < left_id)
+                )
+                fx.ptr_store(
+                    take_right.select(right, left), c["red"] + tid
+                )
+                fx.ptr_store(
+                    take_right.select(right_id, left_id),
+                    c["red"] + EXPERTS + tid,
+                )
+            gpu.barrier()
+        if tid == 0:
+            best_id = fx.Int32(fx.ptr_load(c["red"] + EXPERTS))
+            fx.ptr_store(
+                fx.Float32(best_id), c["red"] + selected_base + pick
+            )
+            fx.ptr_store(
+                _sigmoid(
+                    _f32(c["logits"], token * EXPERTS + best_id)
+                    * fx.Float32(ROUTER_MULT)
+                ),
+                c["picked"] + pick,
+            )
+        gpu.barrier()
+
+    if tid == 0:
         denom = fx.Float32(0.0)
         for pick in range_constexpr(TOP_K):
-            best, best_id = fx.Float32(-1.0e30), fx.Int32(0)
-            expert = fx.Int32(0)
-            while expert < EXPERTS:
-                used = fx.Int32(0)
-                for q in range_constexpr(pick):
-                    used = used | fx.Int32(expert == selected[q])
-                score = _sigmoid(
-                    _f32(c["logits"], token * EXPERTS + expert)
-                    * fx.Float32(ROUTER_MULT)
-                )
-                biased = score + _f32(c["bias"], expert)
-                take = (used == 0) & (
-                    (biased > best) | ((biased == best) & (expert < best_id))
-                )
-                best, best_id = take.select(biased, best), take.select(expert, best_id)
-                expert = expert + 1
-            selected[pick] = best_id
-            score = _sigmoid(
-                _f32(c["logits"], token * EXPERTS + best_id)
-                * fx.Float32(ROUTER_MULT)
-            )
-            fx.ptr_store(score, c["picked"] + pick)
-            denom = denom + score
+            denom = denom + fx.ptr_load(c["picked"] + pick)
         for pick in range_constexpr(TOP_K):
+            best_id = fx.Int32(
+                fx.ptr_load(c["red"] + selected_base + pick)
+            )
             bo.buffer_store(
-                selected[pick], rsrc(c["ids"]), token * TOP_K + pick
+                best_id, rsrc(c["ids"]), token * TOP_K + pick
             )
             bo.buffer_store(
                 fx.ptr_load(c["picked"] + pick)

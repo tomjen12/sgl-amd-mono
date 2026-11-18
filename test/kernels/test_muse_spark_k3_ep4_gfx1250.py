@@ -1,5 +1,6 @@
 """Four-rank gfx1250 EP4 K3 test with exact per-rank BF16 partial rounding."""
 
+import json
 import os
 import sys
 
@@ -131,7 +132,8 @@ def _worker(rank, port, queue):
             (8, HIDDEN), float("nan"), dtype=bf16, device=device
         )
         got = base_stream.clone()
-        launch = build_k3(K3Build(npes=NP))
+        phase_trace = os.environ.get("MUSE_K3_PHASE_TRACE") == "1"
+        launch = build_k3(K3Build(npes=NP, phase_trace=phase_trace))
         for _ in range(2):
             got.copy_(base_stream)
             torch.cuda.synchronize()
@@ -164,6 +166,79 @@ def _worker(rank, port, queue):
             )
             epoch[0] += 1
         torch.cuda.synchronize()
+        bench_iters = int(os.environ.get("MUSE_K3_BENCH_ITERS", "0"))
+        samples = []
+        for _ in range(bench_iters):
+            got.copy_(base_stream)
+            torch.cuda.synchronize()
+            dist.barrier()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            launch(
+                xin.data_ptr(),
+                ids.data_ptr(),
+                scores.data_ptr(),
+                64 * rank,
+                w13.data_ptr(),
+                s13.data_ptr(),
+                w2.data_ptr(),
+                s2.data_ptr(),
+                weights["pen_w"].data_ptr(),
+                got.data_ptr(),
+                weights["pfw"].data_ptr(),
+                weights["alpha"].data_ptr(),
+                weights["beta"].data_ptr(),
+                weights["npw"].data_ptr(),
+                weights["w_unpool"].data_ptr(),
+                attn.data_ptr(),
+                scratch.data_ptr(),
+                peers.local,
+                peers.addresses.data_ptr(),
+                rank,
+                epoch.data_ptr(),
+                LAYER,
+                0,
+                stream=torch.cuda.current_stream(),
+            )
+            end.record()
+            end.synchronize()
+            epoch[0] += 1
+            samples.append(start.elapsed_time(end) * 1000.0)
+        if samples:
+            print(
+                "K3_EP4_BENCH_US="
+                + json.dumps(
+                    {
+                        "rank": rank,
+                        "mean": sum(samples) / len(samples),
+                        "min": min(samples),
+                        "max": max(samples),
+                        "samples": samples,
+                    }
+                ),
+                flush=True,
+            )
+        if phase_trace:
+            from sgl_amd_mono.muse_spark.gfx1250.build_k3 import _scratch_layout
+
+            offset, _ = _scratch_layout()["k3_phase_ticks"]
+            ticks = (
+                scratch[offset : offset + 8 * 7 * 8]
+                .view(torch.int64)
+                .view(8, 7)
+                .cpu()
+            )
+            print(
+                "K3_EP4_PHASE_TICKS="
+                + json.dumps(
+                    {
+                        "rank": rank,
+                        "deltas": (ticks[:, 1:] - ticks[:, :-1]).tolist(),
+                    }
+                ),
+                flush=True,
+            )
         stream_ok = torch.allclose(
             got, ref_stream, rtol=1 / 32, atol=2e-2
         )

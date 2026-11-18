@@ -37,6 +37,7 @@ RED_FLOATS = WAVES * WAVE_SIZE * WMMA_ACC
 H = HIDDEN
 I = LOCAL_INTERMEDIATE
 GU_ROWS = 2 * I
+COEF_TASKS = COEF_ROWS // ROWS
 GU_TASKS = I // ROWS
 DOWN_TASKS = H // ROWS
 GU_K_PER_WAVE = H // WAVES
@@ -50,7 +51,7 @@ EPS = RMS_EPS
 SOURCES = kernel_sources(__name__)
 _STREAM = fx.Stream(None)
 
-assert (GU_TASKS, DOWN_TASKS) == (448, 512)
+assert (COEF_TASKS, GU_TASKS, DOWN_TASKS) == (128, 448, 512)
 assert (GU_K_PER_WAVE, DOWN_K_PER_WAVE) == (1024, 896)
 assert (GU_STEPS, DOWN_STEPS) == (32, 28)
 
@@ -90,6 +91,7 @@ class DMLPBuild(msgspec.Struct, frozen=True):
     tokens: int = MAX_TOKENS
     npes: int = 4
     resident_blocks: int = RESIDENT_BLOCKS
+    wmma_coef: bool = True
     fault_site: int = 0
     fault_after: int = 0
 
@@ -237,7 +239,7 @@ def stage_norm(c):
 
 
 @flyc.jit
-def stage_coef(c):
+def stage_coef_scalar(c):
     """Kernel-projection fp32 rows. Each mailbox word is one coefficient."""
     total = c["S"] * COEF_ROWS
     task = c["bid"] * THREADS + c["tid"]
@@ -247,6 +249,51 @@ def stage_coef(c):
         value = _dot_h(c, c["args"]["w_kp"], token, row)
         c["put"](c["coef"], token * COEF_ROWS + row, value)
         task = task + stride
+
+
+@flyc.jit
+def stage_coef_wmma(c):
+    """Kernel projection with the same full-K wave32 WMMA path as Gate/Up."""
+    lane, wave = c["lane"], c["wave"]
+    r_w = rsrc(c["args"]["w_kp"])
+    tile_rows = min(ROWS, c["S"])
+    for token_tile in range_constexpr(c["TOKEN_TILES"]):
+        tile_start = token_tile * ROWS
+        _stage_lds_input(c, c["h"], H, tile_start, tile_rows)
+        token_local = fx.min(lane % ROWS, tile_rows - 1)
+        task = c["bid"]
+        while task < COEF_TASKS:
+            row0 = task * ROWS
+            row = row0 + lane % ROWS
+            coef = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+            for step in range_constexpr(GU_STEPS):
+                k0 = wave * GU_K_PER_WAVE + step * WMMA_K
+                coef = _wmma(
+                    _weight_fragment(r_w, row * H, k0, lane),
+                    _lds_fragment(c["xbuf"], token_local * H, k0, lane),
+                    coef,
+                )
+            fx.ptr_store(
+                coef,
+                c["wmma_red"] + (wave * WAVE_SIZE + lane) * WMMA_ACC,
+            )
+            gpu.barrier()
+            if c["tid"] < tile_rows * (ROWS // 2):
+                local_token = c["tid"] // (ROWS // 2)
+                out_token = tile_start + local_token
+                dim = 2 * (c["tid"] % (ROWS // 2))
+                c["put"](
+                    c["coef"],
+                    out_token * COEF_ROWS + row0 + dim,
+                    _tile_value(c["wmma_red"], 0, dim, local_token),
+                )
+                c["put"](
+                    c["coef"],
+                    out_token * COEF_ROWS + row0 + dim + 1,
+                    _tile_value(c["wmma_red"], 0, dim + 1, local_token),
+                )
+            gpu.barrier()
+            task = task + c["B"]
 
 
 @flyc.jit
@@ -485,6 +532,7 @@ def build_dmlp(key: DMLPBuild):
         s=key.tokens,
         w=key.npes,
         c=key.resident_blocks,
+        p=int(key.wmma_coef),
         f=key.fault_site,
     )
 
@@ -527,7 +575,10 @@ def build_dmlp(key: DMLPBuild):
             },
         }
         stage_norm(c)
-        stage_coef(c)
+        if key.wmma_coef:
+            stage_coef_wmma(c)
+        else:
+            stage_coef_scalar(c)
         stage_hc(c)
         stage_act(c)
         stage_down_out(c)

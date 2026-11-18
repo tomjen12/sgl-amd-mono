@@ -1,5 +1,6 @@
 """Executable four-process TP4 test for the gfx1250 K2 peer boundary."""
 
+import json
 import os
 import sys
 
@@ -96,7 +97,16 @@ def _worker(rank, port, queue):
         )
         peers.bytes.zero_()
         epoch = _epoch(device, 120.0)
-        launch = build_k2(K2Build(tokens=MAX_TOKENS, npes=NP))
+        launch = build_k2(
+            K2Build(
+                tokens=MAX_TOKENS,
+                npes=NP,
+                lds_og=os.environ.get("MUSE_K2_LDS_OG") == "1",
+                cooperative_rp=os.environ.get("MUSE_K2_COOPERATIVE_RP") == "1",
+                aggregate_boundary=os.environ.get("MUSE_K2_AGGREGATE_BOUNDARY") == "1",
+                single_boundary_wait=os.environ.get("MUSE_K2_SINGLE_BOUNDARY_WAIT") == "1",
+            )
+        )
         got = stream.clone()
         torch.cuda.synchronize()
         dist.barrier()
@@ -114,6 +124,41 @@ def _worker(rank, port, queue):
             )  # fmt: skip
             epoch[0] += 1
             torch.cuda.synchronize()
+
+        samples = []
+        for _ in range(int(os.environ.get("MUSE_K2_BENCH_ITERS", "0"))):
+            got.copy_(stream)
+            torch.cuda.synchronize()
+            dist.barrier()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            launch(
+                o.data_ptr(), g.data_ptr(), got.data_ptr(), w["w_o"].data_ptr(),
+                w["alpha"].data_ptr(), w["beta"].data_ptr(), w["pre_w"].data_ptr(),
+                w["w_hi"].data_ptr(), w["w_lo"].data_ptr(), w["bias"].data_ptr(),
+                w["w_pool"].data_ptr(), w["xn_w"].data_ptr(), ids.data_ptr(),
+                scores.data_ptr(), 0, 0, xin.data_ptr(), scratch.data_ptr(), peers.local,
+                peers.addresses.data_ptr(), rank, epoch.data_ptr(), LAYER,
+                stream=torch.cuda.current_stream(),
+            )  # fmt: skip
+            end.record()
+            end.synchronize()
+            epoch[0] += 1
+            samples.append(start.elapsed_time(end) * 1000.0)
+        if samples:
+            print(
+                "K2_TP4_BENCH_US="
+                + json.dumps(
+                    {
+                        "rank": rank,
+                        "mean": sum(samples) / len(samples),
+                        "min": min(samples),
+                        "max": max(samples),
+                    }
+                ),
+                flush=True,
+            )
 
         errors = epoch[guard.ERR_DEADLINE : guard.ERR_FAULT + 1].tolist()
         assert errors == [0, 0, 0], f"mailbox errors {errors}"

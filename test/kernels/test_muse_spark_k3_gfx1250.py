@@ -1,5 +1,7 @@
 """Standalone gfx1250 K3 against an explicit native-Quark PyTorch reference."""
 
+import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -308,7 +310,20 @@ def test_k3_matches_explicit_native_quark_reference(last, shuffled):
         (8, HIDDEN), float("nan"), dtype=bf16, device=device
     )
     got = base_stream.clone()
-    launch = build_k3(K3Build(npes=1, shuffled=shuffled))
+    launch = build_k3(
+        K3Build(
+            npes=1,
+            shuffled=shuffled,
+            staged_profile=os.environ.get("MUSE_K3_STAGED_PROFILE") == "1",
+            phase_trace=os.environ.get("MUSE_K3_PHASE_TRACE") == "1",
+            unpool_profile_mode=int(
+                os.environ.get("MUSE_K3_UNPOOL_PROFILE_MODE", "2")
+            ),
+            expert_profile_mode=(
+                os.environ.get("MUSE_K3_EXPERT_PROFILE_MODE", "1") == "1"
+            ),
+        )
+    )
     try:
         for _ in range(2):
             got.copy_(base_stream)
@@ -340,20 +355,104 @@ def test_k3_matches_explicit_native_quark_reference(last, shuffled):
             )
             epoch[0] += 1
         torch.cuda.synchronize()
+        bench_iters = int(os.environ.get("MUSE_K3_BENCH_ITERS", "0"))
+        if bench_iters:
+            samples = []
+            for _ in range(bench_iters):
+                got.copy_(base_stream)
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                launch(
+                    xin.data_ptr(),
+                    ids.data_ptr(),
+                    scores.data_ptr(),
+                    0,
+                    w13.data_ptr(),
+                    s13.data_ptr(),
+                    w2.data_ptr(),
+                    s2.data_ptr(),
+                    weights["pen_w"].data_ptr(),
+                    got.data_ptr(),
+                    weights["pfw"].data_ptr(),
+                    weights["alpha"].data_ptr(),
+                    weights["beta"].data_ptr(),
+                    weights["npw"].data_ptr(),
+                    weights["w_unpool"].data_ptr(),
+                    attn.data_ptr(),
+                    scratch.data_ptr(),
+                    peers.local,
+                    peers.addresses.data_ptr(),
+                    0,
+                    epoch.data_ptr(),
+                    LAYER,
+                    int(last),
+                    stream=torch.cuda.current_stream(),
+                )
+                end.record()
+                end.synchronize()
+                epoch[0] += 1
+                samples.append(start.elapsed_time(end) * 1000.0)
+            print(
+                "K3_BENCH_US="
+                + json.dumps(
+                    {
+                        "mean": sum(samples) / len(samples),
+                        "min": min(samples),
+                        "max": max(samples),
+                        "samples": samples,
+                    }
+                )
+            )
         from sgl_amd_mono.muse_spark.gfx1250.build_k3 import _scratch_layout
 
         layout = _scratch_layout()
+        if os.environ.get("MUSE_K3_PHASE_TRACE") == "1":
+            offset, _ = layout["k3_phase_ticks"]
+            ticks = (
+                scratch[offset : offset + 8 * 7 * 8]
+                .view(torch.int64)
+                .view(8, 7)
+                .cpu()
+            )
+            deltas = ticks[:, 1:] - ticks[:, :-1]
+            assert (deltas > 0).all()
+            print(
+                "K3_PHASE_TICKS="
+                + json.dumps(
+                    {
+                        "ticks": ticks.tolist(),
+                        "deltas": deltas.tolist(),
+                    }
+                )
+            )
 
         def scratch_bf16(name, shape):
             offset, _ = layout[name]
             size = torch.tensor(shape).prod().item()
             return scratch[offset : offset + size * 2].view(bf16).view(shape)
 
+        def scratch_mxfp8(name, rows, cols):
+            offset, _ = layout[name]
+            raw = scratch[offset : offset + rows * cols * 2].view(
+                rows, cols * 2
+            )
+            payload = raw[:, :cols].view(torch.float8_e4m3fn).float()
+            scales = raw[:, cols : cols + cols // 32].to(torch.int32)
+            dequant_scale = torch.ldexp(
+                torch.ones_like(scales, dtype=torch.float32),
+                scales - 127,
+            )
+            return (
+                payload.view(rows, cols // 32, 32)
+                * dequant_scale[..., None]
+            ).view(rows, cols)
+
         held = ((ids >= 0) & (ids < ROUTED_EXPERTS)).reshape(-1)
-        for name in ("qx", "qmid", "y"):
-            got_stage = scratch_bf16(
-                f"k3_{name}", (8 * TOP_K, MOE_HIDDEN)
-            )[held].float()
+        for name in ("qx", "qmid"):
+            got_stage = scratch_mxfp8(
+                f"k3_{name}", 8 * TOP_K, MOE_HIDDEN
+            )[held]
             ref_stage = diag[name][held].float()
             cosine = torch.nn.functional.cosine_similarity(
                 got_stage, ref_stage, dim=-1
@@ -361,6 +460,15 @@ def test_k3_matches_explicit_native_quark_reference(last, shuffled):
             assert cosine.min() > 0.997, (
                 f"{name} cosine {cosine.min().item():.6f}"
             )
+        got_y = scratch_bf16(
+            "k3_y", (8 * TOP_K, MOE_HIDDEN)
+        )[held].float()
+        y_cosine = torch.nn.functional.cosine_similarity(
+            got_y, diag["y"][held].float(), dim=-1
+        )
+        assert y_cosine.min() > 0.997, (
+            f"y cosine {y_cosine.min().item():.6f}"
+        )
         got_fbuf = scratch_bf16("k3_fbuf", (8, MOE_HIDDEN)).float()
         fbuf_cosine = torch.nn.functional.cosine_similarity(
             got_fbuf, diag["fbuf"].float(), dim=-1

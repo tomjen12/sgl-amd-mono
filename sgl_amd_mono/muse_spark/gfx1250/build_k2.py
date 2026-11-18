@@ -34,6 +34,8 @@ _ALIGN = 256
 O_GROUPS = HIDDEN // (post_attn.ROWS * post_attn.WAVES)
 ROUTER_GROUPS = EXPERTS // (post_attn.ROWS * post_attn.WAVES)
 POOL_GROUPS = MOE_HIDDEN // (post_attn.ROWS * post_attn.WAVES)
+ROUTER_TILES = EXPERTS // post_attn.ROWS
+POOL_TILES = MOE_HIDDEN // post_attn.ROWS
 
 
 def _raw_layout(items):
@@ -66,8 +68,9 @@ def _persistent_layout():
             [
                 ("k2_norm_done", MAX_TOKENS * (Q_K // HEAD_DIM)),
                 ("k2_boundary_done", MAX_TOKENS),
-                ("k2_router_done", ROUTER_GROUPS),
-                ("k2_pool_done", POOL_GROUPS),
+                ("k2_boundary_all_done", 1),
+                ("k2_router_done", ROUTER_TILES),
+                ("k2_pool_done", RESIDENT_BLOCKS),
             ],
             align=_ALIGN,
             start=(offset + _ALIGN - 1) // _ALIGN * _ALIGN,
@@ -97,6 +100,11 @@ class K2Build(msgspec.Struct, frozen=True):
     npes: int = 4
     fault_site: int = 0
     fault_after: int = 0
+    staged_profile: bool = False
+    lds_og: bool = False
+    cooperative_rp: bool = False
+    aggregate_boundary: bool = False
+    single_boundary_wait: bool = False
 
 
 @flyc.jit
@@ -135,6 +143,11 @@ def build_k2(key: K2Build):
         s=key.tokens,
         w=W,
         f=key.fault_site,
+        d=int(key.staged_profile),
+        l=int(key.lds_og),
+        r=int(key.cooperative_rp),
+        a=int(key.aggregate_boundary),
+        q=int(key.single_boundary_wait),
     )
     keyed = key_tuple(key, SOURCES)
     layout = k2_scratch_layout()
@@ -199,6 +212,7 @@ def build_k2(key: K2Build):
                 "red": lds.red.ptr,
                 "rank": rank,
                 "og": ptr(scratch, "k2_og"),
+                "local_og": False,
                 "w_o": w_o,
                 "put_bf": mb.put_bf,
                 "peer_attn": [
@@ -264,48 +278,55 @@ def build_k2(key: K2Build):
     ):
         lds = fx.SharedAllocator().allocate(ProjectionLds).peek()
         tid = fx.thread_idx.x
-        post_attn.stage_router_pool(
-            {
-                "bid": fx.block_idx.x,
-                "S": key.tokens,
-                "B": EXPERTS // post_attn.ROWS,
-                "tid": tid,
-                "lane": tid % 32,
-                "wave": tid // 32,
-                "rows": EXPERTS,
-                "router": True,
-                "x": ptr(scratch, "k2_x"),
-                "w0": w_hi,
-                "w1": w_lo,
-                "out": ptr(scratch, "k2_logits"),
-                "red": lds.red.ptr,
-            }
-        )
+        context = {
+            "bid": fx.block_idx.x,
+            "S": key.tokens,
+            "B": EXPERTS // post_attn.ROWS,
+            "task": fx.block_idx.x,
+            "tid": tid,
+            "lane": tid % 32,
+            "wave": tid // 32,
+            "rows": EXPERTS,
+            "router": True,
+            "x": ptr(scratch, "k2_x"),
+            "w0": w_hi,
+            "w1": w_lo,
+            "out": ptr(scratch, "k2_logits"),
+            "red": lds.red.ptr,
+        }
+        if key.cooperative_rp:
+            post_attn.stage_router_pool_cooperative(context)
+        else:
+            post_attn.stage_router_pool(context)
 
     @flyc.kernel(name=f"{name}_pool", known_block_size=[THREADS, 1, 1])
     def pool(w_pool: Int64, scratch: Int64):
         lds = fx.SharedAllocator().allocate(ProjectionLds).peek()
         tid = fx.thread_idx.x
-        post_attn.stage_router_pool(
-            {
-                "bid": fx.block_idx.x,
-                "S": key.tokens,
-                "B": RESIDENT_BLOCKS,
-                "tid": tid,
-                "lane": tid % 32,
-                "wave": tid // 32,
-                "rows": MOE_HIDDEN,
-                "router": False,
-                "x": ptr(scratch, "k2_x"),
-                "w0": w_pool,
-                "w1": fx.Int64(0),
-                "out": ptr(scratch, "k2_pool"),
-                "red": lds.red.ptr,
-            }
-        )
+        context = {
+            "bid": fx.block_idx.x,
+            "S": key.tokens,
+            "B": RESIDENT_BLOCKS,
+            "task": fx.block_idx.x,
+            "tid": tid,
+            "lane": tid % 32,
+            "wave": tid // 32,
+            "rows": MOE_HIDDEN,
+            "router": False,
+            "x": ptr(scratch, "k2_x"),
+            "w0": w_pool,
+            "w1": fx.Int64(0),
+            "out": ptr(scratch, "k2_pool"),
+            "red": lds.red.ptr,
+        }
+        if key.cooperative_rp:
+            post_attn.stage_router_pool_cooperative(context)
+        else:
+            post_attn.stage_router_pool(context)
 
     @fx.struct
     class TopLds:
+        red: fx.Array[fx.Float32, post_attn.RED_FLOATS, 16]
         picked: fx.Array[fx.Float32, 8, 16]
 
     @flyc.kernel(name=f"{name}_top8", known_block_size=[THREADS, 1, 1])
@@ -327,6 +348,7 @@ def build_k2(key: K2Build):
                 "ids": ids,
                 "scores": scores,
                 "logits": ptr(scratch, "k2_logits"),
+                "red": lds.red.ptr,
                 "picked": lds.picked.ptr,
             }
         )
@@ -369,6 +391,7 @@ def build_k2(key: K2Build):
 
     @fx.struct
     class PersistentLds:
+        og: fx.Array[fx.Float32, key.tokens * Q_K // 2, 16]
         red: fx.Array[fx.Float32, post_attn.RED_FLOATS, 16]
         picked: fx.Array[fx.Float32, TOP_K, 16]
 
@@ -426,6 +449,11 @@ def build_k2(key: K2Build):
             persistent_layout["k2_boundary_done"][0],
             "k2_boundary_done",
         )
+        boundary_all_done = sreg(
+            scratch,
+            persistent_layout["k2_boundary_all_done"][0],
+            "k2_boundary_all_done",
+        )
         router_done = sreg(
             scratch,
             persistent_layout["k2_router_done"][0],
@@ -437,27 +465,43 @@ def build_k2(key: K2Build):
             "k2_pool_done",
         )
 
-        norm_task = bid * WAVES + wave
-        if norm_task < key.tokens * (Q_K // HEAD_DIM):
-            post_attn.stage_norm_gate(
-                {
-                    "bid": norm_task,
-                    "lane": lane,
-                    "o": o,
-                    "g": g,
-                    "og": ptr(scratch, "k2_og"),
-                }
-            )
-            _publish_wave(sync["put"], norm_done, norm_task, lane)
+        if key.lds_og:
+            if bid < O_GROUPS:
+                post_attn.stage_norm_gate_lds(
+                    {
+                        "S": key.tokens,
+                        "lane": lane,
+                        "wave": wave,
+                        "o": o,
+                        "g": g,
+                        "og": lds.og.ptr,
+                    }
+                )
+        else:
+            norm_task = bid * WAVES + wave
+            if norm_task < key.tokens * (Q_K // HEAD_DIM):
+                post_attn.stage_norm_gate(
+                    {
+                        "bid": norm_task,
+                        "lane": lane,
+                        "o": o,
+                        "g": g,
+                        "og": ptr(scratch, "k2_og"),
+                    }
+                )
+                _publish_wave(sync["put"], norm_done, norm_task, lane)
 
         if bid < O_GROUPS:
-            _wait(
-                sync["poll"],
-                [
-                    (norm_done, task, 1)
-                    for task in range(key.tokens * (Q_K // HEAD_DIM))
-                ],
-            )
+            if not key.lds_og:
+                _wait(
+                    sync["poll"],
+                    [
+                        (norm_done, task, 1)
+                        for task in range(
+                            key.tokens * (Q_K // HEAD_DIM)
+                        )
+                    ],
+                )
             post_attn.stage_o_projection(
                 {
                     "W": W,
@@ -468,7 +512,12 @@ def build_k2(key: K2Build):
                     "wave": wave,
                     "red": lds.red.ptr,
                     "rank": rank,
-                    "og": ptr(scratch, "k2_og"),
+                    "og": (
+                        lds.og.ptr
+                        if key.lds_og
+                        else ptr(scratch, "k2_og")
+                    ),
+                    "local_og": key.lds_og,
                     "w_o": w_o,
                     "put_bf": sync["put_bf"],
                     "peer_attn": [
@@ -499,56 +548,141 @@ def build_k2(key: K2Build):
             )
             _publish(sync["put"], boundary_done, bid, tid)
 
-        if bid < ROUTER_GROUPS:
+        if key.aggregate_boundary and bid == RESIDENT_BLOCKS - 1:
             _wait(
                 sync["poll"],
                 [(boundary_done, token, 1) for token in range(key.tokens)],
             )
-            post_attn.stage_router_pool(
-                {
-                    "bid": bid,
-                    "S": key.tokens,
-                    "tid": tid,
-                    "lane": lane,
-                    "wave": wave,
-                    "rows": EXPERTS,
-                    "router": True,
-                    "x": ptr(scratch, "k2_x"),
-                    "w0": w_hi,
-                    "w1": w_lo,
-                    "out": ptr(scratch, "k2_logits"),
-                    "red": lds.red.ptr,
-                }
-            )
-            _publish(sync["put"], router_done, bid, tid)
+            _publish(sync["put"], boundary_all_done, 0, tid)
 
-        if bid < POOL_GROUPS:
+        if key.cooperative_rp:
             _wait(
                 sync["poll"],
-                [(boundary_done, token, 1) for token in range(key.tokens)],
+                (
+                    [(boundary_all_done, 0, 1)]
+                    if key.aggregate_boundary
+                    else [
+                        (boundary_done, token, 1)
+                        for token in range(key.tokens)
+                    ]
+                ),
             )
-            post_attn.stage_router_pool(
-                {
-                    "bid": bid,
-                    "S": key.tokens,
-                    "tid": tid,
-                    "lane": lane,
-                    "wave": wave,
-                    "rows": MOE_HIDDEN,
-                    "router": False,
-                    "x": ptr(scratch, "k2_x"),
-                    "w0": w_pool,
-                    "w1": fx.Int64(0),
-                    "out": ptr(scratch, "k2_pool"),
-                    "red": lds.red.ptr,
-                }
-            )
+            if (bid >= 64) & (bid < 64 + ROUTER_TILES):
+                router_task = bid - 64
+                post_attn.stage_router_pool_cooperative(
+                    {
+                        "S": key.tokens,
+                        "task": router_task,
+                        "tid": tid,
+                        "lane": lane,
+                        "wave": wave,
+                        "router": True,
+                        "x": ptr(scratch, "k2_x"),
+                        "w0": w_hi,
+                        "w1": w_lo,
+                        "out": ptr(scratch, "k2_logits"),
+                        "red": lds.red.ptr,
+                    }
+                )
+                _publish(sync["put"], router_done, router_task, tid)
+
+            pool_task = bid
+            while pool_task < POOL_TILES:
+                post_attn.stage_router_pool_cooperative(
+                    {
+                        "S": key.tokens,
+                        "task": pool_task,
+                        "tid": tid,
+                        "lane": lane,
+                        "wave": wave,
+                        "router": False,
+                        "x": ptr(scratch, "k2_x"),
+                        "w0": w_pool,
+                        "w1": fx.Int64(0),
+                        "out": ptr(scratch, "k2_pool"),
+                        "red": lds.red.ptr,
+                    }
+                )
+                pool_task = pool_task + RESIDENT_BLOCKS
             _publish(sync["put"], pool_done, bid, tid)
+        else:
+            if key.single_boundary_wait and bid < POOL_GROUPS:
+                _wait(
+                    sync["poll"],
+                    (
+                        [(boundary_all_done, 0, 1)]
+                        if key.aggregate_boundary
+                        else [
+                            (boundary_done, token, 1)
+                            for token in range(key.tokens)
+                        ]
+                    ),
+                )
+            if bid < ROUTER_GROUPS:
+                if not key.single_boundary_wait:
+                    _wait(
+                        sync["poll"],
+                        [
+                            (boundary_done, token, 1)
+                            for token in range(key.tokens)
+                        ],
+                    )
+                post_attn.stage_router_pool(
+                    {
+                        "bid": bid,
+                        "S": key.tokens,
+                        "tid": tid,
+                        "lane": lane,
+                        "wave": wave,
+                        "rows": EXPERTS,
+                        "router": True,
+                        "x": ptr(scratch, "k2_x"),
+                        "w0": w_hi,
+                        "w1": w_lo,
+                        "out": ptr(scratch, "k2_logits"),
+                        "red": lds.red.ptr,
+                    }
+                )
+                _publish(sync["put"], router_done, bid, tid)
+
+            if bid < POOL_GROUPS:
+                if not key.single_boundary_wait:
+                    _wait(
+                        sync["poll"],
+                        [
+                            (boundary_done, token, 1)
+                            for token in range(key.tokens)
+                        ],
+                    )
+                post_attn.stage_router_pool(
+                    {
+                        "bid": bid,
+                        "S": key.tokens,
+                        "tid": tid,
+                        "lane": lane,
+                        "wave": wave,
+                        "rows": MOE_HIDDEN,
+                        "router": False,
+                        "x": ptr(scratch, "k2_x"),
+                        "w0": w_pool,
+                        "w1": fx.Int64(0),
+                        "out": ptr(scratch, "k2_pool"),
+                        "red": lds.red.ptr,
+                    }
+                )
+                _publish(sync["put"], pool_done, bid, tid)
 
         if bid < key.tokens:
             _wait(
                 sync["poll"],
-                [(router_done, task, 1) for task in range(ROUTER_GROUPS)],
+                [
+                    (router_done, task, 1)
+                    for task in range(
+                        ROUTER_TILES
+                        if key.cooperative_rp
+                        else ROUTER_GROUPS
+                    )
+                ],
             )
             post_attn.stage_top8(
                 {
@@ -558,6 +692,7 @@ def build_k2(key: K2Build):
                     "ids": ids,
                     "scores": scores,
                     "logits": ptr(scratch, "k2_logits"),
+                    "red": lds.red.ptr,
                     "picked": lds.picked.ptr,
                 }
             )
@@ -586,7 +721,14 @@ def build_k2(key: K2Build):
 
             _wait(
                 sync["poll"],
-                [(pool_done, task, 1) for task in range(POOL_GROUPS)],
+                [
+                    (pool_done, task, 1)
+                    for task in range(
+                        RESIDENT_BLOCKS
+                        if key.cooperative_rp
+                        else POOL_GROUPS
+                    )
+                ],
             )
             post_attn.stage_pooled_norm(
                 {
@@ -629,34 +771,89 @@ def build_k2(key: K2Build):
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
-        persistent(
-            o,
-            g,
-            res,
-            w_o,
-            alpha,
-            beta,
-            pre_w,
-            w_hi,
-            w_lo,
-            bias,
-            w_pool,
-            xn_w,
-            ids,
-            scores,
-            override_ids,
-            override_scores,
-            xin,
-            scratch,
-            sym,
-            peers,
-            rank,
-            epoch,
-            layer,
-        ).launch(
-            grid=(RESIDENT_BLOCKS,),
-            block=(THREADS,),
-            stream=stream,
-        )
+        if key.staged_profile:
+            norm_gate(o, g, scratch).launch(
+                grid=(key.tokens * (Q_K // HEAD_DIM),),
+                block=(32,),
+                stream=stream,
+            )
+            oproj(
+                w_o, scratch, sym, peers, rank, epoch, layer
+            ).launch(grid=(O_GROUPS,), block=(THREADS,), stream=stream)
+            boundary(
+                res,
+                alpha,
+                beta,
+                pre_w,
+                scratch,
+                sym,
+                peers,
+                rank,
+                epoch,
+                layer,
+            ).launch(grid=(key.tokens,), block=(THREADS,), stream=stream)
+            if key.cooperative_rp:
+                router(w_hi, w_lo, scratch).launch(
+                    grid=(ROUTER_TILES,),
+                    block=(THREADS,),
+                    stream=stream,
+                )
+                pool(w_pool, scratch).launch(
+                    grid=(POOL_TILES,),
+                    block=(THREADS,),
+                    stream=stream,
+                )
+            else:
+                router(w_hi, w_lo, scratch).launch(
+                    grid=(ROUTER_GROUPS,),
+                    block=(THREADS,),
+                    stream=stream,
+                )
+                pool(w_pool, scratch).launch(
+                    grid=(POOL_GROUPS,),
+                    block=(THREADS,),
+                    stream=stream,
+                )
+            top8(
+                bias,
+                ids,
+                scores,
+                override_ids,
+                override_scores,
+                scratch,
+            ).launch(grid=(key.tokens,), block=(THREADS,), stream=stream)
+            pooled_norm(xn_w, xin, scratch).launch(
+                grid=(key.tokens,), block=(THREADS,), stream=stream
+            )
+        else:
+            persistent(
+                o,
+                g,
+                res,
+                w_o,
+                alpha,
+                beta,
+                pre_w,
+                w_hi,
+                w_lo,
+                bias,
+                w_pool,
+                xn_w,
+                ids,
+                scores,
+                override_ids,
+                override_scores,
+                xin,
+                scratch,
+                sym,
+                peers,
+                rank,
+                epoch,
+                layer,
+            ).launch(
+                grid=(RESIDENT_BLOCKS,),
+                block=(THREADS,),
+                stream=stream,
+            )
 
     return launch

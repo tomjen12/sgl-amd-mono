@@ -17,7 +17,11 @@ import json
 import logging
 import multiprocessing
 import os
+import pickle
 import random
+import signal
+import subprocess
+import sys
 import tempfile
 import time
 import traceback
@@ -809,6 +813,130 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
     )
 
 
+def _profile_sibling_workers(args, server_args, port_args, directory: str):
+    """Run four peer ranks while rocprof-compute wraps only one worker.
+
+    The profiler process is a sibling of the three unprofiled workers, not
+    their parent. This preserves the symmetric TP4 process-group lifecycle and
+    prevents rocprofiler-sdk from following every distributed child.
+    """
+    root = Path(directory)
+    state_path = root / "worker-state.pkl"
+    with state_path.open("wb") as stream:
+        pickle.dump((args, server_args, port_args), stream)
+
+    paths = [str(root / f"rank_{rank}.json") for rank in range(WORLD_SIZE)]
+    clean_env = os.environ.copy()
+    for name in tuple(clean_env):
+        if (
+            name == "LD_PRELOAD"
+            or name.startswith("ROCPROF")
+            or name.startswith("ROCP_TOOL")
+        ):
+            clean_env.pop(name)
+
+    processes: dict[int, subprocess.Popen] = {}
+    for rank in range(WORLD_SIZE):
+        worker_env = clean_env.copy()
+        worker = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            args.bundle,
+            args.target_config,
+            "--worker-state",
+            str(state_path),
+            "--worker-rank",
+            str(rank),
+            "--worker-result",
+            paths[rank],
+        ]
+        if rank == args.profile_worker_rank:
+            worker_env["LD_PRELOAD"] = args.profile_preload
+            command = [
+                args.profile_rocprof,
+                "profile",
+                "--output-directory",
+                args.profile_output,
+                "--set",
+                args.profile_set,
+                "--no-roof",
+                "--kernel",
+                args.profile_kernel,
+                "--overwrite",
+                "--",
+                *worker,
+            ]
+        else:
+            command = worker
+        processes[rank] = subprocess.Popen(
+            command,
+            env=worker_env,
+            start_new_session=rank == args.profile_worker_rank,
+        )
+
+    deadline = time.monotonic() + args.profile_timeout
+    profile_ready_since = None
+    forced_profile_completion = False
+    while any(process.poll() is None for process in processes.values()):
+        profile_process = processes[args.profile_worker_rank]
+        counters_ready = any(
+            Path(args.profile_output).rglob("*_native_counter_collection.csv.gz")
+        )
+        results_ready = all(Path(path).is_file() for path in paths)
+        if profile_process.poll() is None and counters_ready and results_ready:
+            if profile_ready_since is None:
+                profile_ready_since = time.monotonic()
+            elif (
+                time.monotonic() - profile_ready_since
+                >= args.profile_finalize_grace
+            ):
+                os.killpg(profile_process.pid, signal.SIGTERM)
+                try:
+                    profile_process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    os.killpg(profile_process.pid, signal.SIGKILL)
+                    profile_process.wait()
+                forced_profile_completion = True
+        failures = [
+            (rank, process.returncode)
+            for rank, process in processes.items()
+            if process.returncode not in (None, 0)
+            and not (rank == args.profile_worker_rank and forced_profile_completion)
+        ]
+        if failures or time.monotonic() >= deadline:
+            for process in processes.values():
+                if process.poll() is None:
+                    process.terminate()
+            for process in processes.values():
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+            if failures:
+                raise RuntimeError(f"profile worker failure: {failures}")
+            raise TimeoutError(
+                f"four-rank profiling exceeded {args.profile_timeout} seconds"
+            )
+        time.sleep(0.2)
+
+    results = []
+    for rank, path in enumerate(paths):
+        if Path(path).is_file():
+            results.append(_read_json(path))
+        else:
+            results.append(
+                {
+                    "rank": rank,
+                    "status": "error",
+                    "error": (
+                        f"profile worker exited {processes[rank].returncode} "
+                        "without a result"
+                    ),
+                }
+            )
+    return results
+
+
 def execute(args) -> tuple[int, dict[str, Any]]:
     os.environ.update(BASELINE_ENVIRONMENT)
     os.environ["SGLANG_MUSE_REPLAY_TARGET_LAYERS"] = str(TARGET_LAYERS)
@@ -835,32 +963,39 @@ def execute(args) -> tuple[int, dict[str, Any]]:
     port_args = PortArgs.init_new(server_args)
 
     with tempfile.TemporaryDirectory(prefix="muse-target-replay-") as directory:
-        workers = []
-        paths = []
-        for rank in range(WORLD_SIZE):
-            path = str(Path(directory) / f"rank_{rank}.json")
-            paths.append(path)
-            process = multiprocessing.Process(
-                target=_worker,
-                args=(args, server_args, port_args, rank, rank, path),
+        if args.profile_worker_rank is not None:
+            results = _profile_sibling_workers(
+                args, server_args, port_args, directory
             )
-            process.start()
-            workers.append(process)
-        for process in workers:
-            process.join()
-
-        results = []
-        for rank, (process, path) in enumerate(zip(workers, paths)):
-            if Path(path).is_file():
-                results.append(_read_json(path))
-            else:
-                results.append(
-                    {
-                        "rank": rank,
-                        "status": "error",
-                        "error": f"worker exited {process.exitcode} without a result",
-                    }
+        else:
+            workers = []
+            paths = []
+            for rank in range(WORLD_SIZE):
+                path = str(Path(directory) / f"rank_{rank}.json")
+                paths.append(path)
+                process = multiprocessing.Process(
+                    target=_worker,
+                    args=(args, server_args, port_args, rank, rank, path),
                 )
+                process.start()
+                workers.append(process)
+            for process in workers:
+                process.join()
+
+            results = []
+            for rank, (process, path) in enumerate(zip(workers, paths)):
+                if Path(path).is_file():
+                    results.append(_read_json(path))
+                else:
+                    results.append(
+                        {
+                            "rank": rank,
+                            "status": "error",
+                            "error": (
+                                f"worker exited {process.exitcode} without a result"
+                            ),
+                        }
+                    )
 
     failures = [item for item in results if item.get("status") != "ok"]
     routing_blockers = [
@@ -907,6 +1042,20 @@ def create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--attn-dump-dir")
+    parser.add_argument("--profile-worker-rank", type=int, choices=range(WORLD_SIZE))
+    parser.add_argument("--profile-rocprof")
+    parser.add_argument("--profile-preload")
+    parser.add_argument("--profile-output")
+    parser.add_argument("--profile-kernel")
+    parser.add_argument(
+        "--profile-set",
+        choices=("launch_stats", "mem_thruput", "compute_thruput_flops"),
+    )
+    parser.add_argument("--profile-timeout", type=float, default=300.0)
+    parser.add_argument("--profile-finalize-grace", type=float, default=15.0)
+    parser.add_argument("--worker-state", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-rank", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-result", help=argparse.SUPPRESS)
     parser.add_argument(
         "--allow-routing-mismatch",
         action="store_true",
@@ -920,8 +1069,59 @@ def create_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = create_parser().parse_args(argv)
+    if args.worker_state is not None:
+        if args.worker_rank is None or args.worker_result is None:
+            raise SystemExit(
+                "--worker-state requires --worker-rank and --worker-result"
+            )
+        with Path(args.worker_state).open("rb") as stream:
+            worker_args, server_args, port_args = pickle.load(stream)
+        _worker(
+            worker_args,
+            server_args,
+            port_args,
+            args.worker_rank,
+            args.worker_rank,
+            args.worker_result,
+        )
+        # PyTorch may lazily start multiprocessing.resource_tracker even though
+        # this worker does not create child ranks. Stop it before process exit;
+        # otherwise rocprofiler-sdk finalization waits for that helper while
+        # Python's atexit cleanup waits for profiler finalization.
+        from multiprocessing import resource_tracker
+
+        tracker = resource_tracker._resource_tracker
+        if tracker._pid is not None:
+            tracker._stop()
+        result = _read_json(args.worker_result)
+        return 0 if result.get("status") == "ok" else 1
     if args.warmup < 0 or args.iterations <= 0:
         raise SystemExit("--warmup must be non-negative and --iterations positive")
+    profile_values = (
+        args.profile_rocprof,
+        args.profile_preload,
+        args.profile_output,
+        args.profile_kernel,
+        args.profile_set,
+    )
+    if args.profile_worker_rank is not None and any(
+        value is None for value in profile_values
+    ):
+        raise SystemExit(
+            "--profile-worker-rank requires --profile-rocprof, "
+            "--profile-preload, --profile-output, --profile-kernel, and --profile-set"
+        )
+    if args.profile_worker_rank is None and any(
+        value is not None for value in profile_values
+    ):
+        raise SystemExit(
+            "--profile-rocprof/--profile-preload/--profile-output/"
+            "--profile-kernel/--profile-set require --profile-worker-rank"
+        )
+    if args.profile_timeout <= 0:
+        raise SystemExit("--profile-timeout must be positive")
+    if args.profile_finalize_grace <= 0:
+        raise SystemExit("--profile-finalize-grace must be positive")
     if args.mode == "mono" and args.routing_snapshot_dir is None:
         raise SystemExit(
             "Target Mono replay requires --routing-snapshot-dir from baseline."

@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Correctness-first gfx1250 wave32 K3 stages.
+"""gfx1250 wave32 K3 stages.
 
 The implementation deliberately favors an explicit, auditable execution order:
 one CTA computes one routed expert pick, one CTA finalizes one token and performs
 the EP rank-order sum, and one CTA redundantly unpools and applies the boundary
-for one token.  Native Quark MXFP4 tensors are decoded in software and multiplied
-with the gfx1250 BF16 WMMA used by K1.
+for one token. Expert GEMMs consume packed MXFP8 activations and native Quark
+MXFP4 weights with gfx1250 mixed scaled WMMA.
 """
 
 import flydsl.compiler as flyc
@@ -36,6 +36,7 @@ THREADS = 256
 WAVE_SIZE = 32
 WAVES = 8
 WMMA_K = 32
+SCALED_WMMA_K = 128
 WMMA_ACC = 8
 RED_FLOATS = WAVES * WAVE_SIZE * WMMA_ACC
 ELEMS = 16
@@ -54,8 +55,8 @@ def _e8m0_f32(byte):
     return ((fx.Int32(byte) & 0xFF) << 23).bitcast(fx.Float32)
 
 
-def _mxfp8_value(x, amax):
-    """AITER per-1x32 MXFP8 quantization, returned as its dequantized f32."""
+def _mxfp8_quant(x, amax):
+    """AITER per-1x32 MXFP8 quantization as E4M3 payload and E8M0 scale."""
     safe_max = fx.max(amax, fx.Float32(1e-10))
     working = (safe_max * fx.Int32(FP8_INV_MAX).bitcast(fx.Float32)).bitcast(
         fx.Int32
@@ -70,6 +71,12 @@ def _mxfp8_value(x, amax):
         T.i32, x * quant_scale, fx.Float32(0.0), fx.Int32(0), 0
     )
     code = fx.Int32(packed) & 0xFF
+    return code, e8m0
+
+
+def _mxfp8_value(x, amax):
+    """AITER MXFP8 quantization, returned as its dequantized f32."""
+    code, e8m0 = _mxfp8_quant(x, amax)
     exponent, mantissa = (code >> 3) & 0xF, code & 7
     normal = ((exponent + 120) << 23) | (mantissa << 20)
     decoded = (exponent == 0).select(
@@ -153,6 +160,82 @@ def _decode_weight_fragment(r_w, r_s, row, k0, lane, shuffled):
     return fx.Vector.from_elements(vals, fx.Float32).to(fx.BFloat16)
 
 
+def _packed_weight_fragment(r_w, row, k0, lane, shuffled):
+    """One FP4 A operand for a 16x16x128 mixed scaled-WMMA."""
+    lane_k = lane // 16
+    bytes_ = [
+        k0 // 2 + block * 32 + lane_k * 16
+        for block in range(2)
+    ]
+    if shuffled:
+        chunks = [
+            fx.Vector(
+                bo.buffer_load(
+                    r_w,
+                    _shuffled_weight_offset(row, byte) // 4,
+                    vec_width=4,
+                    dtype=T.i32,
+                )
+            )
+            for byte in bytes_
+        ]
+        return fx.Vector.from_elements(
+            [chunks[block][i] for block in range(2) for i in range(4)],
+            fx.Int32,
+        )
+    chunks = [
+        fx.Vector(
+            bo.buffer_load(
+                r_w,
+                (row * W13_ROW_BYTES + byte) // 4,
+                vec_width=4,
+                dtype=T.i32,
+            )
+        )
+        for byte in bytes_
+    ]
+    return fx.Vector.from_elements(
+        [chunks[block][i] for block in range(2) for i in range(4)],
+        fx.Int32,
+    )
+
+
+def _weight_scale_pack(r_s, row, k0, shuffled):
+    group = k0 // 32
+    byte = (
+        _shuffled_scale_offset(row, group)
+        if shuffled
+        else row * W13_SCALE_COLS + group
+    )
+    return fx.Int32(bo.buffer_load(r_s, byte // 4, vec_width=1, dtype=T.i32))
+
+
+def _packed_activation_fragment(resource, n, k0, lane):
+    """One E4M3 B operand; the same row is broadcast over 16 columns."""
+    lane_k = lane // 16
+    chunks = [
+        fx.Vector(
+            bo.buffer_load(
+                resource,
+                (k0 + i * 32 + lane_k * 16) // 4,
+                vec_width=4,
+                dtype=T.i32,
+            )
+        )
+        for i in range(4)
+    ]
+    return fx.Vector.from_elements(
+        [chunks[i][j] for i in range(4) for j in range(4)],
+        fx.Int32,
+    )
+
+
+def _activation_scale_pack(resource, n, k0):
+    return fx.Int32(
+        bo.buffer_load(resource, (n + k0 // 32) // 4, vec_width=1, dtype=T.i32)
+    )
+
+
 def _bf_fragment(resource, base, k0, lane):
     """One row-major BF16 vector, repeated in all WMMA B columns."""
     kh = (lane // 16) * 8
@@ -171,6 +254,30 @@ def _bf_fragment(resource, base, k0, lane):
     ).bitcast(fx.BFloat16)
 
 
+def _bf_tokens_fragment(resource, k, k0, lane, tokens):
+    """One BF16 B operand with one activation row per live WMMA column."""
+    token = lane % 16
+    kh = (lane // 16) * 8
+    base = token * k
+    lo = fx.Vector(
+        bo.buffer_load(
+            resource, (base + k0 + kh) // 2, vec_width=4, dtype=T.i32
+        )
+    )
+    hi = fx.Vector(
+        bo.buffer_load(
+            resource,
+            (base + k0 + 16 + kh) // 2,
+            vec_width=4,
+            dtype=T.i32,
+        )
+    )
+    valid = token < tokens
+    words = [valid.select(lo[i], fx.Int32(0)) for i in range(4)]
+    words += [valid.select(hi[i], fx.Int32(0)) for i in range(4)]
+    return fx.Vector.from_elements(words, fx.Int32).bitcast(fx.BFloat16)
+
+
 def _wmma(a, b, acc):
     result = rocdl.wmma_f32_16x16x32_bf16(
         fx.Vector.make_type(WMMA_ACC, fx.Float32),
@@ -183,8 +290,35 @@ def _wmma(a, b, acc):
     return fx.Vector(result)
 
 
+def _wmma_scaled(a, b, acc, scale_a, scale_b):
+    result = rocdl.wmma_scale_f32_16x16x128_f8f6f4(
+        fx.Vector.make_type(WMMA_ACC, fx.Float32),
+        fx.as_ir_value(a),
+        fx.as_ir_value(b),
+        fx.as_ir_value(acc),
+        fx.as_ir_value(scale_a),
+        fx.as_ir_value(scale_b),
+        fmtA=4,
+        fmtB=0,
+        reuseA=False,
+        reuseB=False,
+    )
+    return fx.Vector(result)
+
+
 def _tile_value(red, row):
     lane = ((row % 16) // 8) * 16
+    elem = row % 8
+    out = fx.Float32(0.0)
+    for wave in range_constexpr(WAVES):
+        out = out + fx.ptr_load(
+            red + (wave * WAVE_SIZE + lane) * WMMA_ACC + elem
+        )
+    return out
+
+
+def _tile_token_value(red, token, row):
+    lane = ((row % 16) // 8) * 16 + token
     elem = row % 8
     out = fx.Float32(0.0)
     for wave in range_constexpr(WAVES):
@@ -204,15 +338,92 @@ def _mx_weight_gemv_tile(c, r_w, r_s, row0, x_addr, k, gate_up=0):
         row = row * 2 + (gate_up - 1)
     r_x = rsrc(x_addr)
     acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
-    for step in range(0, k // (WAVES * WMMA_K)):
-        k0 = (wave * (k // WAVES)) + step * WMMA_K
-        acc = _wmma(
-            _decode_weight_fragment(r_w, r_s, row, k0, lane, c["shuffled"]),
-            _bf_fragment(r_x, 0, k0, lane),
+    for step in range(0, k // (WAVES * SCALED_WMMA_K)):
+        k0 = (wave * (k // WAVES)) + step * SCALED_WMMA_K
+        acc = _wmma_scaled(
+            _packed_weight_fragment(r_w, row, k0, lane, c["shuffled"]),
+            _packed_activation_fragment(r_x, k, k0, lane),
             acc,
+            _weight_scale_pack(r_s, row, k0, c["shuffled"]),
+            _activation_scale_pack(r_x, k, k0),
         )
     fx.ptr_store(acc, red + (wave * WAVE_SIZE + lane) * WMMA_ACC)
     gpu.barrier()
+
+
+@flyc.jit
+def _mx_weight_gate_up_32(c, r_w, r_s, row0, x_addr, k):
+    """Two 16-row Gate/Up tiles sharing one activation load per K step."""
+    lane, wave, red = c["lane"], c["wave"], c["red"]
+    r_x = rsrc(x_addr)
+    gate_acc = [
+        fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+        for _ in range(2)
+    ]
+    up_acc = [
+        fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+        for _ in range(2)
+    ]
+    for step in range(0, k // (WAVES * SCALED_WMMA_K)):
+        k0 = (wave * (k // WAVES)) + step * SCALED_WMMA_K
+        activation = _packed_activation_fragment(r_x, k, k0, lane)
+        activation_scale = _activation_scale_pack(r_x, k, k0)
+        for half in range_constexpr(2):
+            row = row0 + half * 16 + lane % 16
+            gate_row = row * 2 if c["shuffled"] else row
+            up_row = row * 2 + 1 if c["shuffled"] else INTER + row
+            gate_acc[half] = _wmma_scaled(
+                _packed_weight_fragment(
+                    r_w, gate_row, k0, lane, c["shuffled"]
+                ),
+                activation,
+                gate_acc[half],
+                _weight_scale_pack(
+                    r_s, gate_row, k0, c["shuffled"]
+                ),
+                activation_scale,
+            )
+            up_acc[half] = _wmma_scaled(
+                _packed_weight_fragment(
+                    r_w, up_row, k0, lane, c["shuffled"]
+                ),
+                activation,
+                up_acc[half],
+                _weight_scale_pack(
+                    r_s, up_row, k0, c["shuffled"]
+                ),
+                activation_scale,
+            )
+
+    for half in range_constexpr(2):
+        fx.ptr_store(
+            gate_acc[half],
+            red + (wave * WAVE_SIZE + lane) * WMMA_ACC,
+        )
+        gpu.barrier()
+        if c["tid"] < 16:
+            fx.ptr_store(
+                _tile_value(red, c["tid"]), c["aux"] + 32 + c["tid"]
+            )
+        gpu.barrier()
+        fx.ptr_store(
+            up_acc[half],
+            red + (wave * WAVE_SIZE + lane) * WMMA_ACC,
+        )
+        gpu.barrier()
+        if c["tid"] < 16:
+            gate = fx.ptr_load(c["aux"] + 32 + c["tid"])
+            up = _tile_value(red, c["tid"])
+            mid = bf16_round(
+                gate
+                * (
+                    fx.Float32(1.0)
+                    / (fx.Float32(1.0) + hw_exp2(-gate * LOG2E))
+                )
+                * up
+            )
+            fx.ptr_store(mid, c["aux"] + half * 16 + c["tid"])
+        gpu.barrier()
 
 
 @flyc.jit
@@ -234,9 +445,27 @@ def _bf_gemv_tile(c, r_w, row0, x_addr, k):
 
 
 @flyc.jit
+def _bf_gemm_tokens_tile(c, r_w, row0, x_addr, k):
+    """Sixteen BF16 weight rows times every live token in one WMMA tile."""
+    lane, wave, red = c["lane"], c["wave"], c["red"]
+    row = row0 + lane % 16
+    r_x = rsrc(x_addr)
+    acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+    for step in range(0, k // (WAVES * WMMA_K)):
+        k0 = wave * (k // WAVES) + step * WMMA_K
+        acc = _wmma(
+            _bf_fragment(r_w, row * k, k0, lane),
+            _bf_tokens_fragment(r_x, k, k0, lane, c["S"]),
+            acc,
+        )
+    fx.ptr_store(acc, red + (wave * WAVE_SIZE + lane) * WMMA_ACC)
+    gpu.barrier()
+
+
+@flyc.jit
 def _quantize_row(c, src_addr, dst_addr, n):
-    """Apply AITER's per-1x32 MXFP8 rule and store its BF16 dequantization."""
-    tid = c["tid"]
+    """Store packed E4M3 payload followed by one E8M0 byte per 32 values."""
+    tid, lane = c["tid"], c["lane"]
     r_src, r_dst = rsrc(src_addr), rsrc(dst_addr)
     for it in range_constexpr(n // THREADS):
         i = tid + it * THREADS
@@ -244,10 +473,15 @@ def _quantize_row(c, src_addr, dst_addr, n):
             bo.buffer_load(r_src, i, vec_width=1, dtype=T.bf16)
         )
         amax = fx.coop.warp_reduce(abs(x), fx.ReductionOp.MAX, width=32)
-        value = _mxfp8_value(x, amax)
-        bo.buffer_store(
-            value.to(fx.BFloat16), r_dst, i, cache_modifier=16
-        )
+        code, e8m0 = _mxfp8_quant(x, amax)
+        bo.buffer_store(fx.Int8(code), r_dst, i, cache_modifier=16)
+        if lane == 0:
+            bo.buffer_store(
+                fx.Int8(e8m0),
+                r_dst,
+                n + i // 32,
+                cache_modifier=16,
+            )
     gpu.barrier()
 
 
@@ -264,6 +498,88 @@ def _block_sum(c, value, slot):
         out = out + fx.ptr_load(sums + slot * WAVES + w)
     gpu.barrier()
     return out
+
+
+@flyc.jit
+def stage_expert_quantize(c, pick):
+    """Quantize one routed pick before CTA-parallel expert GEMMs."""
+    token = pick // TOP_K
+    a = c["args"]
+    expert = fx.Int32(
+        bo.buffer_load(rsrc(a["ids"]), pick, vec_width=1, dtype=T.i32)
+    )
+    local = expert - a["local_start"]
+    if (local >= 0) & (local < LOCAL_EXPERTS):
+        qx = c["qx"].value + fx.Int64(pick * MOE_HIDDEN * 2)
+        xin = a["xin"] + fx.Int64(token * MOE_HIDDEN * 2)
+        _quantize_row(c, xin, qx, MOE_HIDDEN)
+
+
+@flyc.jit
+def stage_expert_gate_up_block(c, task):
+    """Compute one routed pick's 32-row Gate/Up/SiLU block."""
+    blocks = INTER // 32
+    pick, block = task // blocks, task % blocks
+    a, tid = c["args"], c["tid"]
+    expert = fx.Int32(
+        bo.buffer_load(rsrc(a["ids"]), pick, vec_width=1, dtype=T.i32)
+    )
+    local = expert - a["local_start"]
+    if (local >= 0) & (local < LOCAL_EXPERTS):
+        qx = c["qx"].value + fx.Int64(pick * MOE_HIDDEN * 2)
+        qmid = c["qmid"].value + fx.Int64(pick * INTER * 2)
+        w13_base = fx.Int64(local) * (2 * INTER * W13_ROW_BYTES)
+        s13_base = fx.Int64(local) * (2 * INTER * W13_SCALE_COLS)
+        r13 = rsrc(a["w13"] + w13_base)
+        rs13 = rsrc(a["s13"] + s13_base)
+        _mx_weight_gate_up_32(
+            c, r13, rs13, block * 32, qx, MOE_HIDDEN
+        )
+        if tid < 32:
+            v = fx.ptr_load(c["aux"] + tid)
+            amax = fx.coop.warp_reduce(abs(v), fx.ReductionOp.MAX, width=32)
+            code, e8m0 = _mxfp8_quant(v, amax)
+            bo.buffer_store(
+                fx.Int8(code),
+                rsrc(qmid),
+                block * 32 + tid,
+                cache_modifier=16,
+            )
+            if tid == 0:
+                bo.buffer_store(
+                    fx.Int8(e8m0),
+                    rsrc(qmid),
+                    INTER + block,
+                    cache_modifier=16,
+                )
+        gpu.barrier()
+
+
+@flyc.jit
+def stage_expert_down_tile(c, task):
+    """Compute one routed pick's 16-row Down tile."""
+    tiles = MOE_HIDDEN // 16
+    pick, tile = task // tiles, task % tiles
+    a, tid = c["args"], c["tid"]
+    expert = fx.Int32(
+        bo.buffer_load(rsrc(a["ids"]), pick, vec_width=1, dtype=T.i32)
+    )
+    local = expert - a["local_start"]
+    if (local >= 0) & (local < LOCAL_EXPERTS):
+        qmid = c["qmid"].value + fx.Int64(pick * INTER * 2)
+        y = c["y"].value + fx.Int64(pick * MOE_HIDDEN * 2)
+        w2_base = fx.Int64(local) * (MOE_HIDDEN * W2_ROW_BYTES)
+        s2_base = fx.Int64(local) * (MOE_HIDDEN * W2_SCALE_COLS)
+        r2, rs2 = rsrc(a["w2"] + w2_base), rsrc(a["s2"] + s2_base)
+        _mx_weight_gemv_tile(c, r2, rs2, tile * 16, qmid, INTER)
+        if tid < 16:
+            bo.buffer_store(
+                bf16_round(_tile_value(c["red"], tid)).to(fx.BFloat16),
+                rsrc(y),
+                tile * 16 + tid,
+                cache_modifier=16,
+            )
+        gpu.barrier()
 
 
 @flyc.jit
@@ -321,13 +637,20 @@ def stage_expert_pick(c, task=None):
             if tid < 32:
                 v = fx.ptr_load(c["aux"] + tid)
                 amax = fx.coop.warp_reduce(abs(v), fx.ReductionOp.MAX, width=32)
-                qv = _mxfp8_value(v, amax)
+                code, e8m0 = _mxfp8_quant(v, amax)
                 bo.buffer_store(
-                    qv.to(fx.BFloat16),
+                    fx.Int8(code),
                     rsrc(qmid),
                     block * 32 + tid,
                     cache_modifier=16,
                 )
+                if tid == 0:
+                    bo.buffer_store(
+                        fx.Int8(e8m0),
+                        rsrc(qmid),
+                        INTER + block,
+                        cache_modifier=16,
+                    )
             gpu.barrier()
 
         w2_base = fx.Int64(local) * (MOE_HIDDEN * W2_ROW_BYTES)
@@ -431,24 +754,178 @@ def stage_finalize_ep(c):
 
 
 @flyc.jit
-def stage_unpool_boundary(c):
-    """Kernel 3: replicated unpool GEMV and the complete FFN boundary."""
-    tid, token = c["tid"], c["bid"]
+def stage_finalize_scale(c, pick):
+    """Compute one routed row's post-RMS score scale."""
+    tid, a = c["tid"], c["args"]
+    col0 = tid * ELEMS
+    expert = fx.Int32(
+        bo.buffer_load(rsrc(a["ids"]), pick, vec_width=1, dtype=T.i32)
+    )
+    local = expert - a["local_start"]
+    held = (local >= 0) & (local < LOCAL_EXPERTS)
+    local_ss = fx.Float32(0.0)
+    for q in range_constexpr(ELEMS // 2):
+        yword = fx.Int32(
+            bo.buffer_load(
+                rsrc(c["y"].value),
+                pick * (MOE_HIDDEN // 2) + col0 // 2 + q,
+                vec_width=1,
+                dtype=T.i32,
+            )
+        )
+        pword = fx.Int32(
+            bo.buffer_load(
+                rsrc(a["pen_w"]),
+                col0 // 2 + q,
+                vec_width=1,
+                dtype=T.i32,
+            )
+        )
+        y0, y1 = bf2_f32(yword)
+        p0, p1 = bf2_f32(pword)
+        v0 = held.select(bf16_round(y0 * p0), fx.Float32(0.0))
+        v1 = held.select(bf16_round(y1 * p1), fx.Float32(0.0))
+        local_ss = local_ss + v0 * v0 + v1 * v1
+    ss = _block_sum(c, local_ss, pick % 2)
+    score = fx.Float32(
+        bo.buffer_load(rsrc(a["scores"]), pick, vec_width=1, dtype=T.f32)
+    )
+    scale = held.select(
+        score * hw_rsq(ss / float(MOE_HIDDEN) + POST_EPS),
+        fx.Float32(0.0),
+    )
+    if tid == 0:
+        bo.buffer_store(
+            scale,
+            rsrc(c["finalize_scale"].value),
+            pick,
+            cache_modifier=16,
+        )
+
+
+@flyc.jit
+def stage_finalize_publish(c, task, chunks):
+    """Combine one column chunk, exchange rank partials, and reduce in order."""
+    tid, a = c["tid"], c["args"]
+    token, chunk = task // chunks, task % chunks
+    pairs = MOE_HIDDEN // 2
+    pairs_per_chunk = (pairs + chunks - 1) // chunks
+    pair = chunk * pairs_per_chunk + tid
+    if (tid < pairs_per_chunk) & (pair < pairs):
+        pword = fx.Int32(
+            bo.buffer_load(
+                rsrc(a["pen_w"]),
+                pair,
+                vec_width=1,
+                dtype=T.i32,
+            )
+        )
+        p0, p1 = bf2_f32(pword)
+        value0, value1 = fx.Float32(0.0), fx.Float32(0.0)
+        for slot in range_constexpr(TOP_K):
+            pick = token * TOP_K + slot
+            expert = fx.Int32(
+                bo.buffer_load(rsrc(a["ids"]), pick, vec_width=1, dtype=T.i32)
+            )
+            local = expert - a["local_start"]
+            held = (local >= 0) & (local < LOCAL_EXPERTS)
+            yword = fx.Int32(
+                bo.buffer_load(
+                    rsrc(c["y"].value),
+                    pick * pairs + pair,
+                    vec_width=1,
+                    dtype=T.i32,
+                )
+            )
+            y0, y1 = bf2_f32(yword)
+            v0 = held.select(bf16_round(y0 * p0), fx.Float32(0.0))
+            v1 = held.select(bf16_round(y1 * p1), fx.Float32(0.0))
+            scale = fx.Float32(
+                bo.buffer_load(
+                    rsrc(c["finalize_scale"].value),
+                    pick,
+                    vec_width=1,
+                    dtype=T.f32,
+                )
+            )
+            value0, value1 = value0 + scale * v0, value1 + scale * v1
+
+        partial0, partial1 = bf16_round(value0), bf16_round(value1)
+        for pe in range_constexpr(c["W"]):
+            c["put_bf"](
+                c["peer_partial"][pe],
+                (c["rank"] * c["S"] + token) * MOE_HIDDEN + pair * 2,
+                [partial0, partial1],
+            )
+        got = c["poll"](
+            [
+                (
+                    c["own_partial"],
+                    (src * c["S"] + token) * pairs + pair,
+                    1,
+                )
+                for src in range(c["W"])
+            ]
+        )
+        out0, out1 = fx.Float32(0.0), fx.Float32(0.0)
+        for src in range_constexpr(c["W"]):
+            x0, x1 = bf2_f32(got[src][0])
+            out0, out1 = out0 + x0, out1 + x1
+        bo.buffer_store(
+            bf16_pair(out0, out1).bitcast(fx.Int32),
+            rsrc(c["fbuf"].value),
+            token * pairs + pair,
+            cache_modifier=16,
+        )
+
+
+@flyc.jit
+def stage_unpool_gemv(c, task):
+    """Compute one 16-row unpool tile for one token."""
+    tiles = HIDDEN // 16
+    token, tile = task // tiles, task % tiles
     a = c["args"]
     frow = c["fbuf"].value + fx.Int64(token * MOE_HIDDEN * 2)
     branch = c["branch"].value + fx.Int64(token * HIDDEN * 2)
     r_unp = rsrc(a["w_unpool"])
-    for tile in range(0, HIDDEN // 16):
-        _bf_gemv_tile(c, r_unp, tile * 16, frow, MOE_HIDDEN)
-        if tid < 16:
+    _bf_gemv_tile(c, r_unp, tile * 16, frow, MOE_HIDDEN)
+    if c["tid"] < 16:
+        bo.buffer_store(
+            bf16_round(_tile_value(c["red"], c["tid"])).to(fx.BFloat16),
+            rsrc(branch),
+            tile * 16 + c["tid"],
+            cache_modifier=16,
+        )
+
+
+@flyc.jit
+def stage_unpool_tokens_gemv(c, tile):
+    """Compute one 16-row unpool tile for every verify token."""
+    a = c["args"]
+    r_unp = rsrc(a["w_unpool"])
+    _bf_gemm_tokens_tile(c, r_unp, tile * 16, c["fbuf"].value, MOE_HIDDEN)
+    for store_round in range_constexpr((c["S"] * 16 + THREADS - 1) // THREADS):
+        item = c["tid"] + store_round * THREADS
+        if item < c["S"] * 16:
+            token, row = item // 16, item % 16
             bo.buffer_store(
-                bf16_round(_tile_value(c["red"], tid)).to(fx.BFloat16),
-                rsrc(branch),
-                tile * 16 + tid,
+                bf16_round(
+                    _tile_token_value(c["red"], token, row)
+                ).to(fx.BFloat16),
+                rsrc(c["branch"].value),
+                token * HIDDEN + tile * 16 + row,
                 cache_modifier=16,
             )
-        gpu.barrier()
+    gpu.barrier()
 
+
+@flyc.jit
+def stage_unpool_post(c, token=None):
+    """Apply the complete FFN boundary after all unpool tiles are visible."""
+    tid = c["tid"]
+    token = c["bid"] if token is None else token
+    a = c["args"]
+    branch = c["branch"].value + fx.Int64(token * HIDDEN * 2)
     e0 = tid * 32
     post = []
     local_ss = fx.Float32(0.0)
@@ -523,3 +1000,13 @@ def stage_unpool_boundary(c):
             token * (HIDDEN // 2) + e0 // 2 + q,
             cache_modifier=16,
         )
+
+
+@flyc.jit
+def stage_unpool_boundary(c):
+    """Diagnostic three-launch path: unpool GEMV then complete boundary."""
+    token = c["bid"]
+    for tile in range(0, HIDDEN // 16):
+        stage_unpool_gemv(c, token * (HIDDEN // 16) + tile)
+        gpu.barrier()
+    stage_unpool_post(c, token)

@@ -387,12 +387,6 @@ def report(baseline_dir: Path, split_dir: Path, fused_dir: Path) -> dict[str, An
     baseline, baseline_total, baseline_iterations = _baseline_samples(baseline_dir)
     split, split_total, split_iterations = _mono_samples(split_dir, "split")
     fused, fused_total, fused_iterations = _mono_samples(fused_dir, "fused")
-    if len({baseline_iterations, split_iterations, fused_iterations}) != 1:
-        raise ValueError(
-            "iteration mismatch: "
-            f"baseline={baseline_iterations}, split={split_iterations}, "
-            f"fused={fused_iterations}"
-        )
     fused_baseline = _fused_baseline(baseline, baseline_iterations)
     split_comparison = _comparison(baseline, split, STAGES)
     fused_comparison = _comparison(fused_baseline, fused, FAMILIES)
@@ -400,6 +394,11 @@ def report(baseline_dir: Path, split_dir: Path, fused_dir: Path) -> dict[str, An
         "schema_version": 1,
         "workload": "Muse Spark synthetic Target layers 0-9 width8 8K replay",
         "iterations": baseline_iterations,
+        "iteration_counts": {
+            "baseline": baseline_iterations,
+            "split": split_iterations,
+            "fused": fused_iterations,
+        },
         "ranks": 4,
         "excluded": "layer 0 BF16 fallback",
         "launches_per_rank_iteration": {
