@@ -153,7 +153,10 @@ def test_gfx1250_draft_kernels_are_enabled_only_for_cu96(monkeypatch):
     assert draft._use_kernels()
 
 
-def test_gfx1250_draft_runner_builds_only_the_validated_geometry(monkeypatch):
+@pytest.mark.parametrize("rows", [8, 16, 32, 64])
+def test_gfx1250_draft_runner_builds_only_the_validated_geometry(
+    monkeypatch, rows
+):
     from sgl_amd_mono.muse_spark import draft
 
     class Build:
@@ -192,17 +195,64 @@ def test_gfx1250_draft_runner_builds_only_the_validated_geometry(monkeypatch):
     runner._attn = {}
     runner._post = {}
 
-    runner.kernel(8)
-    runner.attn_kernels(8)
+    runner.kernel(rows)
+    runner.attn_kernels(rows)
 
-    assert (built["mlp"].tokens, built["mlp"].npes) == (8, 4)
-    assert (built["pre"].tokens, built["post"].tokens) == (8, 8)
+    assert (built["mlp"].tokens, built["mlp"].npes) == (rows, 4)
+    assert (built["pre"].tokens, built["post"].tokens) == (rows, rows)
     assert built["post"].npes == 4
     assert (
         built["attn"].tokens,
         built["attn"].q_len,
         built["attn"].resident_blocks,
-    ) == (8, 8, 96)
+    ) == (rows, 8, 96)
+
+
+@pytest.mark.parametrize("rows", [8, 16, 32, 64])
+@pytest.mark.parametrize(
+    "stage, expected",
+    [
+        (1, ("D-MLP",)),
+        (2, ("D-MLP", "D-pre", "D-attn", "D-post")),
+    ],
+)
+def test_gfx1250_draft_precompile_covers_each_enabled_stage(
+    monkeypatch, rows, stage, expected
+):
+    from sgl_amd_mono.muse_spark import draft
+
+    runner = object.__new__(draft.DraftRunner)
+    launches = {
+        "D-MLP": object(),
+        "D-pre": object(),
+        "D-attn": object(),
+        "D-post": object(),
+    }
+    compiled = []
+
+    monkeypatch.setattr(draft, "STAGE", stage)
+    monkeypatch.setattr(
+        "sgl_amd_mono.muse_spark.gfx950.runner.compile_only",
+        compiled.append,
+    )
+    monkeypatch.setattr(
+        runner, "kernel", lambda got: launches["D-MLP"] if got == rows else None
+    )
+    monkeypatch.setattr(
+        runner,
+        "attn_kernels",
+        lambda got: (
+            launches["D-pre"],
+            launches["D-attn"],
+            launches["D-post"],
+        )
+        if got == rows
+        else (),
+    )
+
+    runner.precompile(rows)
+
+    assert compiled == [launches[name] for name in expected]
 
 
 def test_the_recipe_is_accepted():
