@@ -5,6 +5,8 @@ pins the gfx950 TP8/wave64 implementation, while this one pins the gfx1250
 TP4/wave32 BS1 implementation.
 """
 
+import os
+
 import pytest
 import torch
 
@@ -175,7 +177,8 @@ def test_gfx1250_k1_matches_the_fused_kernel_math(rows, rope, swa, slot64):
         scratch_bytes(k1_scratch_layout()), dtype=torch.uint8, device=device
     )
     epoch = _epoch(device)
-    launch = build_k1(K1Build(tokens=rows))
+    phase_trace = os.environ.get("MUSE_PHASE_TRACE") == "1"
+    launch = build_k1(K1Build(tokens=rows, phase_trace=phase_trace))
 
     for _ in range(2):
         launch(
@@ -205,6 +208,11 @@ def test_gfx1250_k1_matches_the_fused_kernel_math(rows, rope, swa, slot64):
     from sgl_amd_mono.common import guard
 
     assert (epoch[guard.ERR_DEADLINE : guard.ERR_FAULT + 1] == 0).all()
+    if phase_trace:
+        offset, _ = k1_scratch_layout()["k1_phase_ticks"]
+        ticks = scratch[offset : offset + 96 * 3 * 8].view(torch.int64).view(96, 3)
+        assert torch.all(ticks[:, 1:] >= ticks[:, :-1])
+        assert torch.all(ticks[:, -1] > ticks[:, 0])
 
     q_ref, k_ref, v_ref, g_ref = _reference(x, w, cos_sin, positions, rope)
     _close(q, q_ref, 1 / 64, "q")

@@ -5,6 +5,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import msgspec
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
 from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
@@ -23,7 +24,11 @@ from sgl_amd_mono.muse_spark.gfx1250.config import (
     TOP_K,
     WIDTHS,
 )
-from sgl_amd_mono.muse_spark.gfx1250.device import mailbox_guard, step_tag
+from sgl_amd_mono.muse_spark.gfx1250.device import (
+    clock,
+    mailbox_guard,
+    step_tag,
+)
 from sgl_amd_mono.muse_spark.gfx1250.stages import post_attn
 
 SOURCES = kernel_sources(__name__)
@@ -31,11 +36,18 @@ _STREAM = fx.Stream(None)
 THREADS = 256
 WAVES = THREADS // 32
 _ALIGN = 256
+JOINT_TDM_BUFFERS = 6
+JOINT_TDM_A_ELEMS = 16 * (256 + 8) + 8
+JOINT_TDM_B_ELEMS = 64 * (256 + 8) + 8
+JOINT_TDM_ARENA_ELEMS = JOINT_TDM_BUFFERS * (
+    JOINT_TDM_A_ELEMS + JOINT_TDM_B_ELEMS
+)
 O_GROUPS = HIDDEN // (post_attn.ROWS * post_attn.WAVES)
 ROUTER_GROUPS = EXPERTS // (post_attn.ROWS * post_attn.WAVES)
 POOL_GROUPS = MOE_HIDDEN // (post_attn.ROWS * post_attn.WAVES)
 ROUTER_TILES = EXPERTS // post_attn.ROWS
 POOL_TILES = MOE_HIDDEN // post_attn.ROWS
+K2_PHASE_POINTS = 7
 
 
 def _raw_layout(items):
@@ -55,6 +67,15 @@ def k2_scratch_layout():
             ("k2_x", MAX_TOKENS * HIDDEN * 2),
             ("k2_logits", MAX_TOKENS * EXPERTS * 4),
             ("k2_pool", MAX_TOKENS * MOE_HIDDEN * 2),
+            (
+                "k2_joint",
+                MAX_TOKENS * post_attn.JOINT_ROWS * 4,
+            ),
+            ("k2_joint_arrivals", 4),
+            (
+                "k2_phase_ticks",
+                RESIDENT_BLOCKS * K2_PHASE_POINTS * 8,
+            ),
         ]
     )
 
@@ -71,6 +92,8 @@ def _persistent_layout():
                 ("k2_boundary_all_done", 1),
                 ("k2_router_done", ROUTER_TILES),
                 ("k2_pool_done", RESIDENT_BLOCKS),
+                ("k2_joint_counter_ready", 1),
+                ("k2_joint_all_done", 1),
             ],
             align=_ALIGN,
             start=(offset + _ALIGN - 1) // _ALIGN * _ALIGN,
@@ -105,6 +128,9 @@ class K2Build(msgspec.Struct, frozen=True):
     cooperative_rp: bool = False
     aggregate_boundary: bool = False
     single_boundary_wait: bool = False
+    lds_x_rp: bool = False
+    joint_rp: bool = False
+    phase_trace: bool = False
 
 
 @flyc.jit
@@ -130,12 +156,34 @@ def _wait(poll, specs):
     return values
 
 
+@flyc.jit
+def _stamp_phase(enabled, ticks, bid, tid, phase):
+    if enabled:
+        gpu.barrier()
+        if tid == 0:
+            bo.buffer_store(
+                clock(),
+                rsrc(ticks),
+                bid * K2_PHASE_POINTS + phase,
+            )
+
+
 def build_k2(key: K2Build):
     """Build K2 for a supported Target width."""
     if key.tokens not in WIDTHS:
         raise ValueError(f"gfx1250 K2 supports widths {WIDTHS}, got {key.tokens}")
     if key.npes not in (1, 4):
         raise ValueError(f"gfx1250 K2 V1 supports TP1 or TP4, got {key.npes}")
+    if key.lds_x_rp and key.tokens != 8:
+        raise ValueError("K2 LDS-X Router/Pooler currently supports width 8")
+    if key.joint_rp and key.tokens != 8:
+        raise ValueError("K2 joint Router/Pooler currently supports width 8")
+    if key.joint_rp and (key.cooperative_rp or key.lds_x_rp):
+        raise ValueError("K2 joint Router/Pooler is a distinct execution path")
+    if key.joint_rp and key.lds_og:
+        raise ValueError("K2 joint Router/Pooler overlays the O-projection LDS")
+    if key.joint_rp and key.staged_profile:
+        raise ValueError("K2 joint Router/Pooler requires the persistent path")
 
     W = key.npes
     name = kernel_symbol(
@@ -148,6 +196,9 @@ def build_k2(key: K2Build):
         r=int(key.cooperative_rp),
         a=int(key.aggregate_boundary),
         q=int(key.single_boundary_wait),
+        u=int(key.lds_x_rp),
+        j=int(key.joint_rp),
+        t=int(key.phase_trace),
     )
     keyed = key_tuple(key, SOURCES)
     layout = k2_scratch_layout()
@@ -160,6 +211,7 @@ def build_k2(key: K2Build):
     @fx.struct
     class ProjectionLds:
         red: fx.Array[fx.Float32, post_attn.RED_FLOATS, 16]
+        xrp: fx.Array[fx.Float32, post_attn.RP_X_PAIRS, 16]
 
     @flyc.kernel(name=f"{name}_norm_gate", known_block_size=[32, 1, 1])
     def norm_gate(o: Int64, g: Int64, scratch: Int64):
@@ -293,6 +345,8 @@ def build_k2(key: K2Build):
             "w1": w_lo,
             "out": ptr(scratch, "k2_logits"),
             "red": lds.red.ptr,
+            "lds_x": key.lds_x_rp,
+            "x_lds": lds.xrp.ptr,
         }
         if key.cooperative_rp:
             post_attn.stage_router_pool_cooperative(context)
@@ -318,6 +372,8 @@ def build_k2(key: K2Build):
             "w1": fx.Int64(0),
             "out": ptr(scratch, "k2_pool"),
             "red": lds.red.ptr,
+            "lds_x": key.lds_x_rp,
+            "x_lds": lds.xrp.ptr,
         }
         if key.cooperative_rp:
             post_attn.stage_router_pool_cooperative(context)
@@ -389,11 +445,23 @@ def build_k2(key: K2Build):
             }
         )
 
-    @fx.struct
-    class PersistentLds:
-        og: fx.Array[fx.Float32, key.tokens * Q_K // 2, 16]
-        red: fx.Array[fx.Float32, post_attn.RED_FLOATS, 16]
-        picked: fx.Array[fx.Float32, TOP_K, 16]
+    if key.joint_rp:
+
+        @fx.struct
+        class PersistentLds:
+            # The TDM arena overlays O-projection/boundary reduction storage.
+            # At 253,632 B it fits the gfx1250 256-KiB LDS budget while a
+            # separate reduction allocation would not.
+            arena: fx.Array[fx.BFloat16, JOINT_TDM_ARENA_ELEMS, 16]
+
+    else:
+
+        @fx.struct
+        class PersistentLds:
+            og: fx.Array[fx.Float32, key.tokens * Q_K // 2, 16]
+            red: fx.Array[fx.Float32, post_attn.RED_FLOATS, 16]
+            xrp: fx.Array[fx.Float32, post_attn.RP_X_PAIRS, 16]
+            picked: fx.Array[fx.Float32, TOP_K, 16]
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def persistent(
@@ -422,6 +490,21 @@ def build_k2(key: K2Build):
         layer: Int32,
     ):
         lds = fx.SharedAllocator().allocate(PersistentLds).peek()
+        if key.joint_rp:
+            arena_addr = fx.Int32(fx.ptrtoint(lds.arena.ptr))
+            lds_f32 = fx.inttoptr(
+                fx.PointerType.get(
+                    elem_ty=fx.Float32.ir_type,
+                    address_space=fx.AddressSpace.Shared,
+                    alignment=16,
+                ),
+                arena_addr,
+            )
+            red_lds = lds_f32
+            picked_lds = lds_f32 + post_attn.RED_FLOATS
+        else:
+            red_lds = lds.red.ptr
+            picked_lds = lds.picked.ptr
         tid, bid = fx.thread_idx.x, fx.block_idx.x
         lane, wave = tid % 32, tid // 32
         mb = Mailbox(
@@ -464,6 +547,25 @@ def build_k2(key: K2Build):
             persistent_layout["k2_pool_done"][0],
             "k2_pool_done",
         )
+        joint_counter_ready = sreg(
+            scratch,
+            persistent_layout["k2_joint_counter_ready"][0],
+            "k2_joint_counter_ready",
+        )
+        joint_all_done = sreg(
+            scratch,
+            persistent_layout["k2_joint_all_done"][0],
+            "k2_joint_all_done",
+        )
+        joint_arrivals = ptr(scratch, "k2_joint_arrivals")
+        phase_ticks = ptr(scratch, "k2_phase_ticks")
+        _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 0)
+        if key.joint_rp and bid == 0:
+            if tid == 0:
+                bo.buffer_store(
+                    fx.Int32(0), rsrc(joint_arrivals), 0, cache_modifier=0
+                )
+            _publish(sync["put"], joint_counter_ready, 0, tid)
 
         if key.lds_og:
             if bid < O_GROUPS:
@@ -510,7 +612,7 @@ def build_k2(key: K2Build):
                     "tid": tid,
                     "lane": lane,
                     "wave": wave,
-                    "red": lds.red.ptr,
+                    "red": red_lds,
                     "rank": rank,
                     "og": (
                         lds.og.ptr
@@ -526,6 +628,7 @@ def build_k2(key: K2Build):
                     ],
                 }
             )
+        _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 1)
 
         if bid < key.tokens:
             post_attn.stage_boundary(
@@ -536,7 +639,7 @@ def build_k2(key: K2Build):
                     "tid": tid,
                     "lane": lane,
                     "wave": wave,
-                    "red": lds.red.ptr,
+                    "red": red_lds,
                     "res": res,
                     "alpha": alpha,
                     "beta": beta,
@@ -547,6 +650,7 @@ def build_k2(key: K2Build):
                 }
             )
             _publish(sync["put"], boundary_done, bid, tid)
+        _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 2)
 
         if key.aggregate_boundary and bid == RESIDENT_BLOCKS - 1:
             _wait(
@@ -555,7 +659,47 @@ def build_k2(key: K2Build):
             )
             _publish(sync["put"], boundary_all_done, 0, tid)
 
-        if key.cooperative_rp:
+        if key.joint_rp:
+            _wait(sync["poll"], [(joint_counter_ready, 0, 1)])
+            _wait(
+                sync["poll"],
+                [
+                    (boundary_done, token, 1)
+                    for token in range(key.tokens)
+                ],
+            )
+            if bid < post_attn.JOINT_TASKS:
+                post_attn.stage_joint_router_pool(
+                    {
+                        "S": key.tokens,
+                        "task": bid,
+                        "tid": tid,
+                        "lane": lane,
+                        "wave": wave,
+                        "x": ptr(scratch, "k2_x"),
+                        # Joint mode reuses the existing w_pool ABI slot.  The
+                        # runner binds it to LayerViews.w_joint.
+                        "w_joint": w_pool,
+                        "out": ptr(scratch, "k2_joint"),
+                        "red": red_lds,
+                    }
+                )
+                fx.memory_fence(
+                    syncscope="agent", ordering=fx.AtomicOrdering.Release
+                )
+                if tid == 0:
+                    arrival = fx.Int32(
+                        comm_ops.atomic_add_agent(
+                            joint_arrivals, fx.Int32(1)
+                        )
+                    )
+                    if arrival == post_attn.JOINT_TASKS - 1:
+                        _publish_wave(
+                            sync["put"], joint_all_done, 0, fx.Int32(0)
+                        )
+            _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 3)
+            _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 4)
+        elif key.cooperative_rp:
             _wait(
                 sync["poll"],
                 (
@@ -581,10 +725,13 @@ def build_k2(key: K2Build):
                         "w0": w_hi,
                         "w1": w_lo,
                         "out": ptr(scratch, "k2_logits"),
-                        "red": lds.red.ptr,
+                        "red": red_lds,
+                        "lds_x": key.lds_x_rp,
+                        "x_lds": lds.xrp.ptr,
                     }
                 )
                 _publish(sync["put"], router_done, router_task, tid)
+            _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 3)
 
             pool_task = bid
             while pool_task < POOL_TILES:
@@ -600,11 +747,14 @@ def build_k2(key: K2Build):
                         "w0": w_pool,
                         "w1": fx.Int64(0),
                         "out": ptr(scratch, "k2_pool"),
-                        "red": lds.red.ptr,
+                        "red": red_lds,
+                        "lds_x": key.lds_x_rp,
+                        "x_lds": lds.xrp.ptr,
                     }
                 )
                 pool_task = pool_task + RESIDENT_BLOCKS
             _publish(sync["put"], pool_done, bid, tid)
+            _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 4)
         else:
             if key.single_boundary_wait and bid < POOL_GROUPS:
                 _wait(
@@ -640,10 +790,13 @@ def build_k2(key: K2Build):
                         "w0": w_hi,
                         "w1": w_lo,
                         "out": ptr(scratch, "k2_logits"),
-                        "red": lds.red.ptr,
+                        "red": red_lds,
+                        "lds_x": key.lds_x_rp,
+                        "x_lds": lds.xrp.ptr,
                     }
                 )
                 _publish(sync["put"], router_done, bid, tid)
+            _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 3)
 
             if bid < POOL_GROUPS:
                 if not key.single_boundary_wait:
@@ -667,35 +820,55 @@ def build_k2(key: K2Build):
                         "w0": w_pool,
                         "w1": fx.Int64(0),
                         "out": ptr(scratch, "k2_pool"),
-                        "red": lds.red.ptr,
+                        "red": red_lds,
+                        "lds_x": key.lds_x_rp,
+                        "x_lds": lds.xrp.ptr,
                     }
                 )
                 _publish(sync["put"], pool_done, bid, tid)
+            _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 4)
 
         if bid < key.tokens:
-            _wait(
-                sync["poll"],
-                [
-                    (router_done, task, 1)
-                    for task in range(
-                        ROUTER_TILES
-                        if key.cooperative_rp
-                        else ROUTER_GROUPS
-                    )
-                ],
-            )
-            post_attn.stage_top8(
-                {
-                    "bid": bid,
-                    "tid": tid,
-                    "bias": bias,
-                    "ids": ids,
-                    "scores": scores,
-                    "logits": ptr(scratch, "k2_logits"),
-                    "red": lds.red.ptr,
-                    "picked": lds.picked.ptr,
-                }
-            )
+            if key.joint_rp:
+                _wait(sync["poll"], [(joint_all_done, 0, 1)])
+            else:
+                _wait(
+                    sync["poll"],
+                    [
+                        (router_done, task, 1)
+                        for task in range(
+                            ROUTER_TILES
+                            if key.cooperative_rp
+                            else ROUTER_GROUPS
+                        )
+                    ],
+                )
+            if key.joint_rp:
+                post_attn.stage_joint_top8(
+                    {
+                        "bid": bid,
+                        "tid": tid,
+                        "bias": bias,
+                        "ids": ids,
+                        "scores": scores,
+                        "joint": ptr(scratch, "k2_joint"),
+                        "red": red_lds,
+                        "picked": picked_lds,
+                    }
+                )
+            else:
+                post_attn.stage_top8(
+                    {
+                        "bid": bid,
+                        "tid": tid,
+                        "bias": bias,
+                        "ids": ids,
+                        "scores": scores,
+                        "logits": ptr(scratch, "k2_logits"),
+                        "red": red_lds,
+                        "picked": picked_lds,
+                    }
+                )
             if override_ids != 0 and tid == 0:
                 for pick in range_constexpr(TOP_K):
                     offset = bid * TOP_K + pick
@@ -718,30 +891,49 @@ def build_k2(key: K2Build):
                             )
                         )
                         bo.buffer_store(score, rsrc(scores), offset)
+        _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 5)
 
-            _wait(
-                sync["poll"],
-                [
-                    (pool_done, task, 1)
-                    for task in range(
-                        RESIDENT_BLOCKS
-                        if key.cooperative_rp
-                        else POOL_GROUPS
-                    )
-                ],
-            )
-            post_attn.stage_pooled_norm(
-                {
-                    "bid": bid,
-                    "tid": tid,
-                    "lane": lane,
-                    "wave": wave,
-                    "red": lds.red.ptr,
-                    "pool": ptr(scratch, "k2_pool"),
-                    "xn_w": xn_w,
-                    "xin": xin,
-                }
-            )
+        if key.joint_rp:
+            if (bid >= key.tokens) & (bid < 2 * key.tokens):
+                _wait(sync["poll"], [(joint_all_done, 0, 1)])
+                post_attn.stage_joint_pooled_norm(
+                    {
+                        "bid": bid - key.tokens,
+                        "tid": tid,
+                        "lane": lane,
+                        "wave": wave,
+                        "red": red_lds,
+                        "joint": ptr(scratch, "k2_joint"),
+                        "xn_w": xn_w,
+                        "xin": xin,
+                    }
+                )
+        else:
+            if bid < key.tokens:
+                _wait(
+                    sync["poll"],
+                    [
+                        (pool_done, task, 1)
+                        for task in range(
+                            RESIDENT_BLOCKS
+                            if key.cooperative_rp
+                            else POOL_GROUPS
+                        )
+                    ],
+                )
+                post_attn.stage_pooled_norm(
+                    {
+                        "bid": bid,
+                        "tid": tid,
+                        "lane": lane,
+                        "wave": wave,
+                        "red": red_lds,
+                        "pool": ptr(scratch, "k2_pool"),
+                        "xn_w": xn_w,
+                        "xin": xin,
+                    }
+                )
+        _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 6)
 
     @flyc.jit
     def launch(

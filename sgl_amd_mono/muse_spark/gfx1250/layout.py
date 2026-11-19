@@ -83,7 +83,10 @@ def k1_post_tasks(block_id: int) -> tuple[str, int] | None:
 def k1_scratch_layout() -> dict:
     """Tagged fp32 partials for every K part, token and projection row."""
     return pair_layout(
-        [("k1_part", K_PARTS * MAX_TOKENS * QKVG_ROWS)],
+        [
+            ("k1_part", K_PARTS * MAX_TOKENS * QKVG_ROWS),
+            ("k1_phase_ticks", RESIDENT_BLOCKS * 3),
+        ],
         align=256,
     )
 
@@ -115,7 +118,10 @@ def kattn_lds_bytes() -> int:
 # The fused Target attention layout is kept here so CPU-only geometry tests do
 # not need to import FlyDSL/AITER and probe for a GPU.
 FUSED_ROWS = 16
-FUSED_SPLITS = 6
+FUSED_SPLITS = 6  # Maximum split count and stable scratch-ABI stride.
+FUSED_SPLIT_CHOICES = (2, 3, 4, 6)
+FUSED_KEY_BLOCK_CHOICES = (16, 32, 64)
+FUSED_LOAD_BITS_CHOICES = (64, 128)
 FUSED_TILES = LOCAL_KV_HEADS * (MAX_TOKENS // 2)
 FUSED_TASKS = FUSED_TILES * FUSED_SPLITS
 FUSED_KEY_TILE = 16
@@ -145,8 +151,60 @@ def fused_tiles(tokens: int) -> int:
     return LOCAL_KV_HEADS * (tokens // 2)
 
 
-def fused_tasks(tokens: int) -> int:
-    return fused_tiles(tokens) * FUSED_SPLITS
+def validate_fused_splits(splits: int) -> int:
+    if splits not in FUSED_SPLIT_CHOICES:
+        raise ValueError(
+            f"fused attention splits {splits}, want one of {FUSED_SPLIT_CHOICES}"
+        )
+    return splits
+
+
+def fused_tasks(tokens: int, splits: int = FUSED_SPLITS) -> int:
+    return fused_tiles(tokens) * validate_fused_splits(splits)
+
+
+def fused_scratch_task(tile: int, split: int) -> int:
+    """Return the stable max-six scratch slot for an active split task."""
+    if tile < 0:
+        raise ValueError(f"negative fused attention tile {tile}")
+    if not 0 <= split < FUSED_SPLITS:
+        raise ValueError(f"fused attention split index {split}, want [0, {FUSED_SPLITS})")
+    return tile * FUSED_SPLITS + split
+
+
+def fused_key_block_plan(
+    keys: int,
+    splits: int,
+    begin: int = 0,
+    end: int | None = None,
+    key_block: int = FUSED_KEY_BLOCK,
+) -> tuple[tuple[int, ...], ...]:
+    """Mirror the persistent kernel's split/wave key-block assignment."""
+    validate_fused_splits(splits)
+    if key_block not in FUSED_KEY_BLOCK_CHOICES:
+        raise ValueError(
+            f"fused attention key block {key_block}, "
+            f"want one of {FUSED_KEY_BLOCK_CHOICES}"
+        )
+    if keys <= 0:
+        raise ValueError(f"fused attention keys {keys}, want > 0")
+    if end is None:
+        end = keys
+    if not 0 <= begin < end <= keys:
+        raise ValueError(
+            f"fused attention key range [{begin}, {end}), want within [0, {keys})"
+        )
+    first_block = begin // key_block
+    last_block = (end + key_block - 1) // key_block
+    stride = splits * WAVES
+    return tuple(
+        tuple(
+            block
+            for block in range(first_block, last_block)
+            if ((block - first_block) % stride) // WAVES == split
+        )
+        for split in range(splits)
+    )
 
 
 def resident_rounds(tasks: int) -> int:

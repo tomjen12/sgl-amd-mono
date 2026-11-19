@@ -10,8 +10,10 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from validation_contract import COSINE_THRESHOLD
+
 LAYERS = 10
-DEFAULT_COSINE = 0.997
+DEFAULT_COSINE = COSINE_THRESHOLD
 
 
 def _minimum_row_cosine(got: torch.Tensor, expected: torch.Tensor) -> float:
@@ -69,7 +71,9 @@ def compare_rank(baseline: dict, mono: dict, threshold: float) -> dict:
 
 
 def compare_directories(
-    baseline_dir: Path, mono_dir: Path, threshold: float
+    baseline_dir: Path,
+    mono_dir: Path,
+    threshold: float = DEFAULT_COSINE,
 ) -> dict:
     baseline_paths = sorted(baseline_dir.glob("rank_*.snapshot.pt"))
     mono_paths = sorted(mono_dir.glob("rank_*.snapshot.pt"))
@@ -96,12 +100,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("baseline_dir", type=Path)
     parser.add_argument("mono_dir", type=Path)
-    parser.add_argument("--threshold", type=float, default=DEFAULT_COSINE)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    result = compare_directories(
-        args.baseline_dir, args.mono_dir, args.threshold
-    )
+    result = compare_directories(args.baseline_dir, args.mono_dir)
     text = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)

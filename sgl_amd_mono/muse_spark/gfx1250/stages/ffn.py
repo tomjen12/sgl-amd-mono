@@ -560,9 +560,16 @@ def stage_expert_quantize(c, pick):
 
 
 @flyc.jit
-def stage_k3_route_compact(c, picks):
-    """Build expert-grouped M64 tiles and a pick-to-compact-row map."""
+def stage_k3_route_compact(c, picks, tile_m):
+    """Build expert-grouped tiles and a pick-to-compact-row map."""
     tid, a = c["tid"], c["args"]
+    max_picks = MAX_TOKENS * TOP_K
+    lds_counts = fx.recast_iter(fx.Int32, c["aux"])
+    lds_i32 = fx.recast_iter(fx.Int32, c["red"])
+    lds_local = lds_i32
+    lds_ordinal = lds_i32 + max_picks
+    scan_a = lds_i32 + 2 * max_picks
+    scan_b = scan_a + LOCAL_EXPERTS
     counts = rsrc(c["route_count"].value)
     tile_bases = rsrc(c["route_tile_base"].value)
     tile_experts = rsrc(c["tile_expert"].value)
@@ -570,55 +577,13 @@ def stage_k3_route_compact(c, picks):
     route_rows = rsrc(c["route_row"].value)
 
     if tid < LOCAL_EXPERTS:
-        count = fx.Int32(0)
-        for pick in range_constexpr(picks):
-            expert = fx.Int32(
-                bo.buffer_load(rsrc(a["ids"]), pick, vec_width=1, dtype=T.i32)
-            )
-            count = count + (expert - a["local_start"] == tid).select(1, 0)
-        bo.buffer_store(count, counts, tid)
+        fx.ptr_store(fx.Int32(0), lds_counts + tid)
     gpu.barrier()
-    fx.memory_fence(syncscope="workgroup", ordering=fx.AtomicOrdering.Acquire)
 
-    if tid < LOCAL_EXPERTS:
-        count = fx.Int32(
-            bo.buffer_load(counts, tid, vec_width=1, dtype=T.i32)
-        )
-        tile_base = fx.Int32(0)
-        for expert in range_constexpr(LOCAL_EXPERTS):
-            if expert < tid:
-                previous = fx.Int32(
-                    bo.buffer_load(counts, expert, vec_width=1, dtype=T.i32)
-                )
-                tile_base = tile_base + (previous + 63) // 64
-        bo.buffer_store(tile_base, tile_bases, tid)
-        expert_tiles = (count + 63) // 64
-        for tile in range_constexpr((MAX_TOKENS * TOP_K + 63) // 64):
-            if tile < expert_tiles:
-                tile_id = tile_base + tile
-                bo.buffer_store(fx.Int32(tid), tile_experts, tile_id)
-                remaining = count - tile * 64
-                bo.buffer_store(
-                    (remaining < 64).select(remaining, fx.Int32(64)),
-                    tile_rows,
-                    tile_id,
-                )
-    gpu.barrier()
-    fx.memory_fence(syncscope="workgroup", ordering=fx.AtomicOrdering.Acquire)
-
-    if tid == 0:
-        total_tiles = fx.Int32(0)
-        for expert in range_constexpr(LOCAL_EXPERTS):
-            count = fx.Int32(
-                bo.buffer_load(counts, expert, vec_width=1, dtype=T.i32)
-            )
-            total_tiles = total_tiles + (count + 63) // 64
-        bo.buffer_store(
-            total_tiles, rsrc(c["tile_count"].value), 0
-        )
-
+    # Load each route once.  One LDS atomic both builds the histogram and
+    # returns this pick's stable ordinal within its local expert.
     for round_id in range_constexpr(
-        (MAX_TOKENS * TOP_K + THREADS - 1) // THREADS
+        (max_picks + THREADS - 1) // THREADS
     ):
         pick = tid + round_id * THREADS
         if pick < picks:
@@ -626,28 +591,76 @@ def stage_k3_route_compact(c, picks):
                 bo.buffer_load(rsrc(a["ids"]), pick, vec_width=1, dtype=T.i32)
             )
             local = expert - a["local_start"]
+            ordinal = fx.Int32(-1)
+            if (local >= 0) & (local < LOCAL_EXPERTS):
+                ordinal = fx.llvm.atomic_add(
+                    lds_counts + local,
+                    fx.Int32(1),
+                    syncscope="workgroup",
+                )
+            fx.ptr_store(local, lds_local + pick)
+            fx.ptr_store(ordinal, lds_ordinal + pick)
+    gpu.barrier()
+
+    # Six parallel scan rounds produce inclusive tile counts for 64 experts.
+    if tid < LOCAL_EXPERTS:
+        count = fx.Int32(fx.ptr_load(lds_counts + tid))
+        bo.buffer_store(count, counts, tid)
+        fx.ptr_store((count + tile_m - 1) // tile_m, scan_a + tid)
+    gpu.barrier()
+    for offset in (1, 2, 4, 8, 16, 32):
+        if tid < LOCAL_EXPERTS:
+            value = fx.Int32(fx.ptr_load(scan_a + tid))
+            if tid >= offset:
+                value = value + fx.Int32(
+                    fx.ptr_load(scan_a + tid - offset)
+                )
+            fx.ptr_store(value, scan_b + tid)
+        gpu.barrier()
+        scan_a, scan_b = scan_b, scan_a
+
+    if tid < LOCAL_EXPERTS:
+        count = fx.Int32(fx.ptr_load(lds_counts + tid))
+        expert_tiles = (count + tile_m - 1) // tile_m
+        tile_base = fx.Int32(fx.ptr_load(scan_a + tid)) - expert_tiles
+        bo.buffer_store(tile_base, tile_bases, tid)
+        for tile in range_constexpr(
+            (max_picks + tile_m - 1) // tile_m
+        ):
+            if tile < expert_tiles:
+                tile_id = tile_base + tile
+                bo.buffer_store(fx.Int32(tid), tile_experts, tile_id)
+                remaining = count - tile * tile_m
+                bo.buffer_store(
+                    (remaining < tile_m).select(
+                        remaining, fx.Int32(tile_m)
+                    ),
+                    tile_rows,
+                    tile_id,
+                )
+    if tid == 0:
+        bo.buffer_store(
+            fx.Int32(fx.ptr_load(scan_a + LOCAL_EXPERTS - 1)),
+            rsrc(c["tile_count"].value),
+            0,
+        )
+    gpu.barrier()
+
+    for round_id in range_constexpr(
+        (max_picks + THREADS - 1) // THREADS
+    ):
+        pick = tid + round_id * THREADS
+        if pick < picks:
+            local = fx.Int32(fx.ptr_load(lds_local + pick))
+            ordinal = fx.Int32(fx.ptr_load(lds_ordinal + pick))
             compact_row = fx.Int32(-1)
             if (local >= 0) & (local < LOCAL_EXPERTS):
-                ordinal = fx.Int32(0)
-                for previous_pick in range_constexpr(picks):
-                    if previous_pick < pick:
-                        previous_expert = fx.Int32(
-                            bo.buffer_load(
-                                rsrc(a["ids"]),
-                                previous_pick,
-                                vec_width=1,
-                                dtype=T.i32,
-                            )
-                        )
-                        ordinal = ordinal + (
-                            previous_expert == expert
-                        ).select(1, 0)
                 tile_base = fx.Int32(
                     bo.buffer_load(
                         tile_bases, local, vec_width=1, dtype=T.i32
                     )
                 )
-                compact_row = tile_base * 64 + ordinal
+                compact_row = tile_base * tile_m + ordinal
             bo.buffer_store(compact_row, route_rows, pick)
     gpu.barrier()
 

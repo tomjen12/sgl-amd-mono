@@ -10,8 +10,10 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from validation_contract import COSINE_THRESHOLD
+
 LAYERS = 5
-DEFAULT_COSINE = 0.997
+DEFAULT_COSINE = COSINE_THRESHOLD
 
 
 def _cosine_min(got: torch.Tensor, expected: torch.Tensor) -> float:
@@ -136,12 +138,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("baseline_dir", type=Path)
     parser.add_argument("mono_dir", type=Path)
-    parser.add_argument("--cosine", type=float, default=DEFAULT_COSINE)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    result = compare_directories(
-        args.baseline_dir, args.mono_dir, threshold=args.cosine
-    )
+    result = compare_directories(args.baseline_dir, args.mono_dir)
     encoded = json.dumps(result, indent=2, sort_keys=True)
     if args.output is not None:
         args.output.write_text(encoded + "\n")

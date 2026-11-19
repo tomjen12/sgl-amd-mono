@@ -462,6 +462,29 @@ def _router_hi_lo(moe, i: int, copies: dict) -> tuple[torch.Tensor, torch.Tensor
     return copies[keys[0]], copies[keys[1]]
 
 
+def _joint_router_pooler_weight(
+    moe, i: int, hi: torch.Tensor, lo: torch.Tensor, copies: dict
+) -> torch.Tensor:
+    """Contiguous BF16 ``[pooler; router_hi; router_lo]`` for the K2 joint GEMM."""
+    packed = getattr(moe, "router_pooler_packed_weight", None)
+    want = (MOE_HIDDEN + 2 * EXPERTS, HIDDEN)
+    if (
+        packed is not None
+        and packed.dtype == torch.bfloat16
+        and tuple(packed.shape) == want
+        and packed.is_contiguous()
+        and moe.pre_expert_proj.weight.data_ptr() == packed.data_ptr()
+    ):
+        return packed
+    key = ("joint router/pooler", i)
+    if key not in copies:
+        with torch.no_grad():
+            copies[key] = torch.cat(
+                [moe.pre_expert_proj.weight.data, hi, lo], dim=0
+            ).contiguous()
+    return copies[key]
+
+
 class LayerViews(msgspec.Struct, frozen=True):
     """Everything the launches read for one decoder layer ``layer_reasons`` accepted."""
 
@@ -479,6 +502,7 @@ class LayerViews(msgspec.Struct, frozen=True):
     gate_lo: torch.Tensor
     bias: torch.Tensor  # fp32 [EXPERTS]
     w_pool: torch.Tensor  # bf16 [MOE_HIDDEN, HIDDEN]
+    w_joint: torch.Tensor  # bf16 [MOE_HIDDEN + 2 EXPERTS, HIDDEN]
     xn_w: torch.Tensor  # bf16 [MOE_HIDDEN]: pre_expert_norm (+1)
     w13: object  # MXFP4 u8 [LOCAL_EXPERTS, 2 INTER, MOE_HIDDEN / 2] or None (bf16 experts)
     s13: object
@@ -532,6 +556,7 @@ class LayerViews(msgspec.Struct, frozen=True):
             layer.post_feedforward_residual_gate, i, "post_feedforward", copies
         )
         hi, lo = _router_hi_lo(moe, i, copies)
+        joint = _joint_router_pooler_weight(moe, i, hi, lo, copies)
         return LayerViews(
             layer_id=i,
             kind=kind,
@@ -551,6 +576,7 @@ class LayerViews(msgspec.Struct, frozen=True):
             gate_lo=lo,
             bias=moe.expert_bias.data,
             w_pool=moe.pre_expert_proj.weight.data,
+            w_joint=joint,
             xn_w=_effective_norm_weight(
                 moe.pre_expert_norm, i, "pre_expert_norm", copies
             ),

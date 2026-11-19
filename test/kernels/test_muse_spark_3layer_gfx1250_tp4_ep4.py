@@ -495,6 +495,7 @@ def _worker(rank, port, queue, rows):
     dist.init_process_group("gloo", rank=rank, world_size=NP)
     device = torch.device("cuda", rank)
     peers = []
+    split_only = os.environ.get("MUSE_TARGET_SPLIT_ONLY") == "1"
     started = time.monotonic()
     try:
         # Establish the small uncached IPC mappings before allocating the
@@ -514,14 +515,16 @@ def _worker(rank, port, queue, rows):
             NP,
             device,
         )
-        fused_peers = PeerBuffer(
-            layer_sym_bytes(NP) + guard.FLAG_BYTES,
-            dist.group.WORLD,
-            rank,
-            NP,
-            device,
-        )
-        peers.extend((split_k2_peers, split_k3_peers, fused_peers))
+        peers.extend((split_k2_peers, split_k3_peers))
+        if not split_only:
+            fused_peers = PeerBuffer(
+                layer_sym_bytes(NP) + guard.FLAG_BYTES,
+                dist.group.WORLD,
+                rank,
+                NP,
+                device,
+            )
+            peers.append(fused_peers)
         for peer in peers:
             peer.bytes.zero_()
         torch.cuda.synchronize()
@@ -608,42 +611,50 @@ def _worker(rank, port, queue, rows):
                 K3Build(tokens=rows, npes=NP, last=True, shuffled=True)
             ),
         }
-        layer_v2 = build_layer(
-            LayerBuild(
-                tokens=rows,
-                q_len=8,
-                npes=NP,
-                next_k1=True,
-                last=False,
-                shuffled=True,
+        if not split_only:
+            layer_v2 = build_layer(
+                LayerBuild(
+                    tokens=rows,
+                    q_len=8,
+                    npes=NP,
+                    next_k1=True,
+                    last=False,
+                    shuffled=True,
+                )
             )
-        )
-        layer_v1_last = build_layer(
-            LayerBuild(
-                tokens=rows,
-                q_len=8,
-                npes=NP,
-                next_k1=False,
-                last=True,
-                shuffled=True,
+            layer_v1_last = build_layer(
+                LayerBuild(
+                    tokens=rows,
+                    q_len=8,
+                    npes=NP,
+                    next_k1=False,
+                    last=True,
+                    shuffled=True,
+                )
             )
-        )
         split_k1_scratch = torch.zeros(
             k1_scratch_bytes(k1_scratch_layout()),
             dtype=torch.uint8,
             device=device,
         )
-        fused_k1_scratch = torch.zeros_like(split_k1_scratch)
+        fused_k1_scratch = (
+            None if split_only else torch.zeros_like(split_k1_scratch)
+        )
         k2_scratch = torch.zeros(
             k2_scratch_bytes(), dtype=torch.uint8, device=device
         )
         k3_scratch = torch.zeros(
             k3_scratch_bytes(), dtype=torch.uint8, device=device
         )
-        fused_scratch = torch.zeros(
-            layer_scratch_bytes(), dtype=torch.uint8, device=device
+        fused_scratch = (
+            None
+            if split_only
+            else torch.zeros(
+                layer_scratch_bytes(), dtype=torch.uint8, device=device
+            )
         )
-        split_epoch, fused_epoch = _epoch(device), _epoch(device)
+        split_epoch = _epoch(device)
+        fused_epoch = None if split_only else _epoch(device)
         oracle_epoch = _epoch(device)
         oracle_k_cache = torch.empty_like(layers[0]["k_initial"])
         oracle_v_cache = torch.empty_like(layers[0]["v_initial"])
@@ -735,6 +746,74 @@ def _worker(rank, port, queue, rows):
             split_stream = outputs["res"].clone()
             split_attn_input = outputs["attn_out"].clone()
             split_epoch[0] += 1
+
+        if split_only:
+            def strict_cosine(got, expected, label):
+                got_rows = got.float().reshape(rows, -1)
+                expected_rows = expected.float().reshape(rows, -1)
+                cosine = torch.nn.functional.cosine_similarity(
+                    got_rows, expected_rows, dim=-1
+                )
+                minimum = cosine.min().item()
+                assert minimum > 0.997, (
+                    f"{label}: minimum per-row cosine {minimum:.6f}, "
+                    "required > 0.997"
+                )
+
+            for layer_offset, (split, oracle) in enumerate(
+                zip(split_layers, oracle_layers)
+            ):
+                layer_index = layer_offset + 1
+                for name, tolerance in (
+                    ("q", 1 / 32),
+                    ("k", 1 / 32),
+                    ("v", 1 / 128),
+                    ("g", 1 / 128),
+                ):
+                    k1_close(
+                        split[name],
+                        oracle[name],
+                        tolerance,
+                        f"split layer {layer_index} {name}",
+                    )
+                assert torch.equal(split["ids"], oracle["ids"])
+                _assert_close(
+                    split["scores"],
+                    oracle["scores"],
+                    1 / 64,
+                    1e-4,
+                    f"rank {rank} split layer {layer_index} scores",
+                )
+                for name in ("o", "xin", "res", "attn_out"):
+                    strict_cosine(
+                        split[name],
+                        oracle[name],
+                        f"rank {rank} split layer {layer_index} {name}",
+                    )
+                torch.testing.assert_close(
+                    split_k_cache[layer_offset].float(),
+                    oracle_k[layer_offset].float(),
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    split_v_cache[layer_offset].float(),
+                    oracle_v[layer_offset].float(),
+                    rtol=0,
+                    atol=0,
+                )
+            strict_cosine(
+                split_layers[-1]["attn_out"],
+                oracle_layers[-1]["attn_out"],
+                "split three-layer final",
+            )
+            errors = split_epoch[
+                guard.ERR_DEADLINE : guard.ERR_FAULT + 1
+            ].tolist()
+            assert errors == [0, 0, 0], f"split guard errors: {errors}"
+            elapsed = time.monotonic() - started
+            queue.put((rank, None, elapsed))
+            return
 
         # Path 3: first K1 stands alone, then V2, V2 and final V1.
         fused_k_cache = [layer["k_initial"].clone() for layer in layers]

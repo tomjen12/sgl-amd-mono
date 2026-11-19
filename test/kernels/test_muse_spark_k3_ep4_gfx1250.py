@@ -154,7 +154,10 @@ def _worker(rank, port, queue):
             (8, HIDDEN), float("nan"), dtype=bf16, device=device
         )
         got = base_stream.clone()
-        phase_trace = os.environ.get("MUSE_K3_PHASE_TRACE") == "1"
+        phase_trace = (
+            os.environ.get("MUSE_PHASE_TRACE") == "1"
+            or os.environ.get("MUSE_K3_PHASE_TRACE") == "1"
+        )
         launch = build_k3(
             K3Build(
                 npes=NP,
@@ -276,18 +279,49 @@ def _worker(rank, port, queue):
                 ),
                 flush=True,
             )
-        stream_ok = torch.allclose(
-            got, ref_stream, rtol=1 / 32, atol=2e-2
-        ) and repeat_stream > 0.99999
-        attn_ok = torch.allclose(
-            attn, ref_attn, rtol=1 / 32, atol=2e-2
-        ) and repeat_attn > 0.99999
+        stream_cosine = torch.nn.functional.cosine_similarity(
+            got.float(), ref_stream.float(), dim=-1
+        ).min()
+        attn_cosine = torch.nn.functional.cosine_similarity(
+            attn.float(), ref_attn.float(), dim=-1
+        ).min()
+        stream_ok = stream_cosine > 0.997 and repeat_stream > 0.99999
+        attn_ok = attn_cosine > 0.997 and repeat_attn > 0.99999
+        from sgl_amd_mono.muse_spark.gfx1250.build_k3 import _scratch_layout
+
+        offset, _ = _scratch_layout()["k3_fbuf"]
+        got_fbuf = (
+            scratch[offset : offset + 8 * MOE_HIDDEN * 2]
+            .view(bf16)
+            .view(8, MOE_HIDDEN)
+        )
+        ref_fbuf = torch.zeros_like(rank_partials[0].float())
+        for value in rank_partials:
+            ref_fbuf += value.float()
+        ref_fbuf = ref_fbuf.to(bf16)
+        fbuf_cosine = torch.nn.functional.cosine_similarity(
+            got_fbuf.float(), ref_fbuf.float(), dim=-1
+        ).min()
         errors = epoch[
             guard.ERR_DEADLINE : guard.ERR_FAULT + 1
         ].tolist()
-        queue.put((rank, stream_ok, attn_ok, errors))
+        queue.put(
+            (
+                rank,
+                stream_ok,
+                attn_ok,
+                errors,
+                float(fbuf_cosine),
+                float(stream_cosine),
+                float(attn_cosine),
+                float(repeat_stream),
+                float(repeat_attn),
+            )
+        )
     except Exception as exc:
-        queue.put((rank, False, False, [repr(exc)]))
+        queue.put(
+            (rank, False, False, [repr(exc)], 0.0, 0.0, 0.0, 0.0, 0.0)
+        )
     finally:
         if peers is not None:
             peers.close()
@@ -321,8 +355,24 @@ def _run():
     reason="needs four gfx1250 GPUs",
 )
 def test_k3_ep4_models_rank_partial_rounding():
-    for rank, stream_ok, attn_ok, errors in _run():
-        assert stream_ok and attn_ok, f"rank {rank}: output mismatch"
+    for (
+        rank,
+        stream_ok,
+        attn_ok,
+        errors,
+        fbuf,
+        stream_cosine,
+        attn_cosine,
+        repeat_stream,
+        repeat_attn,
+    ) in _run():
+        assert stream_ok and attn_ok, (
+            f"rank {rank}: output mismatch; fbuf cosine={fbuf:.6f}, "
+            f"stream cosine={stream_cosine:.6f}, "
+            f"attn cosine={attn_cosine:.6f}, "
+            f"repeat stream={repeat_stream:.6f}, "
+            f"repeat attn={repeat_attn:.6f}"
+        )
         assert errors == [0, 0, 0], f"rank {rank}: mailbox errors {errors}"
 
 

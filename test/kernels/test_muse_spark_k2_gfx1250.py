@@ -92,6 +92,11 @@ def _inputs(device, seed=1252):
     bf = torch.bfloat16
     router = torch.randn(EXPERTS, HIDDEN, device=device) * 0.02
     w_hi = router.to(bf)
+    w_lo = (router - w_hi.float()).to(bf)
+    w_pool = (
+        torch.randn(MOE_HIDDEN, HIDDEN, device=device) * 0.02
+    ).to(bf)
+    joint = torch.cat([w_pool, w_hi, w_lo], dim=0).contiguous()
     return (
         torch.randn(MAX_TOKENS, Q_K, device=device).to(bf),
         torch.randn(MAX_TOKENS, Q_K, device=device).to(bf),
@@ -101,12 +106,11 @@ def _inputs(device, seed=1252):
             "alpha": torch.rand(HIDDEN, device=device) * 0.5 + 0.5,
             "beta": torch.rand(HIDDEN, device=device) * 0.5,
             "pre_w": (1 + 0.1 * torch.randn(HIDDEN, device=device)).to(bf),
-            "w_hi": w_hi,
-            "w_lo": (router - w_hi.float()).to(bf),
+            "w_hi": joint[MOE_HIDDEN : MOE_HIDDEN + EXPERTS],
+            "w_lo": joint[MOE_HIDDEN + EXPERTS :],
             "bias": torch.randn(EXPERTS, device=device) * 0.01,
-            "w_pool": (
-                torch.randn(MOE_HIDDEN, HIDDEN, device=device) * 0.02
-            ).to(bf),
+            "w_pool": joint[:MOE_HIDDEN],
+            "w_joint": joint,
             "xn_w": (1 + 0.1 * torch.randn(MOE_HIDDEN, device=device)).to(bf),
         },
     )
@@ -158,6 +162,8 @@ def test_gfx1250_k2_matches_explicit_reference_for_two_epochs():
             cooperative_rp=os.environ.get("MUSE_K2_COOPERATIVE_RP") == "1",
             aggregate_boundary=os.environ.get("MUSE_K2_AGGREGATE_BOUNDARY") == "1",
             single_boundary_wait=os.environ.get("MUSE_K2_SINGLE_BOUNDARY_WAIT") == "1",
+            lds_x_rp=os.environ.get("MUSE_K2_LDS_X_RP") == "1",
+            joint_rp=os.environ.get("MUSE_K2_JOINT_RP") == "1",
         )
     )
     got = stream.clone()
@@ -180,7 +186,7 @@ def test_gfx1250_k2_matches_explicit_reference_for_two_epochs():
                 o.data_ptr(), g.data_ptr(), got.data_ptr(), w["w_o"].data_ptr(),
                 w["alpha"].data_ptr(), w["beta"].data_ptr(), w["pre_w"].data_ptr(),
                 w["w_hi"].data_ptr(), w["w_lo"].data_ptr(), w["bias"].data_ptr(),
-                w["w_pool"].data_ptr(), w["xn_w"].data_ptr(), ids.data_ptr(),
+                (w["w_joint"] if os.environ.get("MUSE_K2_JOINT_RP") == "1" else w["w_pool"]).data_ptr(), w["xn_w"].data_ptr(), ids.data_ptr(),
                 scores.data_ptr(), 0, 0, xin.data_ptr(), scratch.data_ptr(), peers.local,
                 peers.addresses.data_ptr(), 0, epoch.data_ptr(), LAYER,
                 stream=torch.cuda.current_stream(),
@@ -204,7 +210,7 @@ def test_gfx1250_k2_matches_explicit_reference_for_two_epochs():
             o.data_ptr(), g.data_ptr(), got.data_ptr(), w["w_o"].data_ptr(),
             w["alpha"].data_ptr(), w["beta"].data_ptr(), w["pre_w"].data_ptr(),
             w["w_hi"].data_ptr(), w["w_lo"].data_ptr(), w["bias"].data_ptr(),
-            w["w_pool"].data_ptr(), w["xn_w"].data_ptr(), ids.data_ptr(),
+            (w["w_joint"] if os.environ.get("MUSE_K2_JOINT_RP") == "1" else w["w_pool"]).data_ptr(), w["xn_w"].data_ptr(), ids.data_ptr(),
             scores.data_ptr(), override_ids.data_ptr(), override_scores.data_ptr(),
             xin.data_ptr(), scratch.data_ptr(), peers.local,
             peers.addresses.data_ptr(), 0, epoch.data_ptr(), LAYER,

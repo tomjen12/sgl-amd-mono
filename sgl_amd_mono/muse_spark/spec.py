@@ -20,9 +20,11 @@ launch's input and logs each layer's rel / cosine on the live rows.
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import math
 import os
+from pathlib import Path
 
 import torch
 
@@ -268,6 +270,7 @@ class _Built:
         self.lm, self.model, self.runner = lm, lm.model.language_model, runner
         self.original = original  # the model class's own forward, for media batches
         self.check = os.environ.get("SGLANG_AMD_MONO_CHECK", "0") == "1"
+        self.phase_output = os.environ.get("MUSE_PHASE_TRACE_OUTPUT")
 
     def forward(
         self,
@@ -308,6 +311,7 @@ class _Built:
         aux, last = [], len(m.layers) - 1
         check = self.check and not torch.cuda.is_current_stream_capturing()
         live = forward_batch.out_cache_loc[:rows] > 0 if check else None
+        phase_records = []
         for i in range(len(m.layers)):
             pre_norm_dtype = torch.bfloat16 if i == last else None
             ref = self._reference(i, positions, forward_batch, stream, attn_input, pre_norm_dtype) if check else None  # fmt: skip
@@ -317,6 +321,8 @@ class _Built:
                 i=i, rows=rows, q_len=q_len, positions=positions, forward_batch=forward_batch,
                 stream=stream, attn_input=attn_input, pre_norm_dtype=pre_norm_dtype,
             )  # fmt: skip
+            if self.phase_output and r.views[i].kind == "mxfp4":
+                phase_records.extend(r.phase_records(i, rows))
             if ref is not None:
                 # Captured inside runner after any standalone K1 and before the
                 # fused layer can reuse the Q buffer for next-K1.
@@ -356,18 +362,28 @@ class _Built:
                         self._reference_stages.get("k3_y"),
                         self._reference_stages.get("k3_rows"),
                     )
-                    _log_pick_stage_check(
-                        i,
-                        live,
-                        "k3_qmid",
-                        layer_debug["k3_qmid"],
-                        self._reference_stages.get("k3_qmid"),
-                        self._reference_stages.get("k3_rows"),
-                    )
+                    if layer_debug["k3_qmid"] is not None:
+                        _log_pick_stage_check(
+                            i,
+                            live,
+                            "k3_qmid",
+                            layer_debug["k3_qmid"],
+                            self._reference_stages.get("k3_qmid"),
+                            self._reference_stages.get("k3_rows"),
+                        )
                 self._attn_check(i, rows, q_len, forward_batch, q_i)
             if i in m.layers_to_capture:  # set after attach: read per step
                 aux.append(stream.to(torch.bfloat16))
         r.end_step()
+        if self.phase_output:
+            output_dir = Path(self.phase_output)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output = output_dir / f"target.rank_{r.rank:04d}.phases.json"
+            temporary = output.with_suffix(".json.tmp")
+            temporary.write_text(
+                json.dumps({"records": phase_records}, sort_keys=True) + "\n"
+            )
+            temporary.replace(output)
         return attn_input, (aux if self.lm.capture_aux_hidden_states else None)
 
     def _attn_check(self, i, rows, q_len, forward_batch, q_i):

@@ -390,8 +390,10 @@ def build_layer(key: LayerBuild):
                         "mb": mb,
                         "wave_stats": lds.attn.wave_stats.ptr,
                         "row_stats": lds.attn.row_stats.ptr,
-                        "probabilities": lds.attn.probabilities.ptr,
+                        "q": lds.attn.q.ptr,
+                        "probabilities": lds.attn.q.ptr,
                         "pv": lds.attn.pv.ptr,
+                        "kv": lds.attn.kv.ptr,
                         **attn_regions,
                         "args": attn_args,
                     }

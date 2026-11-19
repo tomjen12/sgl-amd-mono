@@ -1,5 +1,7 @@
 """gfx1250 TP4 variable-width K-attn against exact paged-cache attention."""
 
+import json
+import os
 import struct
 
 import pytest
@@ -109,25 +111,165 @@ def test_gfx1250_kattn_matches_paged_attention(width, keys, window, zero_q):
         tiled_kattn_scratch_bytes(), dtype=torch.uint8, device=device
     )
     epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
+    phase_trace = os.environ.get("MUSE_PHASE_TRACE") == "1"
+    splits = int(os.environ.get("MUSE_KATTN_TEST_SPLITS", "6"))
+    fp8_wmma = os.environ.get("MUSE_KATTN_FP8_WMMA") == "1"
+    register_probability = (
+        os.environ.get("MUSE_KATTN_REGISTER_PROBABILITY", "1") == "1"
+    )
+    stage_q = (
+        os.environ.get("MUSE_KATTN_STAGE_Q", "1") == "1"
+        and not fp8_wmma
+        and register_probability
+    )
+    key_block = int(os.environ.get("MUSE_KATTN_KEY_BLOCK", "32"))
+    load_bits = int(os.environ.get("MUSE_KATTN_LOAD_BITS", "64"))
     launch = build_tiled_kattn(
-        KAttnBuild(tokens=width, q_len=DRAFT_TOKENS)
+        KAttnBuild(
+            tokens=width,
+            q_len=DRAFT_TOKENS,
+            phase_trace=phase_trace,
+            splits=splits,
+            fp8_wmma=fp8_wmma,
+            register_probability=register_probability,
+            stage_q=stage_q,
+            key_block=key_block,
+            load_bits=load_bits,
+        )
     )
-    launch(
-        q.data_ptr(),
-        out.data_ptr(),
-        k_cache.data_ptr(),
-        v_cache.data_ptr(),
-        table.data_ptr(),
-        table.stride(0),
-        prefix_lens.data_ptr(),
-        window,
-        scale_bits,
-        scratch.data_ptr(),
-        epoch.data_ptr(),
-        0,
-        stream=torch.cuda.current_stream(),
-    )
+
+    def invoke(candidate, iteration):
+        candidate(
+            q.data_ptr(),
+            out.data_ptr(),
+            k_cache.data_ptr(),
+            v_cache.data_ptr(),
+            table.data_ptr(),
+            table.stride(0),
+            prefix_lens.data_ptr(),
+            window,
+            scale_bits,
+            scratch.data_ptr(),
+            epoch.data_ptr(),
+            iteration,
+            stream=torch.cuda.current_stream(),
+        )
+
+    invoke(launch, 0)
     torch.cuda.synchronize()
+    bench_iters = int(os.environ.get("MUSE_KATTN_BENCH_ITERS", "0"))
+    bench_warmup = int(os.environ.get("MUSE_KATTN_BENCH_WARMUP", "0"))
+    ab_rounds = int(os.environ.get("MUSE_KATTN_STAGE_Q_AB_ROUNDS", "0"))
+    if ab_rounds:
+        candidates = [
+            (
+                enabled,
+                build_tiled_kattn(
+                    KAttnBuild(
+                        tokens=width,
+                        q_len=DRAFT_TOKENS,
+                        phase_trace=False,
+                        splits=splits,
+                        fp8_wmma=False,
+                        register_probability=True,
+                        stage_q=enabled,
+                    )
+                ),
+            )
+            for enabled in (False, True)
+        ]
+        for _, candidate in candidates:
+            invoke(candidate, 1)
+        torch.cuda.synchronize()
+        for trial in range(ab_rounds):
+            for enabled, candidate in candidates:
+                start = torch.cuda.Event(enable_timing=True)
+                stop = torch.cuda.Event(enable_timing=True)
+                start.record()
+                for iteration in range(bench_iters):
+                    invoke(candidate, trial * bench_iters + iteration + 2)
+                stop.record()
+                stop.synchronize()
+                print(
+                    f"KATTN_STAGE_Q_AB_US="
+                    f"{start.elapsed_time(stop) * 1000 / bench_iters:.3f} "
+                    f"trial={trial + 1} stage_q={int(enabled)} "
+                    f"keys={keys} window={window}",
+                    flush=True,
+                )
+    if bench_iters and not ab_rounds:
+        for iteration in range(bench_warmup):
+            invoke(launch, iteration + 1)
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        stop = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for iteration in range(bench_iters):
+            invoke(launch, bench_warmup + iteration + 1)
+        stop.record()
+        stop.synchronize()
+        print(
+            f"KATTN_BENCH_US={start.elapsed_time(stop) * 1000 / bench_iters:.3f} "
+            f"splits={splits} keys={keys} window={window} fp8={int(fp8_wmma)} "
+            f"register_probability={int(register_probability)} "
+            f"stage_q={int(stage_q)} bn={key_block} load_bits={load_bits}",
+            flush=True,
+        )
+    if phase_trace:
+        from sgl_amd_mono.muse_spark.gfx1250.layer import _tiled_kattn_layout
+        from sgl_amd_mono.muse_spark.gfx1250.layout import (
+            FUSED_SPLITS,
+            fused_tasks,
+        )
+
+        offset, _ = _tiled_kattn_layout()["attn_phase_ticks"]
+        tasks = fused_tasks(width, splits)
+        tiles = tasks // splits
+        task_ids = [
+            tile * FUSED_SPLITS + split
+            for tile in range(tiles)
+            for split in range(splits)
+        ]
+        max_task = task_ids[-1] + 1
+        words = (
+            scratch[offset : offset + max_task * 8 * 8]
+            .view(torch.int64)
+            .view(max_task, 8)[task_ids]
+        )
+        ticks = words[:, :6]
+        deltas = ticks[:, 1:] - ticks[:, :-1]
+        split_zero = deltas[::splits]
+        assert torch.all(ticks[:, 1:] >= ticks[:, :-1])
+        assert torch.all(ticks[:, -1] > ticks[:, 0])
+        print(
+            "KATTN_PHASE_TICKS="
+            + json.dumps(
+                {
+                    "width": width,
+                    "keys": keys,
+                    "window": window,
+                    "points": [
+                        "start",
+                        "online_qk_softmax_pv",
+                        "global_stats",
+                        "reserved",
+                        "partial_publish",
+                        "output",
+                    ],
+                    "delta_means": (
+                        deltas.float().mean(dim=0).cpu().tolist()
+                    ),
+                    "split0_delta_means": (
+                        split_zero.float().mean(dim=0).cpu().tolist()
+                    ),
+                    "split0_span_mean": split_zero.sum(dim=1).float().mean().item(),
+                    "split0_span_max": split_zero.sum(dim=1).max().item(),
+                    "qk_softmax_mean": words[:, 6].float().mean().item(),
+                    "pv_mean": words[:, 7].float().mean().item(),
+                }
+            ),
+            flush=True,
+        )
 
     reference = _reference(
         q, k_cache, v_cache, table, keys, DRAFT_TOKENS, window, SOFTMAX_SCALE
@@ -137,12 +279,18 @@ def test_gfx1250_kattn_matches_paged_attention(width, keys, window, zero_q):
     error = (got - reference).abs()
     tolerance = reference.abs() * (1 / 32) + 2e-2
     bad = (error > tolerance).float().mean().item()
-    assert bad == 0.0, (
-        f"{bad:.2%} outputs exceed tolerance; max error {error.max().item():.4f}"
-    )
     cosine = torch.nn.functional.cosine_similarity(
         got.reshape(width, -1, HEAD_DIM),
         reference.reshape(width, -1, HEAD_DIM),
         dim=-1,
+    )
+    print(
+        f"KATTN_ACCURACY max_error={error.max().item():.6f} "
+        f"mean_error={error.mean().item():.6f} "
+        f"min_cosine={cosine.min().item():.9f} fp8={int(fp8_wmma)}",
+        flush=True,
+    )
+    assert bad == 0.0, (
+        f"{bad:.2%} outputs exceed tolerance; max error {error.max().item():.4f}"
     )
     assert cosine.min().item() > 0.999, f"least head cosine {cosine.min().item():.6f}"

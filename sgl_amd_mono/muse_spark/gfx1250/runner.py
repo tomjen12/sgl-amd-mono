@@ -42,8 +42,10 @@ from sgl_amd_mono.muse_spark.gfx1250.config import (
     WIDTHS,
 )
 from sgl_amd_mono.muse_spark.gfx1250.layout import (
+    FUSED_SPLITS,
     k1_scratch_layout,
     scratch_bytes,
+    validate_fused_splits,
 )
 from sgl_amd_mono.muse_spark.gfx1250.layer import tiled_kattn_scratch_bytes
 
@@ -52,10 +54,23 @@ USE_KERNELS = os.environ.get("SGLANG_AMD_MONO_MUSE_KERNELS", "1") == "1"
 # The fused layer remains the default. Replay can select the exact standalone
 # K1 -> K-attn -> K2 -> K3 chain used by the TP4 kernel tests.
 USE_LAYER = os.environ.get("SGLANG_AMD_MONO_MUSE_LAYER", "1") == "1"
+# Compile-time opt-in instrumentation.  The flag participates in each build
+# key/symbol so graph capture never reuses an untraced variant (or vice versa).
+PHASE_TRACE = os.environ.get("MUSE_PHASE_TRACE", "0") == "1"
 # Experimental standalone K3 path: inline AITER's TDM Gate/Up and Down tasks
 # while retaining one persistent K3 launch. GPU runtime remains opt-in until
 # the dedicated correctness gate passes.
 USE_K3_TDM = os.environ.get("SGLANG_AMD_MONO_MUSE_K3_TDM", "0") == "1"
+# Experimental packed Pooler/Router K2 path.  It remains opt-in until the
+# TP1/TP4 and strict replay gates pass.
+USE_K2_JOINT_RP = (
+    os.environ.get("SGLANG_AMD_MONO_MUSE_K2_JOINT_RP", "0") == "1"
+)
+# Opt-in compile-time specialization for standalone sliding-window attention.
+# Full attention and the scratch ABI remain fixed at the max-six layout.
+WINDOW_KATTN_SPLITS = validate_fused_splits(
+    int(os.environ.get("SGLANG_AMD_MONO_MUSE_KATTN_WINDOW_SPLITS", FUSED_SPLITS))
+)
 
 # SGLang classes imported lazily by cache validation and page-table binding.
 SGLANG_READS = {
@@ -202,6 +217,110 @@ class MuseMonoRunner:
         )
         self.epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
 
+    def phase_records(self, layer: int, rows: int) -> list[dict]:
+        """Copy one split layer's opt-in phase timelines to versioned records."""
+        if not PHASE_TRACE:
+            raise RuntimeError("phase records requested without MUSE_PHASE_TRACE=1")
+        if self.use_layer:
+            raise RuntimeError("phase tracing requires the Target split kernel mode")
+
+        from sgl_amd_mono.muse_spark.gfx1250.build_k2 import (
+            K2_PHASE_POINTS,
+            k2_scratch_layout,
+        )
+        from sgl_amd_mono.muse_spark.gfx1250.build_k3 import (
+            _scratch_layout as k3_scratch_layout,
+        )
+        from sgl_amd_mono.muse_spark.gfx1250.layer import _tiled_kattn_layout
+        from sgl_amd_mono.muse_spark.gfx1250.layout import (
+            fused_tasks,
+            k1_scratch_layout,
+        )
+        from sgl_amd_mono.muse_spark.gfx1250.phase_trace import (
+            ABI_VERSION,
+            MAGIC,
+            phase_ids,
+        )
+        from sgl_amd_mono.muse_spark.gfx1250.stages.attention import (
+            FUSED_TRACE_WORDS,
+        )
+
+        def ticks(buffer, offset, task_ids, stride, points):
+            end = offset + (max(task_ids) + 1) * stride * 8
+            words = (
+                buffer[offset:end]
+                .view(torch.int64)
+                .view(-1, stride)[task_ids, :points]
+                .cpu()
+                .tolist()
+            )
+            return words
+
+        kattn_splits = self._kattn_splits(layer)
+        kattn_task_ids = [
+            tile * FUSED_SPLITS + split
+            for tile in range(fused_tasks(rows, kattn_splits) // kattn_splits)
+            for split in range(kattn_splits)
+        ]
+
+        layouts = (
+            (
+                "K1",
+                self.scratch_k1,
+                k1_scratch_layout()["k1_phase_ticks"][0],
+                list(range(RESIDENT_BLOCKS)),
+                3,
+            ),
+            (
+                "K-attn",
+                self.scratch_kattn,
+                _tiled_kattn_layout()["attn_phase_ticks"][0],
+                kattn_task_ids,
+                FUSED_TRACE_WORDS,
+            ),
+            (
+                "K2",
+                self.scratch_k2,
+                k2_scratch_layout()["k2_phase_ticks"][0],
+                list(range(RESIDENT_BLOCKS)),
+                K2_PHASE_POINTS,
+            ),
+            (
+                "K3",
+                self.scratch_k3,
+                k3_scratch_layout()["k3_phase_ticks"][0],
+                list(range(rows)),
+                7,
+            ),
+        )
+        records = []
+        clock_hz = float(
+            os.environ.get(
+                "MUSE_PHASE_CLOCK_HZ",
+                torch.cuda.get_device_properties(self.device).clock_rate * 1000,
+            )
+        )
+        for family, buffer, offset, task_ids, stride in layouts:
+            points = phase_ids(family)
+            for task, values in zip(
+                task_ids,
+                ticks(buffer, offset, task_ids, stride, len(points)),
+            ):
+                records.append(
+                    {
+                        "magic": MAGIC,
+                        "abi_version": ABI_VERSION,
+                        "family": family,
+                        "phase_ids": list(points),
+                        "rank": self.rank,
+                        "layer": layer,
+                        "task": task,
+                        "ticks": values,
+                        "clock_hz": clock_hz,
+                    }
+                )
+        return records
+
     def attention_debug(self, rows: int):
         """Views of the most recent fused-attention intermediates.
 
@@ -237,6 +356,60 @@ class MuseMonoRunner:
 
     def layer_debug(self, rows: int):
         """Views of K2 outputs that remain live after the fused layer."""
+        if not self.use_layer:
+            from sgl_amd_mono.muse_spark.gfx1250.build_k2 import (
+                k2_scratch_layout,
+            )
+            from sgl_amd_mono.muse_spark.gfx1250.build_k3 import (
+                _scratch_layout as k3_scratch_layout,
+            )
+
+            k2_layout = k2_scratch_layout()
+            k3_layout = k3_scratch_layout()
+
+            def split_bf16(buffer, layout, name, columns):
+                offset, _ = layout[name]
+                count = rows * columns
+                return buffer[offset : offset + count * 2].view(
+                    torch.bfloat16
+                ).view(rows, columns)
+
+            return {
+                "k2_x": split_bf16(
+                    self.scratch_k2, k2_layout, "k2_x", HIDDEN
+                ),
+                "k2_pool": split_bf16(
+                    self.scratch_k2, k2_layout, "k2_pool", MOE_HIDDEN
+                ),
+                # Compact TDM qmid is expert-grouped MXFP8 plus a separate
+                # shuffled scale plane, not the legacy pick-major BF16 layout.
+                "k3_qmid": (
+                    None
+                    if USE_K3_TDM
+                    else split_bf16(
+                        self.scratch_k3,
+                        k3_layout,
+                        "k3_qmid",
+                        TOP_K * MOE_HIDDEN,
+                    ).view(rows * TOP_K, MOE_HIDDEN)
+                ),
+                "k3_y": split_bf16(
+                    self.scratch_k3,
+                    k3_layout,
+                    "k3_y",
+                    TOP_K * MOE_HIDDEN,
+                ).view(rows * TOP_K, MOE_HIDDEN),
+                "k3_fbuf": split_bf16(
+                    self.scratch_k3, k3_layout, "k3_fbuf", MOE_HIDDEN
+                ),
+                "k3_branch": split_bf16(
+                    self.scratch_k3, k3_layout, "k3_branch", HIDDEN
+                ),
+                "xin": self.xin[:rows],
+                "ids": self.ids[:rows],
+                "scores": self.scores[:rows],
+            }
+
         from sgl_amd_mono.muse_spark.gfx1250.build_layer import _private_layout
 
         layout = _private_layout()
@@ -274,6 +447,7 @@ class MuseMonoRunner:
                     tokens=rows,
                     fault_site=self.fault_site,
                     fault_after=self.fault_after,
+                    phase_trace=PHASE_TRACE,
                 )
             )
         return self._k1[rows]
@@ -303,8 +477,9 @@ class MuseMonoRunner:
             )
         return self._layer[key]
 
-    def kattn_kernel(self, rows: int, q_len: int):
-        key = rows, q_len
+    def kattn_kernel(self, rows: int, q_len: int, splits: int = FUSED_SPLITS):
+        validate_fused_splits(splits)
+        key = rows, q_len, splits
         if key not in self._kattn:
             from sgl_amd_mono.muse_spark.gfx1250.layer import (
                 KAttnBuild,
@@ -313,9 +488,21 @@ class MuseMonoRunner:
 
             no_capture("K-attn first reached")
             self._kattn[key] = build_tiled_kattn(
-                KAttnBuild(tokens=rows, q_len=q_len)
+                KAttnBuild(
+                    tokens=rows,
+                    q_len=q_len,
+                    phase_trace=PHASE_TRACE,
+                    splits=splits,
+                )
             )
         return self._kattn[key]
+
+    def _kattn_splits(self, index: int) -> int:
+        return (
+            WINDOW_KATTN_SPLITS
+            if self.windows is not None and self.windows[index] > 0
+            else FUSED_SPLITS
+        )
 
     def k2_kernel(self, rows: int):
         if rows not in self._k2:
@@ -328,6 +515,8 @@ class MuseMonoRunner:
                     npes=self.npes,
                     fault_site=self.fault_site,
                     fault_after=self.fault_after,
+                    joint_rp=USE_K2_JOINT_RP,
+                    phase_trace=PHASE_TRACE,
                 )
             )
         return self._k2[rows]
@@ -346,6 +535,7 @@ class MuseMonoRunner:
                     shuffled=shuffled,
                     fault_site=self.fault_site,
                     fault_after=self.fault_after,
+                    phase_trace=PHASE_TRACE,
                     unpool_profile_mode=int(
                         os.environ.get("MUSE_K3_UNPOOL_PROFILE_MODE", "2")
                     ),
@@ -418,7 +608,11 @@ class MuseMonoRunner:
                     self.layer_kernel(rows, q_len, next_k1, last, shuffled)
                 )
         else:
-            compile_only(self.kattn_kernel(rows, q_len))
+            for splits in {
+                self._kattn_splits(i)
+                for i, _view in eligible
+            }:
+                compile_only(self.kattn_kernel(rows, q_len, splits))
             compile_only(self.k2_kernel(rows))
             for last, shuffled in {
                 (i == len(self.views) - 1, view.shuffled)
@@ -702,7 +896,7 @@ class MuseMonoRunner:
         )
         if not self.use_layer:
             peers_k2, peers_k3 = self.peers_k2, self.peers_k3
-            self.kattn_kernel(rows, q_len)(
+            self.kattn_kernel(rows, q_len, self._kattn_splits(i))(
                 _ptr(self.q),
                 _ptr(self.o),
                 k_cache,
@@ -728,7 +922,7 @@ class MuseMonoRunner:
                 _ptr(view.gate_hi),
                 _ptr(view.gate_lo),
                 _ptr(view.bias),
-                _ptr(view.w_pool),
+                _ptr(view.w_joint if USE_K2_JOINT_RP else view.w_pool),
                 _ptr(view.xn_w),
                 _ptr(self.ids),
                 _ptr(self.scores),
@@ -798,7 +992,7 @@ class MuseMonoRunner:
             _ptr(view.gate_hi),
             _ptr(view.gate_lo),
             _ptr(view.bias),
-            _ptr(view.w_pool),
+            _ptr(view.w_joint if USE_K2_JOINT_RP else view.w_pool),
             _ptr(view.xn_w),
             _ptr(self.ids),
             _ptr(self.scores),

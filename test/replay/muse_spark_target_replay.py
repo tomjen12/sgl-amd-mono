@@ -638,6 +638,9 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
             "1" if args.target_kernel_mode == "layer" else "0"
         )
         os.environ["SGLANG_AMD_MONO_CHECK"] = "1" if args.check else "0"
+        os.environ["MUSE_PHASE_TRACE"] = "1" if args.phase_dir else "0"
+        if args.phase_dir:
+            os.environ["MUSE_PHASE_TRACE_OUTPUT"] = str(Path(args.phase_dir).resolve())
         if args.attn_dump_dir is not None:
             os.environ["SGLANG_AMD_MONO_ATTN_DUMP"] = args.attn_dump_dir
         if args.check:
@@ -1105,6 +1108,10 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--trace-dir")
+    parser.add_argument(
+        "--phase-dir",
+        help="Write versioned K1/K-attn/K2/K3 phase artifacts for Mono split replay.",
+    )
     parser.add_argument("--snapshot-dir")
     parser.add_argument("--routing-snapshot-dir")
     parser.add_argument("--output")
@@ -1212,6 +1219,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.mode != "mono" and args.target_kernel_mode != "layer":
         raise SystemExit("--target-kernel-mode split requires --mode mono.")
+    if args.phase_dir and (
+        args.mode != "mono" or args.target_kernel_mode != "split"
+    ):
+        raise SystemExit("--phase-dir requires --mode mono --target-kernel-mode split.")
     if args.cuda_graph and (
         args.snapshot_dir is not None
         or args.check

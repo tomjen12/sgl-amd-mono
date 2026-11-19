@@ -15,6 +15,7 @@ from sgl_amd_mono.common.ops import (
     hw_exp2,
     hw_rsq,
     rsrc,
+    xshfl,
 )
 from sgl_amd_mono.muse_spark.gfx1250.config import (
     EXPERTS,
@@ -38,6 +39,12 @@ ROWS = 16
 WMMA_K = 32
 WMMA_ACC = 8
 RED_FLOATS = WAVES * 32 * WMMA_ACC
+RP_X_ROWS = 8
+RP_X_TILE_K = 1024
+RP_X_PAIRS = RP_X_ROWS * RP_X_TILE_K // 2
+JOINT_ROWS = MOE_HIDDEN + 2 * EXPERTS
+JOINT_WAVES = 4
+JOINT_TASKS = JOINT_ROWS // (ROWS * JOINT_WAVES)
 
 
 def _bf(ptr, element):
@@ -296,29 +303,95 @@ def stage_boundary(c):
 @flyc.jit
 def stage_router_pool(c):
     """Eight full-K router/pooler tiles per CTA, one per wave."""
-    lane, wave = c["lane"], c["wave"]
+    tid, lane, wave = c["tid"], c["lane"], c["wave"]
     r_x, r_w0 = rsrc(c["x"]), rsrc(c["w0"])
     r_w1 = rsrc(c["w1"]) if c["router"] else r_w0
+    lds_x = c.get("lds_x", False)
     tile = c["bid"] * WAVES + wave
     row0 = tile * ROWS
     row = row0 + lane % ROWS
     for token0 in range_constexpr((c["S"] + ROWS - 1) // ROWS):
-        token = fx.min(token0 * ROWS + lane % ROWS, c["S"] - 1)
         vacc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
-        for step in range_constexpr(HIDDEN // WMMA_K):
-            k0 = step * WMMA_K
-            x = _fragment(r_x, token * HIDDEN, k0, lane)
-            vacc = _wmma(
-                _fragment(r_w0, row * HIDDEN, k0, lane, cache_modifier=2),
-                x,
-                vacc,
-            )
-            if c["router"]:
+        if lds_x:
+            # All eight waves consume the same activation tile. Stage it once
+            # per CTA and reuse it across the eight independent output tiles.
+            for chunk in range_constexpr(HIDDEN // RP_X_TILE_K):
+                for p in range_constexpr(RP_X_PAIRS // THREADS):
+                    pair = tid + p * THREADS
+                    local_token = pair // (RP_X_TILE_K // 2)
+                    k_pair = pair % (RP_X_TILE_K // 2)
+                    token = fx.min(
+                        token0 * ROWS + local_token, c["S"] - 1
+                    )
+                    word = fx.Int32(
+                        bo.buffer_load(
+                            r_x,
+                            (
+                                token * HIDDEN
+                                + chunk * RP_X_TILE_K
+                            )
+                            // 2
+                            + k_pair,
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    )
+                    fx.ptr_store(
+                        word.bitcast(fx.Float32), c["x_lds"] + pair
+                    )
+                gpu.barrier()
+                for inner in range_constexpr(RP_X_TILE_K // WMMA_K):
+                    k0 = chunk * RP_X_TILE_K + inner * WMMA_K
+                    x = _lds_fragment(
+                        c["x_lds"],
+                        fx.min(lane % ROWS, c["S"] - 1) * RP_X_TILE_K,
+                        inner * WMMA_K,
+                        lane,
+                    )
+                    vacc = _wmma(
+                        _fragment(
+                            r_w0,
+                            row * HIDDEN,
+                            k0,
+                            lane,
+                            cache_modifier=2,
+                        ),
+                        x,
+                        vacc,
+                    )
+                    if c["router"]:
+                        vacc = _wmma(
+                            _fragment(
+                                r_w1,
+                                row * HIDDEN,
+                                k0,
+                                lane,
+                                cache_modifier=2,
+                            ),
+                            x,
+                            vacc,
+                        )
+                gpu.barrier()
+        else:
+            token = fx.min(token0 * ROWS + lane % ROWS, c["S"] - 1)
+            for step in range_constexpr(HIDDEN // WMMA_K):
+                k0 = step * WMMA_K
+                x = _fragment(r_x, token * HIDDEN, k0, lane)
                 vacc = _wmma(
-                    _fragment(r_w1, row * HIDDEN, k0, lane, cache_modifier=2),
+                    _fragment(
+                        r_w0, row * HIDDEN, k0, lane, cache_modifier=2
+                    ),
                     x,
                     vacc,
                 )
+                if c["router"]:
+                    vacc = _wmma(
+                        _fragment(
+                            r_w1, row * HIDDEN, k0, lane, cache_modifier=2
+                        ),
+                        x,
+                        vacc,
+                    )
         fx.ptr_store(vacc, c["red"] + (wave * 32 + lane) * WMMA_ACC)
         gpu.barrier()
         batch = min(ROWS, c["S"] - token0 * ROWS)
@@ -414,6 +487,117 @@ def stage_router_pool_cooperative(c):
 
 
 @flyc.jit
+def stage_joint_router_pool(c):
+    """Packed Pooler/Router GEMM; four N16 tiles per persistent CTA.
+
+    This first joint-path implementation establishes the production packed
+    weight/output ABI and spreads 72 tasks across the 96-CU persistent grid.
+    Its global-load mainloop is intentionally isolated behind an opt-in key so
+    it can be replaced by the six-buffer TDM mainloop without changing ABI.
+    """
+    tid, lane, wave = c["tid"], c["lane"], c["wave"]
+    if wave < JOINT_WAVES:
+        tile = c["task"] * JOINT_WAVES + wave
+        row0 = tile * ROWS
+        row = row0 + lane % ROWS
+        token = fx.min(lane % ROWS, c["S"] - 1)
+        acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+        r_x, r_w = rsrc(c["x"]), rsrc(c["w_joint"])
+        for step in range_constexpr(HIDDEN // WMMA_K):
+            k0 = step * WMMA_K
+            acc = _wmma(
+                _fragment(r_w, row * HIDDEN, k0, lane, cache_modifier=2),
+                _fragment(r_x, token * HIDDEN, k0, lane),
+                acc,
+            )
+        fx.ptr_store(acc, c["red"] + (wave * 32 + lane) * WMMA_ACC)
+    gpu.barrier()
+    count = c["S"] * JOINT_WAVES * ROWS
+    # Joint mode is currently build-time restricted to width 8: 512 values.
+    for p in range_constexpr(2):
+        out = tid + p * THREADS
+        if out < count:
+            tile_wave = out // (c["S"] * ROWS)
+            within = out % (c["S"] * ROWS)
+            token, dim = within // ROWS, within % ROWS
+            row = (c["task"] * JOINT_WAVES + tile_wave) * ROWS + dim
+            bo.buffer_store(
+                _wave_value(c["red"], tile_wave, dim, token),
+                rsrc(c["out"]),
+                token * JOINT_ROWS + row,
+            )
+    gpu.barrier()
+
+
+@flyc.jit
+def stage_joint_top8(c):
+    """Barrier-free stable Top-8: one wave owns one token."""
+    lane, wave, token = c["lane"], c["wave"], c["bid"]
+    if wave == 0:
+        joint_base = token * JOINT_ROWS + MOE_HIDDEN
+        raw, biased = [], []
+        for q in range_constexpr(EXPERTS // 32):
+            expert = lane + q * 32
+            logit = _f32(c["joint"], joint_base + expert) + _f32(
+                c["joint"], joint_base + EXPERTS + expert
+            )
+            score = _sigmoid(logit * fx.Float32(ROUTER_MULT))
+            raw.append(score)
+            biased.append(score + _f32(c["bias"], expert))
+
+        selected_ids, selected_scores = [], []
+        for pick in range_constexpr(TOP_K):
+            best = fx.Float32(-1.0e30)
+            best_id = fx.Int32(EXPERTS)
+            for q in range_constexpr(EXPERTS // 32):
+                expert = fx.Int32(lane + q * 32)
+                used = fx.Int32(0)
+                for previous in range_constexpr(pick):
+                    used = used | fx.Int32(expert == selected_ids[previous])
+                candidate = (used == 0).select(
+                    biased[q], fx.Float32(-1.0e30)
+                )
+                take = (candidate > best) | (
+                    (candidate == best) & (expert < best_id)
+                )
+                best = take.select(candidate, best)
+                best_id = take.select(expert, best_id)
+            for offset in (16, 8, 4, 2, 1):
+                other = xshfl(best, offset)
+                other_id = xshfl(best_id, offset)
+                take = (other > best) | (
+                    (other == best) & (other_id < best_id)
+                )
+                best = take.select(other, best)
+                best_id = take.select(other_id, best_id)
+            selected_ids.append(best_id)
+            chosen = _f32(c["joint"], joint_base + best_id) + _f32(
+                c["joint"], joint_base + EXPERTS + best_id
+            )
+            selected_scores.append(
+                _sigmoid(chosen * fx.Float32(ROUTER_MULT))
+            )
+
+        if lane == 0:
+            denom = fx.Float32(0.0)
+            for pick in range_constexpr(TOP_K):
+                denom = denom + selected_scores[pick]
+            for pick in range_constexpr(TOP_K):
+                bo.buffer_store(
+                    selected_ids[pick],
+                    rsrc(c["ids"]),
+                    token * TOP_K + pick,
+                )
+                bo.buffer_store(
+                    selected_scores[pick]
+                    / (denom + fx.Float32(ROUTE_EPS))
+                    * fx.Float32(ROUTE_SCALE),
+                    rsrc(c["scores"]),
+                    token * TOP_K + pick,
+                )
+
+
+@flyc.jit
 def stage_top8(c):
     """Stable parallel repeated argmax, preserving the lower-id tie rule."""
     tid, token = c["tid"], c["bid"]
@@ -497,6 +681,32 @@ def stage_pooled_norm(c):
         e = 2 * (tid + j * THREADS)
         v0 = _bf(c["pool"], token * MOE_HIDDEN + e)
         v1 = _bf(c["pool"], token * MOE_HIDDEN + e + 1)
+        vals += [v0, v1]
+        ss = ss + v0 * v0 + v1 * v1
+    rstd = hw_rsq(
+        _block_sum(ss, lane, wave, c["red"]) / float(MOE_HIDDEN) + RMS_EPS
+    )
+    for j in range_constexpr(MOE_HIDDEN // (2 * THREADS)):
+        e = 2 * (tid + j * THREADS)
+        _st_bf2(
+            c["xin"],
+            (token * MOE_HIDDEN + e) // 2,
+            vals[2 * j] * rstd * _bf(c["xn_w"], e),
+            vals[2 * j + 1] * rstd * _bf(c["xn_w"], e + 1),
+        )
+
+
+@flyc.jit
+def stage_joint_pooled_norm(c):
+    """Round packed FP32 Pooler output once, then RMSNorm as Baseline does."""
+    tid, lane, wave = c["tid"], c["lane"], c["wave"]
+    token = c["bid"]
+    vals = []
+    ss = fx.Float32(0.0)
+    for j in range_constexpr(MOE_HIDDEN // (2 * THREADS)):
+        e = 2 * (tid + j * THREADS)
+        v0 = bf16_round(_f32(c["joint"], token * JOINT_ROWS + e))
+        v1 = bf16_round(_f32(c["joint"], token * JOINT_ROWS + e + 1))
         vals += [v0, v1]
         ss = ss + v0 * v0 + v1 * v1
     rstd = hw_rsq(

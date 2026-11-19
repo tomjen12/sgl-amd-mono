@@ -26,8 +26,10 @@ def _worker(rank, port, queue):
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
     from sgl_amd_mono.muse_spark.gfx1250.build_k2 import (
+        K2_PHASE_POINTS,
         K2Build,
         build_k2,
+        k2_scratch_layout,
         scratch_bytes,
         sym_bytes,
     )
@@ -97,6 +99,10 @@ def _worker(rank, port, queue):
         )
         peers.bytes.zero_()
         epoch = _epoch(device, 120.0)
+        phase_trace = (
+            os.environ.get("MUSE_PHASE_TRACE") == "1"
+            or os.environ.get("MUSE_K2_PHASE_TRACE") == "1"
+        )
         launch = build_k2(
             K2Build(
                 tokens=MAX_TOKENS,
@@ -105,6 +111,9 @@ def _worker(rank, port, queue):
                 cooperative_rp=os.environ.get("MUSE_K2_COOPERATIVE_RP") == "1",
                 aggregate_boundary=os.environ.get("MUSE_K2_AGGREGATE_BOUNDARY") == "1",
                 single_boundary_wait=os.environ.get("MUSE_K2_SINGLE_BOUNDARY_WAIT") == "1",
+                lds_x_rp=os.environ.get("MUSE_K2_LDS_X_RP") == "1",
+                joint_rp=os.environ.get("MUSE_K2_JOINT_RP") == "1",
+                phase_trace=phase_trace,
             )
         )
         got = stream.clone()
@@ -117,7 +126,7 @@ def _worker(rank, port, queue):
                 o.data_ptr(), g.data_ptr(), got.data_ptr(), w["w_o"].data_ptr(),
                 w["alpha"].data_ptr(), w["beta"].data_ptr(), w["pre_w"].data_ptr(),
                 w["w_hi"].data_ptr(), w["w_lo"].data_ptr(), w["bias"].data_ptr(),
-                w["w_pool"].data_ptr(), w["xn_w"].data_ptr(), ids.data_ptr(),
+                (w["w_joint"] if os.environ.get("MUSE_K2_JOINT_RP") == "1" else w["w_pool"]).data_ptr(), w["xn_w"].data_ptr(), ids.data_ptr(),
                 scores.data_ptr(), 0, 0, xin.data_ptr(), scratch.data_ptr(), peers.local,
                 peers.addresses.data_ptr(), rank, epoch.data_ptr(), LAYER,
                 stream=torch.cuda.current_stream(),
@@ -137,7 +146,7 @@ def _worker(rank, port, queue):
                 o.data_ptr(), g.data_ptr(), got.data_ptr(), w["w_o"].data_ptr(),
                 w["alpha"].data_ptr(), w["beta"].data_ptr(), w["pre_w"].data_ptr(),
                 w["w_hi"].data_ptr(), w["w_lo"].data_ptr(), w["bias"].data_ptr(),
-                w["w_pool"].data_ptr(), w["xn_w"].data_ptr(), ids.data_ptr(),
+                (w["w_joint"] if os.environ.get("MUSE_K2_JOINT_RP") == "1" else w["w_pool"]).data_ptr(), w["xn_w"].data_ptr(), ids.data_ptr(),
                 scores.data_ptr(), 0, 0, xin.data_ptr(), scratch.data_ptr(), peers.local,
                 peers.addresses.data_ptr(), rank, epoch.data_ptr(), LAYER,
                 stream=torch.cuda.current_stream(),
@@ -155,6 +164,37 @@ def _worker(rank, port, queue):
                         "mean": sum(samples) / len(samples),
                         "min": min(samples),
                         "max": max(samples),
+                    }
+                ),
+                flush=True,
+            )
+        if phase_trace:
+            from sgl_amd_mono.muse_spark.gfx1250.config import RESIDENT_BLOCKS
+
+            offset, size = k2_scratch_layout()["k2_phase_ticks"]
+            ticks = (
+                scratch[offset : offset + size]
+                .view(torch.int64)
+                .view(RESIDENT_BLOCKS, K2_PHASE_POINTS)
+                .cpu()
+            )
+            deltas = ticks[:, 1:] - ticks[:, :-1]
+            assert bool((deltas >= 0).all()), "K2 phase timestamps are unordered"
+            print(
+                "K2_TP4_PHASE_TICKS="
+                + json.dumps(
+                    {
+                        "rank": rank,
+                        "points": [
+                            "start",
+                            "norm_oproj",
+                            "boundary",
+                            "router",
+                            "pool",
+                            "top8",
+                            "pooled_norm",
+                        ],
+                        "deltas": deltas.tolist(),
                     }
                 ),
                 flush=True,

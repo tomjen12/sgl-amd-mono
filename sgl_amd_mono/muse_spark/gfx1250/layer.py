@@ -13,12 +13,17 @@ from sgl_amd_mono.common.sync import Mailbox, sreg
 from sgl_amd_mono.muse_spark.gfx1250.config import DRAFT_TOKENS, MAX_TOKENS, WIDTHS
 from sgl_amd_mono.muse_spark.gfx1250.device import mailbox_guard, step_tag
 from sgl_amd_mono.muse_spark.gfx1250.layout import (
+    FUSED_KEY_BLOCK,
+    FUSED_KEY_BLOCK_CHOICES,
+    FUSED_LOAD_BITS_CHOICES,
+    FUSED_SPLITS,
     RESIDENT_BLOCKS,
     THREADS,
     fused_tasks,
     kattn_tasks,
     k1_scratch_layout,
     resident_rounds,
+    validate_fused_splits,
 )
 from sgl_amd_mono.muse_spark.gfx1250.stages import attention, pre_attn
 
@@ -31,6 +36,7 @@ class K1Build(msgspec.Struct, frozen=True):
     resident_blocks: int = RESIDENT_BLOCKS
     fault_site: int = 0
     fault_after: int = 0
+    phase_trace: bool = False
 
 
 def build_k1(key: K1Build):
@@ -47,6 +53,7 @@ def build_k1(key: K1Build):
         s=key.tokens,
         c=key.resident_blocks,
         f=key.fault_site,
+        t=int(key.phase_trace),
     )
     keyed = key_tuple(key, SOURCES)
     layout = k1_scratch_layout()
@@ -94,6 +101,12 @@ def build_k1(key: K1Build):
             "put": mailbox.put,
             "poll": mailbox.poll,
             "part": sreg(scratch, layout["k1_part"][0], "k1_part"),
+            "phase_trace": key.phase_trace,
+            "phase_ticks": sreg(
+                scratch,
+                layout["k1_phase_ticks"][0],
+                "k1_phase_ticks",
+            ),
             "args": {
                 "x": x,
                 "w": w,
@@ -173,6 +186,12 @@ class KAttnBuild(msgspec.Struct, frozen=True):
     q_len: int = DRAFT_TOKENS
     resident_blocks: int = RESIDENT_BLOCKS
     phase_trace: bool = False
+    splits: int = FUSED_SPLITS
+    fp8_wmma: bool = False
+    register_probability: bool = True
+    stage_q: bool = True
+    key_block: int = FUSED_KEY_BLOCK
+    load_bits: int = 64
 
 
 def build_kattn(key: KAttnBuild):
@@ -187,6 +206,8 @@ def build_kattn(key: KAttnBuild):
             f"K-attn profile has {RESIDENT_BLOCKS} resident blocks, "
             f"got {key.resident_blocks}"
         )
+    if key.splits != FUSED_SPLITS:
+        raise ValueError("the legacy K-attn kernel only supports six splits")
     name = kernel_symbol(
         "muse_spark_gfx1250_kattn",
         s=key.tokens,
@@ -316,16 +337,52 @@ def build_tiled_kattn(key: KAttnBuild):
             "gfx1250 tiled K-attn requires the cu96 profile; "
             f"got {key.resident_blocks}/{RESIDENT_BLOCKS}"
         )
+    validate_fused_splits(key.splits)
+    if key.key_block not in FUSED_KEY_BLOCK_CHOICES:
+        raise ValueError(
+            f"K-attn key block {key.key_block}, "
+            f"want one of {FUSED_KEY_BLOCK_CHOICES}"
+        )
+    if key.load_bits not in FUSED_LOAD_BITS_CHOICES:
+        raise ValueError(
+            f"K-attn load width {key.load_bits}, "
+            f"want one of {FUSED_LOAD_BITS_CHOICES}"
+        )
+    if key.fp8_wmma and (
+        key.key_block != FUSED_KEY_BLOCK or key.load_bits != 64
+    ):
+        raise ValueError("FP8 K-attn only supports the retained BN32/64-bit load")
+    if key.stage_q and (key.fp8_wmma or not key.register_probability):
+        raise ValueError(
+            "Q LDS staging requires BF16 WMMA with register probabilities"
+        )
     name = kernel_symbol(
         "muse_spark_gfx1250_kattn_tiled",
         s=key.tokens,
         q=key.q_len,
         c=key.resident_blocks,
         t=int(key.phase_trace),
+        p=key.splits,
+        x=int(key.fp8_wmma),
+        r=int(key.register_probability),
+        y=int(key.stage_q),
+        n=key.key_block,
+        l=key.load_bits,
     )
     keyed = key_tuple(key, SOURCES)
     layout = _tiled_kattn_layout()
-    Lds = attention.fused_attn_lds()
+    Lds = (
+        attention.fused_attn_fp8_lds()
+        if key.fp8_wmma
+        else attention.fused_attn_lds(
+            key.register_probability, key.key_block
+        )
+    )
+    run_attention = (
+        attention.run_fused_attn_fp8
+        if key.fp8_wmma
+        else attention.run_fused_attn
+    )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def tiled_kattn(
@@ -371,25 +428,42 @@ def build_tiled_kattn(key: KAttnBuild):
             "scale_bits": scale_bits,
         }
         for task_round in range_constexpr(
-            resident_rounds(fused_tasks(key.tokens))
+            resident_rounds(fused_tasks(key.tokens, key.splits))
         ):
             task = bid + task_round * RESIDENT_BLOCKS
-            if task < fused_tasks(key.tokens):
-                attention.run_fused_attn(
+            if task < fused_tasks(key.tokens, key.splits):
+                run_attention(
                     {
                         "S": key.tokens,
                         "QL": key.q_len,
                         "tid": tid,
                         "lane": lane,
                         "wave": wave,
-                        "tile": task // attention.FUSED_SPLITS,
-                        "split": task % attention.FUSED_SPLITS,
+                        "tile": task // key.splits,
+                        "split": task % key.splits,
+                        "splits": key.splits,
+                        "key_block": key.key_block,
+                        "load_bits": key.load_bits,
                         "mb": mb,
                         "wave_stats": lds.wave_stats.ptr,
                         "row_stats": lds.row_stats.ptr,
-                        "probabilities": lds.probabilities.ptr,
+                        "q": (
+                            lds.q.ptr
+                            if not key.fp8_wmma
+                            and key.register_probability
+                            else lds.probabilities.ptr
+                        ),
+                        "probabilities": (
+                            lds.q.ptr
+                            if not key.fp8_wmma
+                            and key.register_probability
+                            else lds.probabilities.ptr
+                        ),
                         "pv": lds.pv.ptr,
+                        "kv": lds.kv.ptr,
                         "phase_trace": key.phase_trace,
+                        "register_probability": key.register_probability,
+                        "stage_q": key.stage_q,
                         "phase_ticks": sreg(
                             scratch,
                             layout["attn_phase_ticks"][0],

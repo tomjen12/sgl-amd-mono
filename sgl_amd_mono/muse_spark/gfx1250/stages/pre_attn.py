@@ -21,6 +21,7 @@ from sgl_amd_mono.common.ops import (
     hw_rsq,
     rsrc,
 )
+from sgl_amd_mono.muse_spark.gfx1250.device import clock
 from sgl_amd_mono.muse_spark.gfx1250.config import (
     G_OFF,
     HEAD_DIM,
@@ -343,12 +344,26 @@ def stage_gate(c, gate, token_offset):
 
 
 @flyc.jit
+def _stamp_k1(c, phase):
+    if c.get("phase_trace", False):
+        gpu.barrier()
+        if c["tid"] == 0:
+            bo.buffer_store(
+                clock(),
+                rsrc(c["phase_ticks"].value),
+                c["bid"] * 3 + phase,
+            )
+
+
+@flyc.jit
 def run_k1(c, block):
     """Run this CTA's GEMV tasks, then its optional head/gate reduction."""
+    _stamp_k1(c, 0)
     for task_round in range_constexpr(GEMV_TASK_ROUNDS):
         task = block + task_round * RESIDENT_BLOCKS
         if task < GEMV_TASKS:
             stage_gemv(c, task)
+    _stamp_k1(c, 1)
     tokens_per_round = THREADS // TOKEN_LANES
     for token_round in range_constexpr(
         (c["S"] + tokens_per_round - 1) // tokens_per_round
@@ -360,6 +375,7 @@ def run_k1(c, block):
             block < GATE_TASK_BASE + GATE_TASKS
         ):
             stage_gate(c, block - GATE_TASK_BASE, token_offset)
+    _stamp_k1(c, 2)
 
 
 def k1_lds():

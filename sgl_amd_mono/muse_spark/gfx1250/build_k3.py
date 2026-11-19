@@ -31,6 +31,9 @@ from sgl_amd_mono.muse_spark.gfx1250.layout import (
     RESIDENT_BLOCKS,
     resident_rounds,
 )
+from sgl_amd_mono.muse_spark.gfx1250.k3_tdm import (
+    TILE_M as K3_TDM_TILE_M,
+)
 from sgl_amd_mono.muse_spark.gfx1250.k3_tdm import build_k3_tdm_tasks
 from sgl_amd_mono.muse_spark.gfx1250.stages import ffn
 
@@ -38,8 +41,12 @@ SOURCES = kernel_sources(__name__)
 _STREAM = fx.Stream(None)
 THREADS = 256
 _ALIGN = 256
-_K3_COMPACT_TILES = LOCAL_EXPERTS
-_K3_COMPACT_ROWS = _K3_COMPACT_TILES * 64
+_K3_COMPACT_TILES = (
+    LOCAL_EXPERTS
+    + (MAX_TOKENS * TOP_K + K3_TDM_TILE_M - 1) // K3_TDM_TILE_M
+    - 1
+)
+_K3_COMPACT_ROWS = _K3_COMPACT_TILES * K3_TDM_TILE_M
 
 
 class K3Build(msgspec.Struct, frozen=True):
@@ -396,7 +403,9 @@ def build_k3(key: K3Build):
         if key.expert_profile_mode:
             if tdm is not None:
                 if bid == 0:
-                    ffn.stage_k3_route_compact(c, expert_picks)
+                    ffn.stage_k3_route_compact(
+                        c, expert_picks, K3_TDM_TILE_M
+                    )
                     _publish(c["put"], route_done, 0, tid)
                 _wait(c["poll"], [(route_done, 0, 1)])
             if bid < expert_picks:
