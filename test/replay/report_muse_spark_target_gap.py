@@ -28,9 +28,11 @@ from trace_fingerprint import (
 )
 
 STAGES = ("K1", "K-attn", "K2", "K3")
+SPLIT_STAGES = ("K1", "K-attn-full", "K-attn-window", "K2", "K3")
 FAMILIES = ("K1", "Layer V2", "Layer V1")
 TARGET_LAYERS = 10
 ELIGIBLE_LAYERS = range(1, TARGET_LAYERS)
+FULL_ATTENTION_LAYERS = frozenset((1, 5, 9))
 
 BASELINE_LAYOUT = {
     "K1": ("_dense_partial.kd", "_qkv_epilogue.kd"),
@@ -123,6 +125,23 @@ def _matches(name: str, expected: str | tuple[str, ...]) -> bool:
     if isinstance(expected, tuple):
         return any(needle in name for needle in expected)
     return expected in name
+
+
+def _baseline_relevant(kernels: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep Target layer kernels when graph replay has no Python layer scopes."""
+    needles = tuple(
+        needle
+        for expected in BASELINE_LAYOUT.values()
+        for needle in expected
+    )
+    return [
+        event
+        for event in kernels
+        if any(
+            _matches(normalize_name(event.get("name", "")), needle)
+            for needle in needles
+        )
+    ]
 
 
 def _baseline_layer(kernels: list[dict[str, Any]], layer: int) -> dict[str, float]:
@@ -238,17 +257,41 @@ def _rank(path: Path) -> int:
 
 
 def _baseline_samples(directory: Path):
-    by_rank = {rank: {stage: [] for stage in STAGES} for rank in range(4)}
+    labels = (*STAGES, "K-attn-full", "K-attn-window")
+    by_rank = {rank: {stage: [] for stage in labels} for rank in range(4)}
     per_iteration = {rank: [] for rank in range(4)}
     iterations = None
     for path in _trace_paths(directory):
         rank = _rank(path)
-        scopes = _scope_kernels(
-            _load(str(path)), r"^muse_replay/target/layer_[0-9]+$"
-        )
+        trace = _load(str(path))
+        scopes = _scope_kernels(trace, r"^muse_replay/target/layer_[0-9]+$")
+        graph_scopes = []
+        if not scopes:
+            graph_scopes = _scope_kernels(trace, r"^muse_replay/target/verify$")
+            for index, kernels in enumerate(graph_scopes):
+                relevant = _baseline_relevant(kernels)
+                expected = 17 + len(ELIGIBLE_LAYERS) * 18
+                if len(relevant) != expected:
+                    raise ValueError(
+                        f"{path}: graph iteration {index} has {len(relevant)} "
+                        f"Target layer kernels, expected {expected}"
+                    )
+                scopes.extend(
+                    [
+                        relevant[:17],
+                        *[
+                            relevant[17 + offset * 18 : 17 + (offset + 1) * 18]
+                            for offset in range(len(ELIGIBLE_LAYERS))
+                        ],
+                    ]
+                )
         if len(scopes) % TARGET_LAYERS:
-            raise ValueError(f"{path}: {len(scopes)} layer scopes is not divisible by 10")
-        current_iterations = len(scopes) // TARGET_LAYERS
+            raise ValueError(
+                f"{path}: {len(scopes)} layer scopes is not divisible by 10"
+            )
+        current_iterations = (
+            len(graph_scopes) if graph_scopes else len(scopes) // TARGET_LAYERS
+        )
         iterations = current_iterations if iterations is None else iterations
         if current_iterations != iterations:
             raise ValueError(f"{path}: iteration mismatch")
@@ -265,13 +308,20 @@ def _baseline_samples(directory: Path):
                 values = _baseline_layer(layers[layer], layer)
                 for stage, duration in values.items():
                     by_rank[rank][stage].append(duration)
+                    if stage == "K-attn":
+                        attention_stage = (
+                            "K-attn-full"
+                            if layer in FULL_ATTENTION_LAYERS
+                            else "K-attn-window"
+                        )
+                        by_rank[rank][attention_stage].append(duration)
                     total += duration
             per_iteration[rank].append(total)
     return by_rank, per_iteration, int(iterations or 0)
 
 
 def _mono_samples(directory: Path, mode: str):
-    labels = STAGES if mode == "split" else FAMILIES
+    labels = (*STAGES, "K-attn-full", "K-attn-window") if mode == "split" else FAMILIES
     by_rank = {rank: {label: [] for label in labels} for rank in range(4)}
     per_iteration = {rank: [] for rank in range(4)}
     iterations = None
@@ -289,9 +339,16 @@ def _mono_samples(directory: Path, mode: str):
             parsed = parser(kernels)
             total = 0.0
             if mode == "split":
-                for layer in parsed:
+                for layer_id, layer in zip(ELIGIBLE_LAYERS, parsed):
                     for stage, duration in layer.items():
                         by_rank[rank][stage].append(duration)
+                        if stage == "K-attn":
+                            attention_stage = (
+                                "K-attn-full"
+                                if layer_id in FULL_ATTENTION_LAYERS
+                                else "K-attn-window"
+                            )
+                            by_rank[rank][attention_stage].append(duration)
                         total += duration
             else:
                 for family, durations in parsed.items():
@@ -318,19 +375,26 @@ def _critical(by_rank: dict[int, dict[str, list[float]]], label: str) -> list[fl
     return [max(by_rank[rank][label][sample] for rank in range(4)) for sample in range(samples)]
 
 
+def _selected(
+    by_rank: dict[int, dict[str, list[float]]], label: str, rank: int | None
+) -> list[float]:
+    return _critical(by_rank, label) if rank is None else by_rank[rank][label]
+
+
 def _comparison(
     baseline: dict[int, dict[str, list[float]]],
     mono: dict[int, dict[str, list[float]]],
     labels: tuple[str, ...],
+    rank: int | None,
 ) -> dict[str, Any]:
     result = {}
     for label in labels:
-        baseline_values = _critical(baseline, label)
-        mono_values = _critical(mono, label)
+        baseline_values = _selected(baseline, label, rank)
+        mono_values = _selected(mono, label, rank)
         baseline_stats, mono_stats = _stats(baseline_values), _stats(mono_values)
         result[label] = {
-            "baseline_critical": baseline_stats,
-            "mono_critical": mono_stats,
+            "baseline": baseline_stats,
+            "mono": mono_stats,
             "gap_mean_us": mono_stats["mean_us"] - baseline_stats["mean_us"],
             "speedup": baseline_stats["mean_us"] / mono_stats["mean_us"],
         }
@@ -368,12 +432,24 @@ def _total_comparison(
     baseline: dict[int, list[float]],
     split: dict[int, list[float]],
     fused: dict[int, list[float]],
+    rank: int | None,
 ) -> dict[str, Any]:
-    critical = {
-        name: [max(values[rank][sample] for rank in range(4)) for sample in range(len(values[0]))]
-        for name, values in (("baseline", baseline), ("split", split), ("fused", fused))
+    selected = {
+        name: (
+            [
+                max(values[current][sample] for current in range(4))
+                for sample in range(len(values[0]))
+            ]
+            if rank is None
+            else values[rank]
+        )
+        for name, values in (
+            ("baseline", baseline),
+            ("split", split),
+            ("fused", fused),
+        )
     }
-    stats = {name: _stats(values) for name, values in critical.items()}
+    stats = {name: _stats(values) for name, values in selected.items()}
     return {
         **stats,
         "split_gap_mean_us": stats["split"]["mean_us"] - stats["baseline"]["mean_us"],
@@ -383,90 +459,101 @@ def _total_comparison(
     }
 
 
-def report(baseline_dir: Path, split_dir: Path, fused_dir: Path) -> dict[str, Any]:
+def report(
+    baseline_dir: Path,
+    split_dir: Path,
+    fused_dir: Path | None,
+    rank: int | None = None,
+) -> dict[str, Any]:
     baseline, baseline_total, baseline_iterations = _baseline_samples(baseline_dir)
     split, split_total, split_iterations = _mono_samples(split_dir, "split")
-    fused, fused_total, fused_iterations = _mono_samples(fused_dir, "fused")
-    fused_baseline = _fused_baseline(baseline, baseline_iterations)
-    split_comparison = _comparison(baseline, split, STAGES)
-    fused_comparison = _comparison(fused_baseline, fused, FAMILIES)
-    return {
+    split_comparison = _comparison(baseline, split, SPLIT_STAGES, rank)
+    result = {
         "schema_version": 1,
         "workload": "Muse Spark synthetic Target layers 0-9 width8 8K replay",
         "iterations": baseline_iterations,
         "iteration_counts": {
             "baseline": baseline_iterations,
             "split": split_iterations,
-            "fused": fused_iterations,
         },
         "ranks": 4,
+        "selected_rank": rank,
+        "selection": "critical-rank" if rank is None else f"rank-{rank}",
         "excluded": "layer 0 BF16 fallback",
         "launches_per_rank_iteration": {
             "baseline_eligible": 162,
             "split_mono": 36,
-            "fused_mono": 10,
         },
         "split_stages": split_comparison,
-        "fused_families": fused_comparison,
         "largest_absolute_gap_first": {
             "split": sorted(
-                STAGES,
+                SPLIT_STAGES,
                 key=lambda label: abs(split_comparison[label]["gap_mean_us"]),
                 reverse=True,
             ),
-            "fused": sorted(
-                FAMILIES,
-                key=lambda label: abs(fused_comparison[label]["gap_mean_us"]),
-                reverse=True,
-            ),
         },
-        "eligible_total": _total_comparison(
-            baseline_total, split_total, fused_total
-        ),
         "directories": {
             "baseline": str(baseline_dir),
             "split": str(split_dir),
-            "fused": str(fused_dir),
         },
     }
+    if fused_dir is not None:
+        fused, fused_total, fused_iterations = _mono_samples(fused_dir, "fused")
+        fused_baseline = _fused_baseline(baseline, baseline_iterations)
+        fused_comparison = _comparison(fused_baseline, fused, FAMILIES, rank)
+        result["iteration_counts"]["fused"] = fused_iterations
+        result["launches_per_rank_iteration"]["fused_mono"] = 10
+        result["fused_families"] = fused_comparison
+        result["largest_absolute_gap_first"]["fused"] = sorted(
+            FAMILIES,
+            key=lambda label: abs(fused_comparison[label]["gap_mean_us"]),
+            reverse=True,
+        )
+        result["eligible_total"] = _total_comparison(
+            baseline_total, split_total, fused_total, rank
+        )
+        result["directories"]["fused"] = str(fused_dir)
+    return result
 
 
 def _print(result: dict[str, Any]) -> None:
-    print("Split Mono semantic stages (critical rank, average per layer)")
+    print(
+        f"Split Mono semantic stages ({result['selection']}, average per layer)"
+    )
     print("stage      baseline_us  split_us   gap_us  speedup")
-    for stage in STAGES:
+    for stage in SPLIT_STAGES:
         item = result["split_stages"][stage]
         print(
-            f"{stage:<10} {item['baseline_critical']['mean_us']:>11.3f} "
-            f"{item['mono_critical']['mean_us']:>9.3f} "
+            f"{stage:<14} {item['baseline']['mean_us']:>11.3f} "
+            f"{item['mono']['mean_us']:>9.3f} "
             f"{item['gap_mean_us']:>8.3f} {item['speedup']:>7.3f}x"
         )
-    print("\nFused Mono launch families (critical rank)")
-    print("family     baseline_us  fused_us   gap_us  speedup")
-    for family in FAMILIES:
-        item = result["fused_families"][family]
-        print(
-            f"{family:<10} {item['baseline_critical']['mean_us']:>11.3f} "
-            f"{item['mono_critical']['mean_us']:>9.3f} "
-            f"{item['gap_mean_us']:>8.3f} {item['speedup']:>7.3f}x"
-        )
-    total = result["eligible_total"]
-    print("\nEligible layers 1-9 total (critical rank, per iteration)")
-    print(
-        f"baseline={total['baseline']['mean_us']:.3f} us "
-        f"split={total['split']['mean_us']:.3f} us "
-        f"fused={total['fused']['mean_us']:.3f} us"
-    )
+    if "fused_families" in result:
+        print(f"\nFused Mono launch families ({result['selection']})")
+        print("family     baseline_us  fused_us   gap_us  speedup")
+        for family in FAMILIES:
+            item = result["fused_families"][family]
+            print(
+                f"{family:<10} {item['baseline']['mean_us']:>11.3f} "
+                f"{item['mono']['mean_us']:>9.3f} "
+                f"{item['gap_mean_us']:>8.3f} {item['speedup']:>7.3f}x"
+            )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("baseline_dir", type=Path)
     parser.add_argument("split_dir", type=Path)
-    parser.add_argument("fused_dir", type=Path)
+    parser.add_argument("fused_dir", type=Path, nargs="?")
+    parser.add_argument(
+        "--rank",
+        type=int,
+        choices=range(4),
+        help="report one rank instead of the cross-rank critical path",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    result = report(args.baseline_dir, args.split_dir, args.fused_dir)
+    result = report(args.baseline_dir, args.split_dir, args.fused_dir, args.rank)
     _print(result)
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)

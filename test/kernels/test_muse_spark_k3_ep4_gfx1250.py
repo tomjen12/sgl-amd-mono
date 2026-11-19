@@ -96,6 +96,28 @@ def _worker(rank, port, queue):
         w2, s2, d2 = _native_weight(
             TABLE_EXPERTS, MOE_HIDDEN, INTER, device, local_gen
         )
+        tdm_expert = (
+            os.environ.get("SGLANG_AMD_MONO_MUSE_K3_TDM") == "1"
+        )
+        if tdm_expert:
+            from aiter.ops.shuffle import (
+                moe_shuffle_scale,
+                moe_shuffle_weight,
+            )
+
+            w13 = moe_shuffle_weight(
+                w13, is_guinterleave=True, gate_up=True
+            ).view(torch.uint8)
+            s13 = moe_shuffle_scale(
+                s13,
+                experts_cnt=TABLE_EXPERTS,
+                is_guinterleave=True,
+                gate_up=True,
+            ).view(torch.uint8)
+            w2 = moe_shuffle_weight(w2).view(torch.uint8)
+            s2 = moe_shuffle_scale(
+                s2, experts_cnt=TABLE_EXPERTS
+            ).view(torch.uint8)
         partial = _local_partial(
             xin,
             ids,
@@ -133,7 +155,15 @@ def _worker(rank, port, queue):
         )
         got = base_stream.clone()
         phase_trace = os.environ.get("MUSE_K3_PHASE_TRACE") == "1"
-        launch = build_k3(K3Build(npes=NP, phase_trace=phase_trace))
+        launch = build_k3(
+            K3Build(
+                npes=NP,
+                shuffled=tdm_expert,
+                phase_trace=phase_trace,
+                tdm_expert=tdm_expert,
+            )
+        )
+        repeated = []
         for _ in range(2):
             got.copy_(base_stream)
             torch.cuda.synchronize()
@@ -165,7 +195,14 @@ def _worker(rank, port, queue):
                 stream=torch.cuda.current_stream(),
             )
             epoch[0] += 1
-        torch.cuda.synchronize()
+            torch.cuda.synchronize()
+            repeated.append((got.clone(), attn.clone()))
+        repeat_stream = torch.nn.functional.cosine_similarity(
+            repeated[0][0].float(), repeated[1][0].float(), dim=-1
+        ).min()
+        repeat_attn = torch.nn.functional.cosine_similarity(
+            repeated[0][1].float(), repeated[1][1].float(), dim=-1
+        ).min()
         bench_iters = int(os.environ.get("MUSE_K3_BENCH_ITERS", "0"))
         samples = []
         for _ in range(bench_iters):
@@ -241,10 +278,10 @@ def _worker(rank, port, queue):
             )
         stream_ok = torch.allclose(
             got, ref_stream, rtol=1 / 32, atol=2e-2
-        )
+        ) and repeat_stream > 0.99999
         attn_ok = torch.allclose(
             attn, ref_attn, rtol=1 / 32, atol=2e-2
-        )
+        ) and repeat_attn > 0.99999
         errors = epoch[
             guard.ERR_DEADLINE : guard.ERR_FAULT + 1
         ].tolist()

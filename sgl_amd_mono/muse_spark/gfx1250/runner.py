@@ -52,6 +52,10 @@ USE_KERNELS = os.environ.get("SGLANG_AMD_MONO_MUSE_KERNELS", "1") == "1"
 # The fused layer remains the default. Replay can select the exact standalone
 # K1 -> K-attn -> K2 -> K3 chain used by the TP4 kernel tests.
 USE_LAYER = os.environ.get("SGLANG_AMD_MONO_MUSE_LAYER", "1") == "1"
+# Experimental standalone K3 path: inline AITER's TDM Gate/Up and Down tasks
+# while retaining one persistent K3 launch. GPU runtime remains opt-in until
+# the dedicated correctness gate passes.
+USE_K3_TDM = os.environ.get("SGLANG_AMD_MONO_MUSE_K3_TDM", "0") == "1"
 
 # SGLang classes imported lazily by cache validation and page-table binding.
 SGLANG_READS = {
@@ -329,7 +333,7 @@ class MuseMonoRunner:
         return self._k2[rows]
 
     def k3_kernel(self, rows: int, last: bool, shuffled: bool):
-        key = rows, last, shuffled
+        key = rows, last, shuffled, USE_K3_TDM
         if key not in self._k3:
             from sgl_amd_mono.muse_spark.gfx1250.build_k3 import K3Build, build_k3
 
@@ -342,6 +346,10 @@ class MuseMonoRunner:
                     shuffled=shuffled,
                     fault_site=self.fault_site,
                     fault_after=self.fault_after,
+                    unpool_profile_mode=int(
+                        os.environ.get("MUSE_K3_UNPOOL_PROFILE_MODE", "2")
+                    ),
+                    tdm_expert=USE_K3_TDM,
                 )
             )
         return self._k3[key]

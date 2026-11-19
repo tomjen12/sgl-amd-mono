@@ -15,6 +15,8 @@ from sgl_amd_mono.common.sync import Mailbox, preg, sreg
 from sgl_amd_mono.muse_spark.gfx1250.config import (
     DRAFT_TOKENS,
     HIDDEN,
+    INTER,
+    LOCAL_EXPERTS,
     MAX_TOKENS,
     MOE_HIDDEN,
     TOP_K,
@@ -29,12 +31,15 @@ from sgl_amd_mono.muse_spark.gfx1250.layout import (
     RESIDENT_BLOCKS,
     resident_rounds,
 )
+from sgl_amd_mono.muse_spark.gfx1250.k3_tdm import build_k3_tdm_tasks
 from sgl_amd_mono.muse_spark.gfx1250.stages import ffn
 
 SOURCES = kernel_sources(__name__)
 _STREAM = fx.Stream(None)
 THREADS = 256
 _ALIGN = 256
+_K3_COMPACT_TILES = LOCAL_EXPERTS
+_K3_COMPACT_ROWS = _K3_COMPACT_TILES * 64
 
 
 class K3Build(msgspec.Struct, frozen=True):
@@ -51,6 +56,7 @@ class K3Build(msgspec.Struct, frozen=True):
     unpool_profile_mode: int = 2
     expert_profile_mode: bool = True
     finalize_profile_mode: bool = True
+    tdm_expert: bool = False
 
 
 def _byte_layout(items, align=256):
@@ -69,6 +75,17 @@ def _scratch_layout():
             ("k3_qx", picks * MOE_HIDDEN * 2),
             ("k3_qmid", picks * MOE_HIDDEN * 2),
             ("k3_y", picks * MOE_HIDDEN * 2),
+            ("k3_compact_qx", _K3_COMPACT_ROWS * MOE_HIDDEN * 2),
+            ("k3_compact_qmid", _K3_COMPACT_ROWS * INTER),
+            ("k3_compact_qmid_scale", _K3_COMPACT_ROWS * (INTER // 32)),
+            ("k3_compact_y", _K3_COMPACT_ROWS * MOE_HIDDEN * 2),
+            ("k3_unpool_part", 4 * MAX_TOKENS * HIDDEN * 4),
+            ("k3_route_row", picks * 4),
+            ("k3_route_count", LOCAL_EXPERTS * 4),
+            ("k3_route_tile_base", LOCAL_EXPERTS * 4),
+            ("k3_tile_expert", _K3_COMPACT_TILES * 4),
+            ("k3_tile_rows", _K3_COMPACT_TILES * 4),
+            ("k3_tile_count", 4),
             ("k3_fbuf", MAX_TOKENS * MOE_HIDDEN * 2),
             ("k3_branch", MAX_TOKENS * HIDDEN * 2),
             ("k3_finalize_scale", picks * 4),
@@ -87,6 +104,7 @@ def _persistent_layout():
                 ("k3_expert_done", MAX_TOKENS * TOP_K),
                 ("k3_finalize_done", MAX_TOKENS),
                 ("k3_qx_done", MAX_TOKENS * TOP_K),
+                ("k3_route_done", 1),
                 ("k3_gate_worker_done", RESIDENT_BLOCKS),
                 ("k3_down_worker_done", RESIDENT_BLOCKS),
                 ("k3_finalize_scale_done", MAX_TOKENS * TOP_K),
@@ -199,7 +217,18 @@ def build_k3(key: K3Build):
     assert key.tokens in WIDTHS, (key.tokens, WIDTHS)
     assert key.npes in (1, 4), key.npes
     assert key.unpool_profile_mode in (0, 1, 2), key.unpool_profile_mode
+    if key.tdm_expert and not key.expert_profile_mode:
+        raise ValueError("K3 TDM requires the staged expert scheduler")
     Lds = ffn.k3_lds()
+    tdm = (
+        build_k3_tdm_tasks(
+            threads=THREADS,
+            persistent_workers=RESIDENT_BLOCKS,
+            shuffled=key.shuffled,
+        )
+        if key.tdm_expert
+        else None
+    )
     keyed = key_tuple(key, SOURCES)
     suffix = dict(
         s=key.tokens,
@@ -212,6 +241,7 @@ def build_k3(key: K3Build):
         u=key.unpool_profile_mode,
         e=int(key.expert_profile_mode),
         z=int(key.finalize_profile_mode),
+        x=int(key.tdm_expert),
     )
     persistent_name = kernel_symbol("muse_spark_gfx1250_k3", **suffix)
     persistent_layout = _persistent_layout()
@@ -281,7 +311,11 @@ def build_k3(key: K3Build):
         layer: Int32,
         last: Int32,
     ):
-        lds = fx.SharedAllocator().allocate(Lds).peek()
+        shared = fx.SharedAllocator(static=False)
+        lds = shared.allocate(Lds).peek()
+        if tdm is not None:
+            tdm_arena = shared.allocate(tdm.contract.arena_bytes, 128)._ptr
+            tdm.bind_lds(tdm_arena)
         c = _context(
             key,
             lds,
@@ -331,6 +365,11 @@ def build_k3(key: K3Build):
             persistent_layout["k3_qx_done"][0],
             "k3_qx_done",
         )
+        route_done = sreg(
+            scratch,
+            persistent_layout["k3_route_done"][0],
+            "k3_route_done",
+        )
         gate_worker_done = sreg(
             scratch,
             persistent_layout["k3_gate_worker_done"][0],
@@ -355,8 +394,16 @@ def build_k3(key: K3Build):
         _stamp_phase(c, key.phase_trace, 0)
         expert_picks = key.tokens * TOP_K
         if key.expert_profile_mode:
+            if tdm is not None:
+                if bid == 0:
+                    ffn.stage_k3_route_compact(c, expert_picks)
+                    _publish(c["put"], route_done, 0, tid)
+                _wait(c["poll"], [(route_done, 0, 1)])
             if bid < expert_picks:
-                ffn.stage_expert_quantize(c, bid)
+                if tdm is not None:
+                    ffn.stage_expert_quantize_compact(c, bid)
+                else:
+                    ffn.stage_expert_quantize(c, bid)
                 _publish(c["put"], qx_done, bid, tid)
             _wait(
                 c["poll"],
@@ -364,11 +411,18 @@ def build_k3(key: K3Build):
             )
             _stamp_phase(c, key.phase_trace, 1)
 
-            gate_tasks = expert_picks * (MOE_HIDDEN // 32)
+            gate_tasks = (
+                _K3_COMPACT_TILES * tdm.contract.gate_tiles_per_pick
+                if tdm is not None
+                else expert_picks * (MOE_HIDDEN // 32)
+            )
             for gate_round in range(resident_rounds(gate_tasks)):
                 gate_task = bid + gate_round * RESIDENT_BLOCKS
                 if gate_task < gate_tasks:
-                    ffn.stage_expert_gate_up_block(c, gate_task)
+                    if tdm is not None:
+                        tdm.gate(c, gate_task)
+                    else:
+                        ffn.stage_expert_gate_up_block(c, gate_task)
             _publish(c["put"], gate_worker_done, bid, tid)
             _wait(
                 c["poll"],
@@ -379,11 +433,18 @@ def build_k3(key: K3Build):
             )
             _stamp_phase(c, key.phase_trace, 2)
 
-            down_tasks = expert_picks * (MOE_HIDDEN // 16)
+            down_tasks = (
+                _K3_COMPACT_TILES * tdm.contract.down_tiles_per_pick
+                if tdm is not None
+                else expert_picks * (MOE_HIDDEN // 16)
+            )
             for down_round in range(resident_rounds(down_tasks)):
                 down_task = bid + down_round * RESIDENT_BLOCKS
                 if down_task < down_tasks:
-                    ffn.stage_expert_down_tile(c, down_task)
+                    if tdm is not None:
+                        tdm.down(c, down_task)
+                    else:
+                        ffn.stage_expert_down_tile(c, down_task)
             _publish(c["put"], down_worker_done, bid, tid)
             _wait(
                 c["poll"],
@@ -394,6 +455,8 @@ def build_k3(key: K3Build):
             )
             _stamp_phase(c, key.phase_trace, 3)
             if bid < expert_picks:
+                if tdm is not None:
+                    ffn.stage_expert_gather_compact_y(c, bid)
                 _publish(c["put"], expert_done, bid, tid)
         else:
             for expert_round in range_constexpr(
@@ -477,7 +540,8 @@ def build_k3(key: K3Build):
             unpool_tasks = (
                 key.tokens * (HIDDEN // 16)
                 if key.unpool_profile_mode == 1
-                else HIDDEN // 16
+                else
+                ((key.tokens + 15) // 16) * (HIDDEN // 64) * 4
             )
             for unpool_round in range(resident_rounds(unpool_tasks)):
                 unpool_task = bid + unpool_round * RESIDENT_BLOCKS
@@ -485,7 +549,7 @@ def build_k3(key: K3Build):
                     if key.unpool_profile_mode == 1:
                         ffn.stage_unpool_gemv(c, unpool_task)
                     else:
-                        ffn.stage_unpool_tokens_gemv(c, unpool_task)
+                        ffn.stage_unpool_splitk_tile(c, unpool_task)
             _publish(c["put"], unpool_worker_done, bid, tid)
             if bid < key.tokens:
                 _wait(
@@ -495,7 +559,10 @@ def build_k3(key: K3Build):
                         for worker in range(RESIDENT_BLOCKS)
                     ],
                 )
-                ffn.stage_unpool_post(c)
+                if key.unpool_profile_mode == 2:
+                    ffn.stage_unpool_reduce_post(c)
+                else:
+                    ffn.stage_unpool_post(c)
                 _stamp_phase(c, key.phase_trace, 6)
 
     @flyc.kernel(

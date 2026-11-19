@@ -1,6 +1,10 @@
 import json
+from types import SimpleNamespace
 
 import pytest
+import torch
+
+import muse_spark_target_replay as replay
 
 from muse_spark_target_replay import (
     ROUTING_BLOCKER,
@@ -200,11 +204,15 @@ def test_cli_requires_explicit_routing_mismatch_opt_in():
     )
 
     assert defaults.allow_routing_mismatch is False
+    assert defaults.cuda_graph is False
     assert defaults.iterations == 5
     assert defaults.target_kernel_mode == "layer"
     assert opted_in.allow_routing_mismatch is True
     assert opted_in.warmup == 3
     assert opted_in.target_kernel_mode == "split"
+
+    graph = parser.parse_args(["bundle", "target", "--cuda-graph"])
+    assert graph.cuda_graph is True
 
 
 def test_output_writer_creates_parent_directories(tmp_path):
@@ -213,3 +221,46 @@ def test_output_writer_creates_parent_directories(tmp_path):
     write_output(destination, '{"status":"ok"}\n')
 
     assert destination.read_text() == '{"status":"ok"}\n'
+
+
+def test_state_observers_synchronize_reused_buffers(monkeypatch):
+    class Stream:
+        calls = 0
+
+        def synchronize(self):
+            self.calls += 1
+
+    stream = Stream()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+
+    layer = SimpleNamespace(
+        forward=lambda *_args, **_kwargs: (
+            torch.tensor([1.0]),
+            torch.tensor([2.0]),
+        )
+    )
+    model = SimpleNamespace(
+        model=SimpleNamespace(language_model=SimpleNamespace(layers=[layer]))
+    )
+    baseline_states = {}
+    handles = replay._install_baseline_state_observers(model, baseline_states)
+    layer.forward()
+    handles[0].remove()
+
+    runner = SimpleNamespace(
+        ids=torch.tensor([[7]], dtype=torch.int32),
+        launch=lambda **_kwargs: (torch.tensor([3.0]), torch.tensor([4.0])),
+    )
+    monkeypatch.setattr(
+        replay,
+        "_installed_mono",
+        lambda _model: SimpleNamespace(runner=runner),
+    )
+    mono_states = {}
+    handles = replay._install_mono_state_observer(model, mono_states)
+    runner.launch(i=0, rows=1)
+    handles[0].remove()
+
+    assert stream.calls == 2
+    assert baseline_states[0]["hidden"].item() == 1.0
+    assert mono_states[0]["routing_ids"].tolist() == [[7]]

@@ -216,7 +216,9 @@ def _stats(values: list[float]) -> dict[str, float | int]:
     }
 
 
-def report(baseline_dir: Path, mono_dir: Path) -> dict[str, Any]:
+def report(
+    baseline_dir: Path, mono_dir: Path, rank: int | None = None
+) -> dict[str, Any]:
     baseline, baseline_ranks, baseline_iterations = _collect(
         baseline_dir, "baseline"
     )
@@ -240,17 +242,35 @@ def report(baseline_dir: Path, mono_dir: Path) -> dict[str, Any]:
         ]
         baseline_critical_stats = _stats(baseline_critical)
         mono_critical_stats = _stats(mono_critical)
+        selected_baseline = (
+            baseline_critical_stats
+            if rank is None
+            else _stats(baseline_ranks[rank][stage])
+        )
+        selected_mono = (
+            mono_critical_stats if rank is None else _stats(mono_ranks[rank][stage])
+        )
         per_rank = {}
-        for rank in range(4):
-            b = statistics.fmean(baseline_ranks[rank][stage])
-            m = statistics.fmean(mono_ranks[rank][stage])
-            per_rank[str(rank)] = {
+        for current_rank in range(4):
+            b = statistics.fmean(baseline_ranks[current_rank][stage])
+            m = statistics.fmean(mono_ranks[current_rank][stage])
+            per_rank[str(current_rank)] = {
                 "baseline_mean_us": b,
                 "mono_mean_us": m,
                 "gap_us": m - b,
                 "speedup": b / m,
             }
         stages[stage] = {
+            "selected": {
+                "baseline": selected_baseline,
+                "mono": selected_mono,
+                "gap_mean_us": (
+                    selected_mono["mean_us"] - selected_baseline["mean_us"]
+                ),
+                "speedup": (
+                    selected_baseline["mean_us"] / selected_mono["mean_us"]
+                ),
+            },
             "baseline": baseline_stats,
             "mono": mono_stats,
             "gap_mean_us": mono_stats["mean_us"] - baseline_stats["mean_us"],
@@ -278,6 +298,8 @@ def report(baseline_dir: Path, mono_dir: Path) -> dict[str, Any]:
         "iterations": baseline_iterations,
         "layers_per_iteration": 5,
         "ranks": 4,
+        "selected_rank": rank,
+        "selection": "critical-rank" if rank is None else f"rank-{rank}",
         "baseline_dir": str(baseline_dir),
         "mono_dir": str(mono_dir),
         "stages": stages,
@@ -286,18 +308,19 @@ def report(baseline_dir: Path, mono_dir: Path) -> dict[str, Any]:
 
 def _print(result: dict[str, Any]) -> None:
     print(
-        "stage   baseline_critical_us  mono_critical_us  gap_us  speedup  "
+        f"selection={result['selection']}\n"
+        "stage   baseline_selected_us  mono_selected_us  gap_us  speedup  "
         "all_rank_baseline_mean  all_rank_mono_mean"
     )
     for stage in STAGES:
         item = result["stages"][stage]
-        critical = item["critical_path"]
+        selected = item["selected"]
         print(
             f"{stage:<7} "
-            f"{critical['baseline']['mean_us']:>20.3f} "
-            f"{critical['mono']['mean_us']:>17.3f} "
-            f"{critical['gap_mean_us']:>7.3f} "
-            f"{critical['speedup']:>7.3f}x "
+            f"{selected['baseline']['mean_us']:>20.3f} "
+            f"{selected['mono']['mean_us']:>16.3f} "
+            f"{selected['gap_mean_us']:>7.3f} "
+            f"{selected['speedup']:>7.3f}x "
             f"{item['baseline']['mean_us']:>22.3f} "
             f"{item['mono']['mean_us']:>18.3f}"
         )
@@ -307,9 +330,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("baseline_dir", type=Path)
     parser.add_argument("mono_dir", type=Path)
+    parser.add_argument(
+        "--rank",
+        type=int,
+        choices=range(4),
+        help="report one rank instead of the cross-rank critical path",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    result = report(args.baseline_dir, args.mono_dir)
+    result = report(args.baseline_dir, args.mono_dir, args.rank)
     _print(result)
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)

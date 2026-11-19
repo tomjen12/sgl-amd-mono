@@ -34,6 +34,9 @@ WORLD_SIZE = 4
 TARGET_LAYERS = 10
 DEFAULT_SEED = 300959315
 KV_GUARD_ROWS = 16
+DEFAULT_SYNTHETIC_DRAFT_CONFIG = (
+    Path(__file__).resolve().parents[5] / "synthetic-target-0-9" / "dflash"
+)
 BASELINE_ENVIRONMENT = {
     "HIP_VISIBLE_DEVICES": "0,1,2,3",
     "HSA_CU_MASK": "0-3:0-95",
@@ -41,7 +44,14 @@ BASELINE_ENVIRONMENT = {
     "SGLANG_MUSE_MONO_GFX1250_CONFIG": "cu96_tp4",
     "SGLANG_USE_AITER": "1",
     "SGLANG_USE_AITER_UNIFIED_ATTN": "1",
+    "AITER_GROUPED_DEBUG": "0",
+    "SGLANG_SIMULATE_ACC_LEN": "4.05",
+    "SGLANG_RAGGED_VERIFY_MODE": "static",
     "MUSE_MOE_BACKEND": "triton",
+    "NCCL_CUMEM_ENABLE": "1",
+    "AITER_CUSTOM_AR_FORCE_VMM": "1",
+    "AITER_CUSTOM_AR_MAX_SIZE": "1048576",
+    "SGLANG_USE_AITER_AG": "0",
     "SGLANG_ROCM_MUSE_FINALIZE_AR_PUSH": "0",
     "SGLANG_ROCM_MUSE_A4W4_MOE": "0",
     "SGLANG_ROCM_MUSE_COMPACT_A4_VERIFY": "0",
@@ -335,12 +345,18 @@ def _installed_mono(model):
 
 
 def _install_baseline_state_observers(model, states: dict[int, dict[str, Any]]):
+    import torch
+
     handles = []
     for layer_id, layer in enumerate(_target_model(model).layers):
         original = layer.forward
 
         def observe(*args, layer_id=layer_id, original=original, **kwargs):
             output = original(*args, **kwargs)
+            # Snapshot collection is correctness-only.  The layer outputs may
+            # be backed by buffers reused by the next asynchronous layer, so
+            # finish this layer before cloning them.
+            torch.cuda.current_stream().synchronize()
             states[layer_id] = {
                 "hidden": output[0].detach().clone(),
                 "residual": output[1].detach().clone(),
@@ -353,6 +369,8 @@ def _install_baseline_state_observers(model, states: dict[int, dict[str, Any]]):
 
 
 def _install_mono_state_observer(model, states: dict[int, dict[str, Any]]):
+    import torch
+
     built = _installed_mono(model)
     runner = built.runner
     original = runner.launch
@@ -360,6 +378,10 @@ def _install_mono_state_observer(model, states: dict[int, dict[str, Any]]):
     def observe(*args, **kwargs):
         layer_id = int(kwargs["i"])
         output = original(*args, **kwargs)
+        # runner.ids and the state tensors are reused across layers.  Without
+        # this correctness-only synchronization, an early layer's asynchronous
+        # clone can observe a later layer (layer 0 previously captured layer 9).
+        torch.cuda.current_stream().synchronize()
         states[layer_id] = {
             "hidden": output[0].detach().clone(),
             "residual": output[1].detach().clone(),
@@ -413,8 +435,14 @@ def _build_server_args(args):
         kv_cache_dtype="fp8_e4m3",
         disable_radix_cache=True,
         enable_amd_monokernel=args.mode == "mono",
-        cuda_graph_backend_decode="disabled",
+        speculative_algorithm="DFLASH",
+        speculative_draft_model_path=str(Path(args.draft_checkpoint)),
+        speculative_draft_attention_backend="triton",
+        speculative_num_draft_tokens=WIDTH,
+        speculative_draft_window_size=2048,
+        cuda_graph_backend_decode="full" if args.cuda_graph else "disabled",
         cuda_graph_backend_prefill="disabled",
+        cuda_graph_max_bs_decode=1 if args.cuda_graph else None,
     )
 
 
@@ -469,15 +497,14 @@ def _load_runner(
         )
     )
     runner.init_attention_backends()
-    # Even with both graph families disabled, ModelRunner.forward expects
-    # init_cuda_graphs() to install the eager runner attributes.
-    runner.init_cuda_graphs()
     if cfg.tp_size > 1:
         dist.barrier()
     return runner
 
 
-def _prepare_verify_batch(runner, descriptor: RankDescriptor):
+def _prepare_verify_batch(
+    runner, descriptor: RankDescriptor, *, cuda_graph: bool = False
+):
     import torch
     from sglang.benchmark.one_batch import (
         extend,
@@ -560,6 +587,7 @@ def _prepare_verify_batch(runner, descriptor: RankDescriptor):
         iteration_ids=plan,
     )
     batch.out_cache_loc = out_cache_loc
+    batch.can_run_decode_cuda_graph = cuda_graph
     # Preserve the captured host-side planner bound exactly; GPU seq_lens stays
     # at the committed 8192-token prefix as in DFlashWorkerV2.
     batch.seq_lens_cpu = torch.tensor([descriptor.seq_lens_sum], dtype=torch.int64)
@@ -567,8 +595,12 @@ def _prepare_verify_batch(runner, descriptor: RankDescriptor):
     forward_batch, can_graph = spec.prepare_for_verify(
         batch, SimpleNamespace(model_runner=runner)
     )
-    if can_graph:
-        raise RuntimeError("Target replay must use the eager baseline path")
+    if bool(can_graph) != bool(runner.decode_cuda_graph_captured):
+        raise RuntimeError(
+            "Target replay CUDA Graph eligibility disagrees with the configured "
+            f"runner: eligible={bool(can_graph)}, "
+            f"captured={bool(runner.decode_cuda_graph_captured)}"
+        )
     return forward_batch, out_cache_loc, positions
 
 
@@ -592,6 +624,11 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
     result: dict[str, Any] = {"rank": rank, "status": "error"}
     try:
         os.environ.update(BASELINE_ENVIRONMENT)
+        os.environ["AITER_CONFIG_GROUPED_FMOE"] = str(
+            Path(__file__).resolve().parents[3]
+            / "sglang/docker/muse_gfx1250/"
+            "muse_gfx1250_tp8_ep8_tuned_grouped_fmoe.csv"
+        )
         os.environ["SGLANG_MUSE_REPLAY_TARGET_LAYERS"] = str(TARGET_LAYERS)
         os.environ["SGLANG_ENABLE_AMD_MONOKERNEL"] = (
             "1" if args.mode == "mono" else "0"
@@ -665,9 +702,6 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
                 f"{getattr(forward, '__qualname__', type(forward).__name__)}, "
                 f"attrs={sorted(runner.model.__dict__)}"
             )
-        forward_batch, out_cache_loc, positions = _prepare_verify_batch(
-            runner, descriptor
-        )
         route_ids = {
             layer: torch.tensor(
                 routing_ids_from_counts(counts),
@@ -684,12 +718,27 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
                 map_location="cpu",
                 weights_only=False,
             )
+            route_ids = {
+                layer: routing_snapshot["routing_ids"][layer]
+                .to(device=runner.device, dtype=torch.int32)
+                .contiguous()
+                for layer in range(TARGET_LAYERS)
+            }
             route_scores = {
                 layer: routing_snapshot["routing_scores"][layer]
                 .to(device=runner.device, dtype=torch.float32)
                 .contiguous()
                 for layer in range(TARGET_LAYERS)
             }
+
+        # Capture under the same deterministic routing override used by replay.
+        # The graph runner owns static input buffers, while the override fixes
+        # the per-layer expert workload captured by the Mono wrappers.
+        with routing_override(route_ids, route_scores):
+            runner.init_cuda_graphs()
+        forward_batch, out_cache_loc, positions = _prepare_verify_batch(
+            runner, descriptor, cuda_graph=args.cuda_graph
+        )
 
         def run_once():
             with replay_scope("target/verify"):
@@ -701,8 +750,20 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
             torch.cuda.synchronize()
 
             writer = _CaptureWriter()
-            with runtime_metadata_capture(writer, "target_layers"):
-                run_once()
+            if args.cuda_graph:
+                from sglang.srt.rocm_muse_spark.replay_capture import (
+                    force_eager_model_runner,
+                )
+
+                # Python metadata hooks are bypassed by graph replay. Collect
+                # one unprofiled eager pass while preserving the captured graph.
+                runner.attn_backend.init_forward_metadata(forward_batch)
+                with force_eager_model_runner(runner):
+                    with runtime_metadata_capture(writer, "target_layers"):
+                        run_once()
+            else:
+                with runtime_metadata_capture(writer, "target_layers"):
+                    run_once()
             torch.cuda.synchronize()
 
             profiler = _trace_context(args.trace_dir is not None)
@@ -747,7 +808,16 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
                         for layer in range(TARGET_LAYERS)
                     },
                     "routing_ids": {
-                        layer: _cpu_snapshot(route_ids[layer])
+                        layer: (
+                            _cpu_snapshot(route_ids[layer])
+                            if args.mode == "mono"
+                            else torch.tensor(
+                                writer.values["target_layers"][
+                                    f"layer_{layer}.routing"
+                                ]["topk_ids"],
+                                dtype=torch.int32,
+                            )
+                        )
                         for layer in range(TARGET_LAYERS)
                     },
                     "routing_scores": {
@@ -1006,6 +1076,7 @@ def execute(args) -> tuple[int, dict[str, Any]]:
     summary = {
         "workload": "synthetic-target-layers-0-9-width8",
         "mode": args.mode,
+        "execution": "cuda-graph" if args.cuda_graph else "eager",
         "target_kernel_mode": args.target_kernel_mode,
         "tp_size": WORLD_SIZE,
         "ep_size": WORLD_SIZE,
@@ -1025,6 +1096,11 @@ def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("bundle")
     parser.add_argument("target_config")
+    parser.add_argument(
+        "--draft-checkpoint",
+        default=str(DEFAULT_SYNTHETIC_DRAFT_CONFIG),
+        help="DFlash2 config used to resolve width-8 Target verify graph shape.",
+    )
     parser.add_argument("--step", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=5)
@@ -1034,6 +1110,14 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output")
     parser.add_argument("--mem-fraction-static", type=float, default=0.88)
     parser.add_argument("--mode", choices=("baseline", "mono"), default="baseline")
+    parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help=(
+            "Profile full decode CUDA Graph replay. Graph capture and warmup "
+            "complete before the trace starts."
+        ),
+    )
     parser.add_argument(
         "--target-kernel-mode",
         choices=("layer", "split"),
@@ -1128,6 +1212,19 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.mode != "mono" and args.target_kernel_mode != "layer":
         raise SystemExit("--target-kernel-mode split requires --mode mono.")
+    if args.cuda_graph and (
+        args.snapshot_dir is not None
+        or args.check
+        or args.attn_dump_dir is not None
+    ):
+        raise SystemExit(
+            "--cuda-graph is profiling-only and cannot be combined with "
+            "--snapshot-dir, --check, or --attn-dump-dir."
+        )
+    if args.cuda_graph and not (Path(args.draft_checkpoint) / "config.json").is_file():
+        raise SystemExit(
+            "--cuda-graph requires a valid DFlash2 --draft-checkpoint config."
+        )
     try:
         code, result = execute(args)
     except (ReplayInputError, FileNotFoundError, ValueError) as error:

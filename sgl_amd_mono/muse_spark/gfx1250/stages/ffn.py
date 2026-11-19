@@ -27,6 +27,7 @@ from sgl_amd_mono.muse_spark.gfx1250.config import (
     INTER,
     LOCAL_EXPERTS,
     LOG2E,
+    MAX_TOKENS,
     MOE_HIDDEN,
     POST_EPS,
     RMS_EPS,
@@ -463,6 +464,49 @@ def _bf_gemm_tokens_tile(c, r_w, row0, x_addr, k):
 
 
 @flyc.jit
+def _bf_gemm_tokens_splitk_tile(
+    c, r_w, row0, x_addr, k, k_base, token0
+):
+    """One 16x16 token tile over a 1024-element split-K slice."""
+    lane, wave, red = c["lane"], c["wave"], c["red"]
+    row = row0 + lane % 16
+    token = lane % 16
+    r_x = rsrc(x_addr)
+    acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+    for step in range_constexpr(1024 // (WAVES * WMMA_K)):
+        k0 = k_base + wave * (1024 // WAVES) + step * WMMA_K
+        kh = (lane // 16) * 8
+        token_id = token0 + token
+        valid = token_id < c["S"]
+        base = valid.select(token_id, fx.Int32(0)) * k
+        lo = fx.Vector(
+            bo.buffer_load(
+                r_x, (base + k0 + kh) // 2, vec_width=4, dtype=T.i32
+            )
+        )
+        hi = fx.Vector(
+            bo.buffer_load(
+                r_x,
+                (base + k0 + 16 + kh) // 2,
+                vec_width=4,
+                dtype=T.i32,
+            )
+        )
+        words = [valid.select(lo[i], fx.Int32(0)) for i in range(4)]
+        words += [valid.select(hi[i], fx.Int32(0)) for i in range(4)]
+        activation = fx.Vector.from_elements(
+            words, fx.Int32
+        ).bitcast(fx.BFloat16)
+        acc = _wmma(
+            _bf_fragment(r_w, row * k, k0, lane),
+            activation,
+            acc,
+        )
+    fx.ptr_store(acc, red + (wave * WAVE_SIZE + lane) * WMMA_ACC)
+    gpu.barrier()
+
+
+@flyc.jit
 def _quantize_row(c, src_addr, dst_addr, n):
     """Store packed E4M3 payload followed by one E8M0 byte per 32 values."""
     tid, lane = c["tid"], c["lane"]
@@ -513,6 +557,136 @@ def stage_expert_quantize(c, pick):
         qx = c["qx"].value + fx.Int64(pick * MOE_HIDDEN * 2)
         xin = a["xin"] + fx.Int64(token * MOE_HIDDEN * 2)
         _quantize_row(c, xin, qx, MOE_HIDDEN)
+
+
+@flyc.jit
+def stage_k3_route_compact(c, picks):
+    """Build expert-grouped M64 tiles and a pick-to-compact-row map."""
+    tid, a = c["tid"], c["args"]
+    counts = rsrc(c["route_count"].value)
+    tile_bases = rsrc(c["route_tile_base"].value)
+    tile_experts = rsrc(c["tile_expert"].value)
+    tile_rows = rsrc(c["tile_rows"].value)
+    route_rows = rsrc(c["route_row"].value)
+
+    if tid < LOCAL_EXPERTS:
+        count = fx.Int32(0)
+        for pick in range_constexpr(picks):
+            expert = fx.Int32(
+                bo.buffer_load(rsrc(a["ids"]), pick, vec_width=1, dtype=T.i32)
+            )
+            count = count + (expert - a["local_start"] == tid).select(1, 0)
+        bo.buffer_store(count, counts, tid)
+    gpu.barrier()
+    fx.memory_fence(syncscope="workgroup", ordering=fx.AtomicOrdering.Acquire)
+
+    if tid < LOCAL_EXPERTS:
+        count = fx.Int32(
+            bo.buffer_load(counts, tid, vec_width=1, dtype=T.i32)
+        )
+        tile_base = fx.Int32(0)
+        for expert in range_constexpr(LOCAL_EXPERTS):
+            if expert < tid:
+                previous = fx.Int32(
+                    bo.buffer_load(counts, expert, vec_width=1, dtype=T.i32)
+                )
+                tile_base = tile_base + (previous + 63) // 64
+        bo.buffer_store(tile_base, tile_bases, tid)
+        expert_tiles = (count + 63) // 64
+        for tile in range_constexpr((MAX_TOKENS * TOP_K + 63) // 64):
+            if tile < expert_tiles:
+                tile_id = tile_base + tile
+                bo.buffer_store(fx.Int32(tid), tile_experts, tile_id)
+                remaining = count - tile * 64
+                bo.buffer_store(
+                    (remaining < 64).select(remaining, fx.Int32(64)),
+                    tile_rows,
+                    tile_id,
+                )
+    gpu.barrier()
+    fx.memory_fence(syncscope="workgroup", ordering=fx.AtomicOrdering.Acquire)
+
+    if tid == 0:
+        total_tiles = fx.Int32(0)
+        for expert in range_constexpr(LOCAL_EXPERTS):
+            count = fx.Int32(
+                bo.buffer_load(counts, expert, vec_width=1, dtype=T.i32)
+            )
+            total_tiles = total_tiles + (count + 63) // 64
+        bo.buffer_store(
+            total_tiles, rsrc(c["tile_count"].value), 0
+        )
+
+    for round_id in range_constexpr(
+        (MAX_TOKENS * TOP_K + THREADS - 1) // THREADS
+    ):
+        pick = tid + round_id * THREADS
+        if pick < picks:
+            expert = fx.Int32(
+                bo.buffer_load(rsrc(a["ids"]), pick, vec_width=1, dtype=T.i32)
+            )
+            local = expert - a["local_start"]
+            compact_row = fx.Int32(-1)
+            if (local >= 0) & (local < LOCAL_EXPERTS):
+                ordinal = fx.Int32(0)
+                for previous_pick in range_constexpr(picks):
+                    if previous_pick < pick:
+                        previous_expert = fx.Int32(
+                            bo.buffer_load(
+                                rsrc(a["ids"]),
+                                previous_pick,
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                        )
+                        ordinal = ordinal + (
+                            previous_expert == expert
+                        ).select(1, 0)
+                tile_base = fx.Int32(
+                    bo.buffer_load(
+                        tile_bases, local, vec_width=1, dtype=T.i32
+                    )
+                )
+                compact_row = tile_base * 64 + ordinal
+            bo.buffer_store(compact_row, route_rows, pick)
+    gpu.barrier()
+
+
+@flyc.jit
+def stage_expert_quantize_compact(c, pick):
+    """Quantize one local routed pick into its expert-grouped compact row."""
+    row = fx.Int32(
+        bo.buffer_load(
+            rsrc(c["route_row"].value), pick, vec_width=1, dtype=T.i32
+        )
+    )
+    if row >= 0:
+        token = pick // TOP_K
+        qx = c["compact_qx"].value + fx.Int64(row * MOE_HIDDEN * 2)
+        xin = c["args"]["xin"] + fx.Int64(token * MOE_HIDDEN * 2)
+        _quantize_row(c, xin, qx, MOE_HIDDEN)
+
+
+@flyc.jit
+def stage_expert_gather_compact_y(c, pick):
+    """Restore compact Down output to finalize's pick-major contract."""
+    row = fx.Int32(
+        bo.buffer_load(
+            rsrc(c["route_row"].value), pick, vec_width=1, dtype=T.i32
+        )
+    )
+    if row >= 0:
+        src = rsrc(
+            c["compact_y"].value + fx.Int64(row * MOE_HIDDEN * 2)
+        )
+        dst = rsrc(c["y"].value + fx.Int64(pick * MOE_HIDDEN * 2))
+        for it in range_constexpr((MOE_HIDDEN // 2) // THREADS):
+            word = c["tid"] + it * THREADS
+            value = fx.Int32(
+                bo.buffer_load(src, word, vec_width=1, dtype=T.i32)
+            )
+            bo.buffer_store(value, dst, word)
+    gpu.barrier()
 
 
 @flyc.jit
@@ -920,6 +1094,43 @@ def stage_unpool_tokens_gemv(c, tile):
 
 
 @flyc.jit
+def stage_unpool_splitk_tile(c, task):
+    """Write one BN64, split-K=4 FP32 Unpool partial tile."""
+    split = task % 4
+    n_tile = (task // 4) % (HIDDEN // 64)
+    m_tile = task // (4 * (HIDDEN // 64))
+    token0 = m_tile * 16
+    row0 = n_tile * 64
+    k_base = split * (MOE_HIDDEN // 4)
+    r_unp = rsrc(c["args"]["w_unpool"])
+    partial = rsrc(c["unpool_part"].value)
+    for sub in range_constexpr(4):
+        _bf_gemm_tokens_splitk_tile(
+            c,
+            r_unp,
+            row0 + sub * 16,
+            c["fbuf"].value,
+            MOE_HIDDEN,
+            k_base,
+            token0,
+        )
+        item = c["tid"]
+        token = item // 16
+        row = item % 16
+        token_id = token0 + token
+        if token_id < c["S"]:
+            value = _tile_token_value(c["red"], token, row)
+            offset = (
+                (split * MAX_TOKENS + token_id) * HIDDEN
+                + row0
+                + sub * 16
+                + row
+            )
+            bo.buffer_store(value, partial, offset)
+        gpu.barrier()
+
+
+@flyc.jit
 def stage_unpool_post(c, token=None):
     """Apply the complete FFN boundary after all unpool tiles are visible."""
     tid = c["tid"]
@@ -937,6 +1148,96 @@ def stage_unpool_post(c, token=None):
                 )
             )
         )
+        w0, w1 = bf2_f32(
+            fx.Int32(
+                bo.buffer_load(
+                    rsrc(a["pfw"]), e0 // 2 + q, vec_width=1, dtype=T.i32
+                )
+            )
+        )
+        p0, p1 = bf16_round(b0 * w0), bf16_round(b1 * w1)
+        post += [p0, p1]
+        local_ss = local_ss + p0 * p0 + p1 * p1
+    rinv = hw_rsq(_block_sum(c, local_ss, 0) / float(HIDDEN) + POST_EPS)
+    new = []
+    local_pre_ss = fx.Float32(0.0)
+    is_last = a["last"] != 0
+    for q in range_constexpr(8):
+        al = fx.Vector(
+            bo.buffer_load(rsrc(a["alpha"]), e0 + 4 * q, vec_width=4, dtype=T.f32)
+        )
+        be = fx.Vector(
+            bo.buffer_load(rsrc(a["beta"]), e0 + 4 * q, vec_width=4, dtype=T.f32)
+        )
+        old = fx.Vector(
+            bo.buffer_load(
+                rsrc(a["res"]),
+                token * HIDDEN + e0 + 4 * q,
+                vec_width=4,
+                dtype=T.f32,
+            )
+        )
+        nv = []
+        for j in range_constexpr(4):
+            n = bf16_round(post[4 * q + j] * rinv)
+            v = fx.Float32(al[j]) * fx.Float32(old[j]) + fx.Float32(be[j]) * n
+            nv.append(v)
+            pre = is_last.select(bf16_round(v), v)
+            local_pre_ss = local_pre_ss + pre * pre
+        new += nv
+        bo.buffer_store(
+            fx.Vector.from_elements(nv, fx.Float32),
+            rsrc(a["res"]),
+            token * HIDDEN + e0 + 4 * q,
+        )
+    pre_rinv = hw_rsq(
+        _block_sum(c, local_pre_ss, 1) / float(HIDDEN) + RMS_EPS
+    )
+    for q in range_constexpr(16):
+        nw0, nw1 = bf2_f32(
+            fx.Int32(
+                bo.buffer_load(
+                    rsrc(a["npw"]), e0 // 2 + q, vec_width=1, dtype=T.i32
+                )
+            )
+        )
+        i = 2 * q
+        p0 = is_last.select(bf16_round(new[i]), new[i])
+        p1 = is_last.select(bf16_round(new[i + 1]), new[i + 1])
+        bo.buffer_store(
+            bf16_pair(p0 * pre_rinv * nw0, p1 * pre_rinv * nw1)
+            .bitcast(fx.Int32),
+            rsrc(a["attn_out"]),
+            token * (HIDDEN // 2) + e0 // 2 + q,
+            cache_modifier=16,
+        )
+
+
+@flyc.jit
+def stage_unpool_reduce_post(c):
+    """Reduce four FP32 Unpool splits, then apply the fused boundary."""
+    tid, token = c["tid"], c["bid"]
+    a = c["args"]
+    partial = rsrc(c["unpool_part"].value)
+    e0 = tid * 32
+    post = []
+    local_ss = fx.Float32(0.0)
+    for q in range_constexpr(16):
+        col0, col1 = e0 + 2 * q, e0 + 2 * q + 1
+        b0, b1 = fx.Float32(0.0), fx.Float32(0.0)
+        for split in range_constexpr(4):
+            base = (split * MAX_TOKENS + token) * HIDDEN
+            b0 = b0 + fx.Float32(
+                bo.buffer_load(
+                    partial, base + col0, vec_width=1, dtype=T.f32
+                )
+            )
+            b1 = b1 + fx.Float32(
+                bo.buffer_load(
+                    partial, base + col1, vec_width=1, dtype=T.f32
+                )
+            )
+        b0, b1 = bf16_round(b0), bf16_round(b1)
         w0, w1 = bf2_f32(
             fx.Int32(
                 bo.buffer_load(

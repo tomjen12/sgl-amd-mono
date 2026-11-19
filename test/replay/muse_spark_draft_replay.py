@@ -290,7 +290,12 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _server_args(descriptor: ReplayDescriptor, mode: str = "baseline"):
+def _server_args(
+    descriptor: ReplayDescriptor,
+    mode: str = "baseline",
+    *,
+    cuda_graph: bool = False,
+):
     from sglang.srt.server_args import ServerArgs
 
     return ServerArgs(
@@ -311,7 +316,9 @@ def _server_args(descriptor: ReplayDescriptor, mode: str = "baseline"):
         speculative_num_draft_tokens=WIDTH,
         speculative_draft_window_size=WINDOW,
         enable_amd_monokernel=mode == "mono",
-        disable_cuda_graph=True,
+        cuda_graph_backend_decode="full" if cuda_graph else "disabled",
+        cuda_graph_backend_prefill="disabled",
+        cuda_graph_max_bs_decode=1 if cuda_graph else None,
     )
 
 
@@ -613,7 +620,13 @@ def _allocate_standalone_draft_pool(runner, pool_rows: int) -> None:
     )
 
 
-def _make_forward_batch(runner, descriptor: ReplayDescriptor, rank: int):
+def _make_forward_batch(
+    runner,
+    descriptor: ReplayDescriptor,
+    rank: int,
+    *,
+    cuda_graph: bool = False,
+):
     import torch
 
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -682,7 +695,7 @@ def _make_forward_batch(runner, descriptor: ReplayDescriptor, rank: int):
         ),
         capture_hidden_mode=CaptureHiddenMode.NULL,
         global_num_token_non_padded_cpu=WIDTH,
-        can_run_decode_cuda_graph=False,
+        can_run_decode_cuda_graph=cuda_graph,
     )
     runner.runner_ids.bind_own_plan(batch)
     return batch
@@ -697,6 +710,7 @@ def _rank_worker(
     trace_dir: str | None,
     record_shapes: bool,
     mode: str,
+    cuda_graph: bool,
     output_dir: str,
     result_connection,
 ) -> None:
@@ -714,10 +728,34 @@ def _rank_worker(
             SGLANG_MUSE_REPLAY_MARKERS="1" if trace_dir is not None else "0",
             SGLANG_USE_AITER="1",
             SGLANG_USE_AITER_UNIFIED_ATTN="1",
+            AITER_GROUPED_DEBUG="0",
+            SGLANG_SIMULATE_ACC_LEN="4.05",
+            SGLANG_RAGGED_VERIFY_MODE="static",
+            MUSE_MOE_BACKEND="triton",
+            NCCL_CUMEM_ENABLE="1",
             AITER_CUSTOM_AR_FORCE_VMM="1",
             AITER_CUSTOM_AR_MAX_SIZE="1048576",
+            SGLANG_USE_AITER_AG="0",
+            SGLANG_ROCM_MUSE_FINALIZE_AR_PUSH="0",
+            SGLANG_ROCM_MUSE_A4W4_MOE="0",
+            SGLANG_ROCM_MUSE_COMPACT_A4_VERIFY="0",
+            SGLANG_ROCM_MUSE_GFX1250_TRY_GFX95="1",
+            SGLANG_ROCM_MUSE_EXTEND_GLUON="0",
+            SGLANG_ROCM_MUSE_EXTEND_SWA_GLUON="0",
+            SGLANG_ROCM_MUSE_EXTEND_FLYDSL="0",
+            SGLANG_ROCM_MUSE_VERIFY_FLYDSL="0",
+            SGLANG_ROCM_MUSE_VERIFY_BALANCED="0",
+            SGLANG_ROCM_MUSE_VERIFY_SWA_FLYDSL="0",
+            HIP_FORCE_DEV_KERNARG="1",
+            SGLANG_ROCM_MUSE_GFX1250_EXTEND="1",
+            SGLANG_ROCM_MUSE_PUSH_AR="0",
             SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2="1",
             SGLANG_OPT_SCHEDULER_SHM_SYNC="1",
+        )
+        os.environ["AITER_CONFIG_GROUPED_FMOE"] = str(
+            Path(__file__).resolve().parents[3]
+            / "sglang/docker/muse_gfx1250/"
+            "muse_gfx1250_tp8_ep8_tuned_grouped_fmoe.csv"
         )
         if mode == "mono":
             import sgl_amd_mono
@@ -745,7 +783,7 @@ def _rank_worker(
         )
 
         torch.cuda.set_device(rank)
-        server_args = _server_args(descriptor, mode)
+        server_args = _server_args(descriptor, mode, cuda_graph=cuda_graph)
         server_args.resolve_once()
         _set_envs_and_config(server_args)
         publish(
@@ -776,13 +814,22 @@ def _rank_worker(
         )
         _allocate_standalone_draft_pool(runner, descriptor.kv_shape[0])
         runner.init_attention_backends()
-        # This initializes the eager runner too; graphs remain disabled by the
-        # ServerArgs and every replay batch explicitly rejects graph dispatch.
         runner.init_cuda_graphs()
         mono_attached = hasattr(runner.model, "_monokernel_unread_metadata")
         if mode == "mono" and not mono_attached:
             raise RuntimeError("Draft Mono mode requested but plugin did not attach.")
-        batch = _make_forward_batch(runner, descriptor, rank)
+        batch = _make_forward_batch(
+            runner, descriptor, rank, cuda_graph=cuda_graph
+        )
+        can_graph = bool(
+            runner.decode_cuda_graph_runner
+            and runner.decode_cuda_graph_runner.can_run_graph(batch)
+        )
+        if can_graph != cuda_graph:
+            raise RuntimeError(
+                "Draft replay CUDA Graph eligibility disagrees with the "
+                f"requested mode: requested={cuda_graph}, eligible={can_graph}"
+            )
 
         def run_once():
             with replay_scope("draft/forward"):
@@ -845,7 +892,16 @@ def _rank_worker(
             else _install_baseline_state_observers(runner.model, layer_states)
             + _install_conv_observers(runner.model, conv_captures)
         )
-        output = run_once()
+        if cuda_graph:
+            from sglang.srt.rocm_muse_spark.replay_capture import (
+                force_eager_model_runner,
+            )
+
+            runner.attn_backend.init_forward_metadata(batch)
+            with force_eager_model_runner(runner):
+                output = run_once()
+        else:
+            output = run_once()
         torch.cuda.synchronize()
         for handle in handles:
             handle.remove()
@@ -939,6 +995,7 @@ def run_replay(
     record_shapes: bool,
     timeout: int,
     mode: str = "baseline",
+    cuda_graph: bool = False,
 ) -> dict[str, Any]:
     if warmup < 0:
         raise ReplayInputError("--warmup must be non-negative.")
@@ -965,6 +1022,7 @@ def run_replay(
                 trace_dir,
                 record_shapes,
                 mode,
+                cuda_graph,
                 str(output_dir),
                 connections[rank][1],
             ),
@@ -1001,8 +1059,13 @@ def run_replay(
     ranks = [result for _, result, _ in sorted(received) if result is not None]
     summary = {
         "descriptor": descriptor.summary(),
-        "workload": "sglang-dflash2-draft-modelrunner-eager",
+        "workload": (
+            "sglang-dflash2-draft-modelrunner-cuda-graph"
+            if cuda_graph
+            else "sglang-dflash2-draft-modelrunner-eager"
+        ),
         "mode": mode,
+        "execution": "cuda-graph" if cuda_graph else "eager",
         "world_size": WORLD_SIZE,
         "ranks": ranks,
     }
@@ -1024,6 +1087,14 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trace", action="store_true")
     parser.add_argument("--record-shapes", action="store_true")
     parser.add_argument("--mode", choices=("baseline", "mono"), default="baseline")
+    parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help=(
+            "Profile full decode CUDA Graph replay. Graph capture and warmup "
+            "complete before the trace starts."
+        ),
+    )
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument(
         "--preflight-only",
@@ -1051,6 +1122,7 @@ def main(argv: list[str] | None = None) -> int:
             record_shapes=args.record_shapes,
             timeout=args.timeout,
             mode=args.mode,
+            cuda_graph=args.cuda_graph,
         )
         print(json.dumps(summary, indent=2, sort_keys=True))
         return 0

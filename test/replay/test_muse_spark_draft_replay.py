@@ -199,4 +199,8 @@ def test_cli_is_eager_baseline_with_explicit_iteration_controls():
     assert args.iterations == 7
     assert args.trace is True
     assert args.record_shapes is True
+    assert args.cuda_graph is False
     assert not hasattr(args, "monokernel")
+
+    graph = create_parser().parse_args(["bundle", "--cuda-graph"])
+    assert graph.cuda_graph is True
