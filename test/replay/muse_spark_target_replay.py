@@ -83,6 +83,7 @@ class ReplayInputError(ValueError):
 class RankDescriptor:
     rank: int
     seed: int
+    batch_size: int
     prefix_len: int
     seq_lens_sum: int
     vocab_size: int
@@ -133,14 +134,20 @@ def load_rank_descriptor(
     config = _read_json(Path(target_config) / "config.json")
     text = config.get("text_config", {})
 
-    if int(cycle.get("width", -1)) != WIDTH or int(cycle.get("batch_size", -1)) != 1:
-        raise ReplayInputError(f"rank {rank}: capture is not width-8/batch-1")
+    batch_size = int(cycle.get("batch_size", -1))
+    rows = batch_size * WIDTH
+    if int(cycle.get("width", -1)) != WIDTH or batch_size not in (1, 4, 8):
+        raise ReplayInputError(
+            f"rank {rank}: capture must be width-8 with batch 1, 4, or 8"
+        )
     if int(cycle.get("draft_tp_size", -1)) != WORLD_SIZE:
         raise ReplayInputError(f"rank {rank}: capture is not TP4")
     if verify.get("forward_mode") != "TARGET_VERIFY":
         raise ReplayInputError(f"rank {rank}: forward mode is not TARGET_VERIFY")
-    if verify.get("tensors", {}).get("input_ids", {}).get("shape") != [WIDTH]:
-        raise ReplayInputError(f"rank {rank}: Target input is not shape [{WIDTH}]")
+    if verify.get("tensors", {}).get("input_ids", {}).get("shape") != [rows]:
+        raise ReplayInputError(
+            f"rank {rank}: Target input is not shape [{rows}]"
+        )
     if int(text.get("num_hidden_layers", -1)) != TARGET_LAYERS:
         raise ReplayInputError("config-only Target must contain exactly layers 0-9")
     if list(Path(target_config).glob("*.safetensors")):
@@ -159,7 +166,10 @@ def load_rank_descriptor(
             )
         cache_rows[cache_name] = int(shape[0])
 
-    lower_bound = int(verify.get("attention_kv_len_lower_bound") or 0)
+    lower_bound = int(
+        verify.get("attention_kv_len_lower_bound")
+        or int(cache.get("kv.full", {}).get("active_length", 0)) - WIDTH
+    )
     if lower_bound < 8192:
         raise ReplayInputError(f"rank {rank}: captured prefix is shorter than 8192")
     routing: list[tuple[int, ...]] = []
@@ -168,22 +178,23 @@ def load_rank_descriptor(
         stream = layers.get(f"layer_{layer}.input.stream")
         if (
             not isinstance(entry, dict)
-            or entry.get("rows") != WIDTH
+            or entry.get("rows") != rows
             or entry.get("top_k") != WIDTH
             or stream is None
-            or stream.get("shape") != [WIDTH, 8192]
+            or stream.get("shape") != [rows, 8192]
         ):
             raise ReplayInputError(
                 f"rank {rank}: layer {layer} lacks width-8 routing/stream geometry"
             )
         counts = tuple(int(value) for value in entry.get("global_token_counts", ()))
-        if len(counts) != 256 or sum(counts) != WIDTH * WIDTH:
+        if len(counts) != 256 or sum(counts) != rows * WIDTH:
             raise ReplayInputError(f"rank {rank}: layer {layer} routing is malformed")
         routing.append(counts)
 
     return RankDescriptor(
         rank=rank,
         seed=int(cycle.get("synthetic_seed", -1)),
+        batch_size=batch_size,
         prefix_len=lower_bound,
         seq_lens_sum=int(verify.get("seq_lens_sum", lower_bound + WIDTH)),
         vocab_size=int(text.get("vocab_size", 0)),
@@ -202,6 +213,7 @@ def validate_inputs(
     )
     seeds = {item.seed for item in descriptors}
     prefixes = {item.prefix_len for item in descriptors}
+    batch_sizes = {item.batch_size for item in descriptors}
     pool_extents = {
         (item.full_kv_physical_rows, item.swa_kv_physical_rows)
         for item in descriptors
@@ -210,6 +222,8 @@ def validate_inputs(
         raise ReplayInputError("all four ranks must share a valid synthetic seed")
     if len(prefixes) != 1:
         raise ReplayInputError("all four ranks must share the captured prefix length")
+    if len(batch_sizes) != 1:
+        raise ReplayInputError("all four ranks must share the captured batch size")
     if len(pool_extents) != 1:
         raise ReplayInputError("all four ranks must share captured KV pool extents")
     if any(item.vocab_size <= 0 for item in descriptors):
@@ -217,28 +231,38 @@ def validate_inputs(
     return descriptors
 
 
-def routing_ids_from_counts(counts: Iterable[int]) -> tuple[tuple[int, ...], ...]:
-    """Build a deterministic [8, 8] routing table with unique ids per row."""
+def routing_ids_from_counts(
+    counts: Iterable[int], rows: int = WIDTH
+) -> tuple[tuple[int, ...], ...]:
+    """Build a deterministic [rows, 8] routing table with unique ids per row."""
     counts = tuple(int(value) for value in counts)
-    if len(counts) != 256 or sum(counts) != WIDTH * WIDTH:
-        raise ReplayInputError("routing counts must contain 64 assignments")
-    if any(value < 0 or value > WIDTH for value in counts):
+    if len(counts) != 256 or sum(counts) != rows * WIDTH:
+        raise ReplayInputError(
+            f"routing counts must contain {rows * WIDTH} assignments"
+        )
+    if any(value < 0 or value > rows for value in counts):
         raise ReplayInputError("an expert may appear at most once per routing row")
 
-    rows: list[list[int]] = [[] for _ in range(WIDTH)]
+    assignments: list[list[int]] = [[] for _ in range(rows)]
     for expert, count in sorted(
         enumerate(counts), key=lambda item: (-item[1], item[0])
     ):
-        candidates = sorted(range(WIDTH), key=lambda row: (len(rows[row]), row))
+        candidates = sorted(
+            range(rows), key=lambda row: (len(assignments[row]), row)
+        )
         for row in candidates[:count]:
-            rows[row].append(expert)
-    if any(len(row) != WIDTH or len(set(row)) != WIDTH for row in rows):
-        raise ReplayInputError("captured routing counts cannot form an [8, 8] table")
-    return tuple(tuple(sorted(row)) for row in rows)
+            assignments[row].append(expert)
+    if any(
+        len(row) != WIDTH or len(set(row)) != WIDTH for row in assignments
+    ):
+        raise ReplayInputError(
+            f"captured routing counts cannot form a [{rows}, 8] table"
+        )
+    return tuple(tuple(sorted(row)) for row in assignments)
 
 
 def compare_routing(
-    expected: Iterable[Iterable[int]], observed: dict[str, Any]
+    expected: Iterable[Iterable[int]], observed: dict[str, Any], *, rows: int = WIDTH
 ) -> dict[str, Any]:
     expected = tuple(tuple(int(v) for v in row) for row in expected)
     mismatched: list[int] = []
@@ -249,7 +273,7 @@ def compare_routing(
             shape_preserved = False
             mismatched.append(layer)
             continue
-        if entry.get("rows") != WIDTH or entry.get("top_k") != WIDTH:
+        if entry.get("rows") != rows or entry.get("top_k") != WIDTH:
             shape_preserved = False
         actual = tuple(int(v) for v in entry.get("global_token_counts", ()))
         if actual != counts:
@@ -499,7 +523,7 @@ class _CaptureWriter:
         self.values[name] = value
 
 
-def _build_server_args(args):
+def _build_server_args(args, descriptor: RankDescriptor):
     from sglang.srt.server_args import ServerArgs
 
     return ServerArgs(
@@ -510,8 +534,8 @@ def _build_server_args(args):
         tp_size=WORLD_SIZE,
         ep_size=WORLD_SIZE,
         mem_fraction_static=args.mem_fraction_static,
-        max_running_requests=2,
-        max_total_tokens=16384,
+        max_running_requests=max(2, descriptor.batch_size),
+        max_total_tokens=16384 * descriptor.batch_size,
         context_length=16384,
         attention_backend="aiter",
         page_size=16,
@@ -525,7 +549,9 @@ def _build_server_args(args):
         speculative_draft_window_size=2048,
         cuda_graph_backend_decode="full" if args.cuda_graph else "disabled",
         cuda_graph_backend_prefill="disabled",
-        cuda_graph_max_bs_decode=1 if args.cuda_graph else None,
+        cuda_graph_bs_decode=(
+            [descriptor.batch_size] if args.cuda_graph else None
+        ),
     )
 
 
@@ -594,22 +620,26 @@ def _prepare_verify_batch(
         prepare_synthetic_inputs_for_latency_test,
     )
     from sglang.srt.managers.schedule_batch import ScheduleBatch
-    from sglang.srt.mem_cache.allocation import (
-        alloc_paged_token_slots_decode,
-        assign_req_to_token_pool_func,
+    from sglang.kernels.ops.speculative.cache_locs import (
+        assign_extend_cache_locs_func,
     )
+    from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
     from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
     from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
-    tokens = deterministic_values(
-        seed=descriptor.seed,
-        rank=0,
-        name="target-prefix",
-        count=descriptor.prefix_len,
-        modulus=descriptor.vocab_size,
-    )
+    batch_size = descriptor.batch_size
+    tokens = [
+        deterministic_values(
+            seed=descriptor.seed,
+            rank=0,
+            name=f"target-prefix-{request}",
+            count=descriptor.prefix_len,
+            modulus=descriptor.vocab_size,
+        )
+        for request in range(batch_size)
+    ]
     reqs = prepare_synthetic_inputs_for_latency_test(
-        1, descriptor.prefix_len, [tokens]
+        batch_size, descriptor.prefix_len, tokens
     )
     _, _, batch = extend(reqs, runner)
     if not isinstance(batch, ScheduleBatch):
@@ -620,45 +650,57 @@ def _prepare_verify_batch(
             seed=descriptor.seed,
             rank=0,
             name="target-width8-input",
-            count=WIDTH,
+            count=batch_size * WIDTH,
             modulus=descriptor.vocab_size,
         ),
         dtype=torch.int64,
         device=runner.device,
     )
     prefix_lens = torch.full(
-        (1,), descriptor.prefix_len, dtype=torch.int64, device=runner.device
-    )
-    positions = torch.arange(
+        (batch_size,),
         descriptor.prefix_len,
-        descriptor.prefix_len + WIDTH,
         dtype=torch.int64,
         device=runner.device,
     )
-    last_loc = batch.req_to_token_pool.req_to_token[
-        batch.req_pool_indices, batch.seq_lens - 1
-    ]
-    out_cache_loc = alloc_paged_token_slots_decode(
+    positions = (
+        torch.arange(
+            descriptor.prefix_len,
+            descriptor.prefix_len + WIDTH,
+            dtype=torch.int64,
+            device=runner.device,
+        )
+        .repeat(batch_size)
+        .contiguous()
+    )
+    next_seq_lens = batch.seq_lens + WIDTH
+    next_seq_lens_cpu = batch.seq_lens_cpu + WIDTH
+    alloc_for_spec_decode(
         tree_cache=batch.tree_cache,
-        seq_lens=batch.seq_lens + WIDTH,
-        seq_lens_cpu=batch.seq_lens_cpu + WIDTH,
-        last_loc=last_loc,
-        token_per_req=WIDTH,
+        req_to_token_pool=batch.req_to_token_pool,
+        reqs=batch.reqs,
         req_pool_indices=batch.req_pool_indices,
+        cur_kv_lens=batch.seq_lens,
+        cur_kv_lens_cpu=batch.seq_lens_cpu,
+        nxt_kv_lens=next_seq_lens,
+        nxt_kv_lens_cpu=next_seq_lens_cpu,
+        num_needed_tokens=batch_size * WIDTH,
         batch=batch,
     )
-    assign_req_to_token_pool_func(
-        batch.req_pool_indices,
-        batch.req_to_token_pool.req_to_token,
-        prefix_lens,
-        prefix_lens + WIDTH,
-        out_cache_loc,
-        batch_size=1,
+    out_cache_loc = assign_extend_cache_locs_func(
+        req_pool_indices=batch.req_pool_indices,
+        req_to_token=batch.req_to_token_pool.req_to_token,
+        start_offset=prefix_lens,
+        end_offset=prefix_lens + WIDTH,
+        batch_size=batch_size,
+        draft_token_num=WIDTH,
+        device=runner.device,
     )
     plan = runner.runner_ids.plan(
         req_pool_indices=batch.req_pool_indices,
         seq_lens=prefix_lens,
-        seq_lens_cpu=torch.tensor([descriptor.prefix_len], dtype=torch.int64),
+        seq_lens_cpu=torch.full(
+            (batch_size,), descriptor.prefix_len, dtype=torch.int64
+        ),
         write_virtual=out_cache_loc,
         read_extent=WIDTH,
     )
@@ -673,7 +715,15 @@ def _prepare_verify_batch(
     batch.can_run_decode_cuda_graph = cuda_graph
     # Preserve the captured host-side planner bound exactly; GPU seq_lens stays
     # at the committed 8192-token prefix as in DFlashWorkerV2.
-    batch.seq_lens_cpu = torch.tensor([descriptor.seq_lens_sum], dtype=torch.int64)
+    if descriptor.seq_lens_sum % batch_size:
+        raise RuntimeError(
+            "Captured Target seq_lens_sum is not divisible by batch size"
+        )
+    batch.seq_lens_cpu = torch.full(
+        (batch_size,),
+        descriptor.seq_lens_sum // batch_size,
+        dtype=torch.int64,
+    )
     batch.seq_lens_sum = descriptor.seq_lens_sum
     forward_batch, can_graph = spec.prepare_for_verify(
         batch, SimpleNamespace(model_runner=runner)
@@ -790,7 +840,9 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
             )
         route_ids = {
             layer: torch.tensor(
-                routing_ids_from_counts(counts),
+                routing_ids_from_counts(
+                    counts, descriptor.batch_size * WIDTH
+                ),
                 dtype=torch.int32,
                 device=runner.device,
             )
@@ -985,7 +1037,11 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
             raw.unlink()
 
         observed = writer.values.get("target_layers", {})
-        routing = compare_routing(descriptor.captured_routing, observed)
+        routing = compare_routing(
+            descriptor.captured_routing,
+            observed,
+            rows=descriptor.batch_size * WIDTH,
+        )
         result = {
             "rank": rank,
             "status": "ok",
@@ -996,6 +1052,7 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
             "weight_seed": weight_seed,
             "input": {
                 "prefix_len": descriptor.prefix_len,
+                "batch_size": descriptor.batch_size,
                 "width": WIDTH,
                 "positions": [int(v) for v in positions.cpu().tolist()],
                 "seq_lens_sum": descriptor.seq_lens_sum,
@@ -1165,7 +1222,7 @@ def execute(args) -> tuple[int, dict[str, Any]]:
     from sglang.srt.server_args import PortArgs
 
     descriptors = validate_inputs(args.bundle, args.target_config, step=args.step)
-    server_args = _build_server_args(args)
+    server_args = _build_server_args(args, descriptors[0])
     declare_resolution(server_args, "muse.target.replay")
     server_args.resolve_once()
     _set_envs_and_config(server_args)

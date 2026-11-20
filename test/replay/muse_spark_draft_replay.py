@@ -44,6 +44,7 @@ class ReplayDescriptor:
     checkpoint: Path
     step: int
     seed: int
+    batch_size: int
     prefix_position: int
     seq_len: int
     seq_len_bound: int
@@ -174,14 +175,14 @@ def validate_replay_inputs(
             )
         for layer in range(LAYERS):
             if _shape(layers, f"layer_{layer}.input.hidden") != (
-                WIDTH,
+                int(current["batch_size"]) * WIDTH,
                 HIDDEN_SIZE,
             ):
                 raise ReplayInputError(
                     f"rank {rank} layer {layer} hidden descriptor is not [8, 8192]."
                 )
             if _shape(layers, f"layer_{layer}.output.conv_coefficients") != (
-                WIDTH,
+                int(current["batch_size"]) * WIDTH,
                 2,
                 HIDDEN_SIZE // 16,
             ):
@@ -190,13 +191,18 @@ def validate_replay_inputs(
                 )
 
     assert common is not None and forward_zero is not None
+    batch_size = int(common["batch_size"])
+    if batch_size not in (1, 4, 8):
+        raise ReplayInputError(
+            f"Captured Draft batch_size must be 1, 4, or 8, got {batch_size}."
+        )
+    rows = batch_size * WIDTH
     expected = {
         "width": WIDTH,
-        "batch_size": 1,
         "tp": WORLD_SIZE,
-        "input_shape": (WIDTH, HIDDEN_SIZE),
-        "position_shape": (WIDTH,),
-        "seq_lens_shape": (1,),
+        "input_shape": (rows, HIDDEN_SIZE),
+        "position_shape": (rows,),
+        "seq_lens_shape": (batch_size,),
     }
     for key, value in expected.items():
         if common[key] != value:
@@ -224,14 +230,15 @@ def validate_replay_inputs(
         checkpoint=checkpoint,
         step=step,
         seed=int(common["seed"]),
+        batch_size=batch_size,
         prefix_position=8192,
         seq_len=WINDOW,
         seq_len_bound=int(common["seq_lens_sum"]),
         cache_rows=WINDOW + WIDTH,
-        input_shape=(WIDTH, HIDDEN_SIZE),
-        position_shape=(WIDTH,),
+        input_shape=(rows, HIDDEN_SIZE),
+        position_shape=(rows,),
         kv_shape=kv_shape,
-        conv_shape=(WIDTH, 2, HIDDEN_SIZE // 16),
+        conv_shape=(rows, 2, HIDDEN_SIZE // 16),
     )
 
 
@@ -263,10 +270,14 @@ def deterministic_values(
 def deterministic_positions(descriptor: ReplayDescriptor):
     import torch
 
-    return torch.arange(
-        descriptor.prefix_position,
-        descriptor.prefix_position + WIDTH,
-        dtype=torch.int64,
+    return (
+        torch.arange(
+            descriptor.prefix_position,
+            descriptor.prefix_position + WIDTH,
+            dtype=torch.int64,
+        )
+        .repeat(descriptor.batch_size)
+        .contiguous()
     )
 
 
@@ -304,8 +315,8 @@ def _server_args(
         device="cuda",
         tp_size=WORLD_SIZE,
         mem_fraction_static=0.75,
-        max_running_requests=2,
-        max_total_tokens=4096,
+        max_running_requests=max(2, descriptor.batch_size),
+        max_total_tokens=4096 * descriptor.batch_size,
         context_length=16384,
         page_size=PAGE_SIZE,
         kv_cache_dtype="fp8_e4m3",
@@ -318,7 +329,9 @@ def _server_args(
         enable_amd_monokernel=mode == "mono",
         cuda_graph_backend_decode="full" if cuda_graph else "disabled",
         cuda_graph_backend_prefill="disabled",
-        cuda_graph_max_bs_decode=1 if cuda_graph else None,
+        cuda_graph_bs_decode=(
+            [descriptor.batch_size] if cuda_graph else None
+        ),
     )
 
 
@@ -662,30 +675,36 @@ def _make_forward_batch(
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     device = torch.device("cuda", rank)
+    batch_size = descriptor.batch_size
     slots = torch.arange(
-        1, descriptor.cache_rows + 1, dtype=torch.int64, device=device
-    )
-    runner.req_to_token_pool.req_to_token[0, : descriptor.cache_rows].copy_(
-        slots.to(torch.int32)
-    )
+        1,
+        batch_size * descriptor.cache_rows + 1,
+        dtype=torch.int64,
+        device=device,
+    ).reshape(batch_size, descriptor.cache_rows)
+    runner.req_to_token_pool.req_to_token[
+        :batch_size, : descriptor.cache_rows
+    ].copy_(slots.to(torch.int32))
+    prefix_slots = slots[:, : descriptor.seq_len].reshape(-1)
+    output_slots = slots[:, descriptor.seq_len :].reshape(-1)
     for layer_id in range(LAYERS):
         key, value = runner.token_to_kv_pool.get_kv_buffer(layer_id)
         key_values = deterministic_values(
-            (descriptor.seq_len, KV_HEADS_PER_RANK, HEAD_DIM),
+            (batch_size * descriptor.seq_len, KV_HEADS_PER_RANK, HEAD_DIM),
             seed=descriptor.seed,
             rank=rank,
             component=f"layer-{layer_id}-key",
             scale=0.7,
         ).to(dtype=torch.float8_e4m3fn, device=device)
         value_values = deterministic_values(
-            (descriptor.seq_len, KV_HEADS_PER_RANK, HEAD_DIM),
+            (batch_size * descriptor.seq_len, KV_HEADS_PER_RANK, HEAD_DIM),
             seed=descriptor.seed,
             rank=rank,
             component=f"layer-{layer_id}-value",
             scale=0.7,
         ).to(dtype=torch.float8_e4m3fn, device=device)
-        key[slots[: descriptor.seq_len]] = key_values
-        value[slots[: descriptor.seq_len]] = value_values
+        key[prefix_slots] = key_values
+        value[prefix_slots] = value_values
 
     positions = deterministic_positions(descriptor).to(device)
     input_embeds = deterministic_values(
@@ -699,18 +718,25 @@ def _make_forward_batch(
     ).to(dtype=torch.bfloat16, device=device)
     batch = ForwardBatch(
         forward_mode=ForwardMode.TARGET_VERIFY,
-        batch_size=1,
+        batch_size=batch_size,
         input_ids=torch.full(
-            (WIDTH,), 200002, dtype=torch.int64, device=device
+            (batch_size * WIDTH,), 200002, dtype=torch.int64, device=device
         ),
-        req_pool_indices=torch.zeros((1,), dtype=torch.int64, device=device),
-        seq_lens=torch.tensor(
-            [descriptor.seq_len], dtype=torch.int32, device=device
+        req_pool_indices=torch.arange(
+            batch_size, dtype=torch.int64, device=device
         ),
-        out_cache_loc=slots[descriptor.seq_len :],
+        seq_lens=torch.full(
+            (batch_size,),
+            descriptor.seq_len,
+            dtype=torch.int32,
+            device=device,
+        ),
+        out_cache_loc=output_slots,
         seq_lens_sum=descriptor.seq_len_bound,
-        seq_lens_cpu=torch.tensor(
-            [descriptor.seq_len_bound], dtype=torch.int32
+        seq_lens_cpu=torch.full(
+            (batch_size,),
+            descriptor.seq_len_bound // batch_size,
+            dtype=torch.int32,
         ),
         positions=positions,
         input_embeds=input_embeds,
@@ -719,7 +745,7 @@ def _make_forward_batch(
             draft_token_num=WIDTH, device=device
         ),
         capture_hidden_mode=CaptureHiddenMode.NULL,
-        global_num_token_non_padded_cpu=WIDTH,
+        global_num_token_non_padded_cpu=batch_size * WIDTH,
         can_run_decode_cuda_graph=cuda_graph,
     )
     runner.runner_ids.bind_own_plan(batch)
