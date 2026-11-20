@@ -113,6 +113,7 @@ def _worker(rank, port, queue):
                 single_boundary_wait=os.environ.get("MUSE_K2_SINGLE_BOUNDARY_WAIT") == "1",
                 lds_x_rp=os.environ.get("MUSE_K2_LDS_X_RP") == "1",
                 joint_rp=os.environ.get("MUSE_K2_JOINT_RP") == "1",
+                joint_rp_tdm=os.environ.get("MUSE_K2_JOINT_RP_TDM") == "1",
                 phase_trace=phase_trace,
             )
         )

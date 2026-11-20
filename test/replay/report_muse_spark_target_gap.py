@@ -270,17 +270,23 @@ def _baseline_samples(directory: Path):
             graph_scopes = _scope_kernels(trace, r"^muse_replay/target/verify$")
             for index, kernels in enumerate(graph_scopes):
                 relevant = _baseline_relevant(kernels)
-                expected = 17 + len(ELIGIBLE_LAYERS) * 18
-                if len(relevant) != expected:
+                eligible_count = len(ELIGIBLE_LAYERS) * 18
+                fallback_count = len(relevant) - eligible_count
+                if fallback_count not in (13, 17):
                     raise ValueError(
                         f"{path}: graph iteration {index} has {len(relevant)} "
-                        f"Target layer kernels, expected {expected}"
+                        "Target layer kernels; expected 13 or 17 layer-0 "
+                        f"fallback launches plus {eligible_count} eligible launches"
                     )
                 scopes.extend(
                     [
-                        relevant[:17],
+                        relevant[:fallback_count],
                         *[
-                            relevant[17 + offset * 18 : 17 + (offset + 1) * 18]
+                            relevant[
+                                fallback_count
+                                + offset * 18 : fallback_count
+                                + (offset + 1) * 18
+                            ]
                             for offset in range(len(ELIGIBLE_LAYERS))
                         ],
                     ]
@@ -299,9 +305,10 @@ def _baseline_samples(directory: Path):
             layers = scopes[
                 iteration * TARGET_LAYERS : (iteration + 1) * TARGET_LAYERS
             ]
-            if len(layers[0]) != 17:
+            if len(layers[0]) not in (13, 17):
                 raise ValueError(
-                    f"baseline layer 0: expected 17 fallback launches, got {len(layers[0])}"
+                    "baseline layer 0: expected 13 graph or 17 eager "
+                    f"fallback launches, got {len(layers[0])}"
                 )
             total = 0.0
             for layer in ELIGIBLE_LAYERS:

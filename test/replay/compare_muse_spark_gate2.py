@@ -140,12 +140,22 @@ def main() -> int:
     parser.add_argument("mono_dir", type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    result = compare_directories(args.baseline_dir, args.mono_dir)
+    try:
+        result = compare_directories(args.baseline_dir, args.mono_dir)
+        exit_code = 0
+    except AssertionError as error:
+        result = {
+            "passed": False,
+            "threshold": DEFAULT_COSINE,
+            "error": str(error),
+        }
+        exit_code = 1
     encoded = json.dumps(result, indent=2, sort_keys=True)
     if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(encoded + "\n")
     print(encoded)
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -1,5 +1,8 @@
 """Checkpoint-shape checks for the gfx1250 DFlash2 TP4 draft profile."""
 
+import torch
+
+from sgl_amd_mono.muse_spark import draft as D
 from sgl_amd_mono.muse_spark.gfx1250 import draft_config as C
 from sgl_amd_mono.muse_spark.gfx1250 import draft_layout as L
 
@@ -50,3 +53,11 @@ def test_variable_request_attention_geometry():
         requests = tokens // C.BLOCK
         assert L.request_count(tokens) == requests
         assert L.attention_tasks(tokens) == requests * 96
+
+
+def test_graph_table_width_uses_host_planning_bound():
+    lens = torch.tensor([2048], dtype=torch.int32)
+    lens_cpu = torch.tensor([2064], dtype=torch.int32)
+
+    assert D._mono_table_width(8192, lens, lens_cpu) == 2072
+    assert D._mono_table_width(2064, lens, lens_cpu) == 2064

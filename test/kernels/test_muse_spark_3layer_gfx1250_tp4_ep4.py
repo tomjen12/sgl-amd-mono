@@ -13,6 +13,7 @@ reference, then are converted to AITER's shuffled gfx1250 layout for both
 kernel paths.  The reference dequantizes only routed expert slices.
 """
 
+import json
 import os
 import sys
 import time
@@ -484,6 +485,8 @@ def _worker(rank, port, queue, rows):
         KAttnBuild,
         build_k1,
         build_kattn,
+        build_tiled_kattn,
+        tiled_kattn_scratch_bytes,
     )
     from sgl_amd_mono.muse_spark.gfx1250.layout import (
         k1_scratch_layout,
@@ -599,8 +602,46 @@ def _worker(rank, port, queue, rows):
             ).view(torch.uint8)
 
         k1 = build_k1(K1Build(tokens=rows))
-        kattn = build_kattn(
-            KAttnBuild(tokens=rows, q_len=8)
+        use_tiled_kattn = os.environ.get("MUSE_TARGET_TILED_KATTN") == "1"
+        kattn_key = KAttnBuild(
+            tokens=rows,
+            q_len=8,
+            triton_parity_v3=(
+                os.environ.get(
+                    "SGLANG_AMD_MONO_MUSE_KATTN_TRITON_PARITY_V3",
+                    "0",
+                )
+                == "1"
+            ),
+            block_b_parity=(
+                os.environ.get(
+                    "SGLANG_AMD_MONO_MUSE_KATTN_BLOCK_B_PARITY",
+                    "0",
+                )
+                == "1"
+            ),
+        )
+        kattn = (
+            build_tiled_kattn(kattn_key)
+            if use_tiled_kattn
+            else build_kattn(kattn_key)
+        )
+        differential_kattn = (
+            use_tiled_kattn
+            and kattn_key.block_b_parity
+            and os.environ.get("MUSE_TARGET_KATTN_DIFFERENTIAL") == "1"
+        )
+        kattn_reference = (
+            build_tiled_kattn(
+                KAttnBuild(
+                    tokens=rows,
+                    q_len=8,
+                    triton_parity_v3=True,
+                    block_b_parity=False,
+                )
+            )
+            if differential_kattn
+            else None
         )
         k2 = build_k2(K2Build(tokens=rows, npes=NP))
         k3_variants = {
@@ -637,6 +678,20 @@ def _worker(rank, port, queue, rows):
             dtype=torch.uint8,
             device=device,
         )
+        split_kattn_scratch = (
+            torch.zeros(
+                tiled_kattn_scratch_bytes(),
+                dtype=torch.uint8,
+                device=device,
+            )
+            if use_tiled_kattn
+            else None
+        )
+        reference_kattn_scratch = (
+            torch.zeros_like(split_kattn_scratch)
+            if differential_kattn
+            else None
+        )
         fused_k1_scratch = (
             None if split_only else torch.zeros_like(split_k1_scratch)
         )
@@ -670,6 +725,70 @@ def _worker(rank, port, queue, rows):
             )
             return q, k, torch.empty_like(k), torch.empty_like(q)
 
+        kattn_serial = 0
+
+        def invoke_kattn(q, out, k_cache, v_cache, layer):
+            nonlocal kattn_serial
+            arguments = (
+                q.data_ptr(),
+                out.data_ptr(),
+                k_cache.data_ptr(),
+                v_cache.data_ptr(),
+                layer["table"].data_ptr(),
+                layer["table"].stride(0),
+                prefix.data_ptr(),
+                int(prefix.dtype == torch.int64),
+                layer["window"],
+                scale_bits,
+            )
+            if use_tiled_kattn:
+                reference_out = None
+                if differential_kattn:
+                    reference_out = torch.empty_like(out)
+                    kattn_reference(
+                        *(
+                            arguments[:1]
+                            + (reference_out.data_ptr(),)
+                            + arguments[2:]
+                        ),
+                        reference_kattn_scratch.data_ptr(),
+                        split_epoch.data_ptr(),
+                        kattn_serial,
+                        stream=stream,
+                    )
+                kattn(
+                    *arguments,
+                    split_kattn_scratch.data_ptr(),
+                    split_epoch.data_ptr(),
+                    kattn_serial,
+                    stream=stream,
+                )
+                kattn_serial += 1
+                if differential_kattn:
+                    torch.cuda.synchronize()
+                    error = (out.float() - reference_out.float()).abs()
+                    cosine = torch.nn.functional.cosine_similarity(
+                        out.float().reshape(rows, -1, 64),
+                        reference_out.float().reshape(rows, -1, 64),
+                        dim=-1,
+                    )
+                    print(
+                        "KATTN_STATE_DIFFERENTIAL="
+                        + json.dumps(
+                            {
+                                "layer": layer["index"],
+                                "rank": rank,
+                                "exact": torch.equal(out, reference_out),
+                                "max_error": error.max().item(),
+                                "min_cosine": cosine.min().item(),
+                            }
+                        ),
+                        flush=True,
+                    )
+                    assert cosine.min().item() > 0.997
+            else:
+                kattn(*arguments, stream=stream)
+
         # Path 2: every layer is explicitly split into K1/K-attn/K2/K3.
         split_k_cache = [layer["k_initial"].clone() for layer in layers]
         split_v_cache = [layer["v_initial"].clone() for layer in layers]
@@ -697,13 +816,13 @@ def _worker(rank, port, queue, rows):
             torch.cuda.synchronize()
             dist.barrier()
             print(f"rank {rank} split layer {layer['index']} K-attn", flush=True)
-            kattn(
-                q.data_ptr(), outputs["o"].data_ptr(),
-                split_k_cache[layer_index].data_ptr(),
-                split_v_cache[layer_index].data_ptr(), layer["table"].data_ptr(),
-                layer["table"].stride(0), prefix.data_ptr(), layer["window"],
-                scale_bits, stream=stream,
-            )  # fmt: skip
+            invoke_kattn(
+                q,
+                outputs["o"],
+                split_k_cache[layer_index],
+                split_v_cache[layer_index],
+                layer,
+            )
             torch.cuda.synchronize()
             dist.barrier()
             weights = layer["weights"]
@@ -758,6 +877,42 @@ def _worker(rank, port, queue, rows):
                 assert minimum > 0.997, (
                     f"{label}: minimum per-row cosine {minimum:.6f}, "
                     "required > 0.997"
+                )
+
+            for layer_offset, (split, oracle) in enumerate(
+                zip(split_layers, oracle_layers)
+            ):
+                layer_metrics = {}
+                for name in ("o", "xin", "res", "attn_out"):
+                    got_rows = split[name].float().reshape(rows, -1)
+                    expected_rows = oracle[name].float().reshape(rows, -1)
+                    layer_metrics[f"{name}_min_cosine"] = (
+                        torch.nn.functional.cosine_similarity(
+                            got_rows, expected_rows, dim=-1
+                        )
+                        .min()
+                        .item()
+                    )
+                layer_metrics.update(
+                    routing_ids_exact=torch.equal(split["ids"], oracle["ids"]),
+                    k_cache_exact=torch.equal(
+                        split_k_cache[layer_offset], oracle_k[layer_offset]
+                    ),
+                    v_cache_exact=torch.equal(
+                        split_v_cache[layer_offset], oracle_v[layer_offset]
+                    ),
+                )
+                print(
+                    "TARGET_SPLIT_LAYER_METRICS="
+                    + json.dumps(
+                        {
+                            "rank": rank,
+                            "layer": layers[layer_offset]["index"],
+                            **layer_metrics,
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
                 )
 
             for layer_offset, (split, oracle) in enumerate(
@@ -875,7 +1030,8 @@ def _worker(rank, port, queue, rows):
                 q.data_ptr(), outputs["o"].data_ptr(),
                 fused_k_cache[layer_index].data_ptr(),
                 fused_v_cache[layer_index].data_ptr(), layer["table"].data_ptr(),
-                layer["table"].stride(0), prefix.data_ptr(), layer["window"],
+                layer["table"].stride(0), prefix.data_ptr(),
+                int(prefix.dtype == torch.int64), layer["window"],
                 scale_bits, gate.data_ptr(),
                 outputs["res"].data_ptr(), weights["w_o"].data_ptr(),
                 weights["attn_alpha"].data_ptr(), weights["attn_beta"].data_ptr(),
@@ -964,17 +1120,12 @@ def _worker(rank, port, queue, rows):
                 # Unlike comparing the split/fused paths directly, this
                 # remains valid after their hidden states have diverged.
                 attention_oracle = torch.empty_like(path["o"])
-                kattn(
-                    path["q"].data_ptr(),
-                    attention_oracle.data_ptr(),
-                    k_cache[layer_offset].data_ptr(),
-                    v_cache[layer_offset].data_ptr(),
-                    layer["table"].data_ptr(),
-                    layer["table"].stride(0),
-                    prefix.data_ptr(),
-                    layer["window"],
-                    scale_bits,
-                    stream=stream,
+                invoke_kattn(
+                    path["q"],
+                    attention_oracle,
+                    k_cache[layer_offset],
+                    v_cache[layer_offset],
+                    layer,
                 )
                 torch.cuda.synchronize()
                 _assert_close(

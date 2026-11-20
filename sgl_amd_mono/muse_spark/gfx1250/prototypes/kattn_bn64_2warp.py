@@ -73,11 +73,7 @@ def run_bn64_2warp_compute(c):
         tile, fx.Int32(0), DRAFT_TOKENS
     )
     request = token0 // DRAFT_TOKENS
-    prefix = fx.Int32(
-        bo.buffer_load(
-            rsrc(args["prefix_lens"]), request, vec_width=1, dtype=T.i32
-        )
-    )
+    prefix = attention._seq_len(args, request)
     keys = prefix + DRAFT_TOKENS
     scale = fx.Int32(args["scale_bits"]).bitcast(fx.Float32)
 
@@ -363,7 +359,8 @@ def build_bn64_2warp(splits: int):
         v_cache: Int64,
         table: Int64,
         table_stride: Int32,
-        prefix_lens: Int64,
+        seq_lens: Int64,
+        lens64: Int32,
         window: Int32,
         scale_bits: Int32,
         partial: Int64,
@@ -395,7 +392,8 @@ def build_bn64_2warp(splits: int):
                     "v_cache": v_cache,
                     "table": table,
                     "table_stride": table_stride,
-                    "prefix_lens": prefix_lens,
+                    "seq_lens": seq_lens,
+                    "lens64": lens64,
                     "window": window,
                     "scale_bits": scale_bits,
                 },
@@ -409,7 +407,8 @@ def build_bn64_2warp(splits: int):
         v_cache: Int64,
         table: Int64,
         table_stride: Int32,
-        prefix_lens: Int64,
+        seq_lens: Int64,
+        lens64: Int32,
         window: Int32,
         scale_bits: Int32,
         partial: Int64,
@@ -423,7 +422,8 @@ def build_bn64_2warp(splits: int):
             v_cache,
             table,
             table_stride,
-            prefix_lens,
+            seq_lens,
+            lens64,
             window,
             scale_bits,
             partial,

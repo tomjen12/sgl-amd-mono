@@ -247,7 +247,8 @@ def _worker(rank, port, queue):
                     case["q"].data_ptr(), split["o"].data_ptr(),
                     case["k_cache"].data_ptr(), case["v_cache"].data_ptr(),
                     case["table"].data_ptr(), case["table"].stride(0),
-                    case["prefix"].data_ptr(), window,
+                    case["prefix"].data_ptr(),
+                    int(case["prefix"].dtype == torch.int64), window,
                     case["scale_bits"], stream=stream,
                 )  # fmt: skip
                 torch.cuda.synchronize()
@@ -292,7 +293,8 @@ def _worker(rank, port, queue):
                     fused_q.data_ptr(), fused["o"].data_ptr(),
                     case["k_cache"].data_ptr(), case["v_cache"].data_ptr(),
                     case["table"].data_ptr(), case["table"].stride(0),
-                    case["prefix"].data_ptr(), window,
+                    case["prefix"].data_ptr(),
+                    int(case["prefix"].dtype == torch.int64), window,
                     case["scale_bits"], fused_g.data_ptr(), fused["res"].data_ptr(),
                     weights["w_o"].data_ptr(), weights["attn_alpha"].data_ptr(),
                     weights["attn_beta"].data_ptr(), weights["pre_w"].data_ptr(),

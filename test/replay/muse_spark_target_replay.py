@@ -320,6 +320,57 @@ def _cpu_snapshot(tensor):
     return tensor.detach().to(device="cpu").clone()
 
 
+def _compare_replay_snapshots(graph_output, graph_kv, eager_output, eager_kv):
+    """Compare graph and forced-eager execution from the same live runner."""
+    import torch
+    import torch.nn.functional as F
+
+    graph_rows = graph_output.float().reshape(graph_output.shape[0], -1)
+    eager_rows = eager_output.float().reshape(eager_output.shape[0], -1)
+    row_cosines = F.cosine_similarity(graph_rows, eager_rows, dim=-1)
+    mismatched_kv = []
+    for layer_id in range(TARGET_LAYERS):
+        for name in ("key", "value"):
+            if not torch.equal(
+                graph_kv[layer_id][name], eager_kv[layer_id][name]
+            ):
+                mismatched_kv.append(f"layer_{layer_id}.{name}")
+    return {
+        "minimum_output_row_cosine": float(row_cosines.min().item()),
+        "kv_exact": not mismatched_kv,
+        "mismatched_kv": mismatched_kv,
+    }
+
+
+def _snapshot_mono_replay_state(runner):
+    state = {
+        name: getattr(runner, name).clone()
+        for name in (
+            "epoch",
+            "scratch_k1",
+            "scratch_kattn",
+            "scratch_k2",
+            "scratch_k3",
+            "scratch_layer",
+        )
+    }
+    for name in ("peers", "peers_k2", "peers_k3"):
+        peer = getattr(runner, name, None)
+        if peer is not None:
+            state[name] = peer.bytes.clone()
+    return state
+
+
+def _restore_mono_replay_state(runner, state) -> None:
+    for name, value in state.items():
+        peer = getattr(runner, name, None)
+        if name.startswith("peers") and peer is not None:
+            peer.bytes.copy_(value)
+        else:
+            getattr(runner, name).copy_(value)
+    runner._k1_done = -1
+
+
 class _Restore:
     def __init__(self, owner, name: str, original):
         self.owner = owner
@@ -406,6 +457,18 @@ def _snapshot_kv(runner, out_cache_loc) -> dict[int, dict[str, Any]]:
             "value": _cpu_snapshot(value[ids]),
         }
     return snapshots
+
+
+def _restore_kv(runner, out_cache_loc, snapshots) -> None:
+    """Restore the write window so two execution modes start identically."""
+    import torch
+
+    for layer_id, state in snapshots.items():
+        key = runner.token_to_kv_pool.get_key_buffer(layer_id)
+        value = runner.token_to_kv_pool.get_value_buffer(layer_id)
+        ids = out_cache_loc.to(device=key.device, dtype=torch.int64)
+        key[ids].copy_(state["key"].to(device=key.device, dtype=key.dtype))
+        value[ids].copy_(state["value"].to(device=value.device, dtype=value.dtype))
 
 
 class _CaptureWriter:
@@ -742,6 +805,10 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
         forward_batch, out_cache_loc, positions = _prepare_verify_batch(
             runner, descriptor, cuda_graph=args.cuda_graph
         )
+        # The scheduler allocation is virtual.  KV tensors are indexed in the
+        # runner's physical id space after IterationIds.bind(); correctness
+        # snapshots must use the bound ids, not the scheduler allocation.
+        physical_out_cache_loc = forward_batch.out_cache_loc
 
         def run_once():
             with replay_scope("target/verify"):
@@ -753,17 +820,60 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
             torch.cuda.synchronize()
 
             writer = _CaptureWriter()
+            graph_eager_comparison = None
             if args.cuda_graph:
                 from sglang.srt.rocm_muse_spark.replay_capture import (
                     force_eager_model_runner,
                 )
 
-                # Python metadata hooks are bypassed by graph replay. Collect
-                # one unprofiled eager pass while preserving the captured graph.
+                # Compare an unprofiled replay with forced eager execution on
+                # this same runner and bound iteration state. Clone graph-owned
+                # outputs before eager execution reuses their static buffers.
+                initial_kv = _snapshot_kv(runner, physical_out_cache_loc)
+                mono_runner = (
+                    _installed_mono(runner.model).runner
+                    if args.mode == "mono"
+                    else None
+                )
+                mono_state = (
+                    _snapshot_mono_replay_state(mono_runner)
+                    if mono_runner is not None
+                    else None
+                )
+                graph_output = run_once()
+                torch.cuda.synchronize()
+                graph_hidden = _cpu_snapshot(_output_hidden(graph_output))
+                graph_kv = _snapshot_kv(runner, physical_out_cache_loc)
+                graph_epoch = mono_runner.epoch.clone() if mono_runner is not None else None
+
+                # Python metadata hooks are bypassed by graph replay. The eager
+                # half also collects the routing metadata needed by reports.
+                # Restore every mutable input read by attention so both halves
+                # execute the same logical replay iteration.
+                _restore_kv(runner, physical_out_cache_loc, initial_kv)
+                if mono_state is not None:
+                    _restore_mono_replay_state(mono_runner, mono_state)
                 runner.attn_backend.init_forward_metadata(forward_batch)
                 with force_eager_model_runner(runner):
                     with runtime_metadata_capture(writer, "target_layers"):
-                        run_once()
+                        eager_output = run_once()
+                torch.cuda.synchronize()
+                eager_hidden = _cpu_snapshot(_output_hidden(eager_output))
+                eager_kv = _snapshot_kv(runner, physical_out_cache_loc)
+                graph_eager_comparison = _compare_replay_snapshots(
+                    graph_hidden, graph_kv, eager_hidden, eager_kv
+                )
+                if graph_epoch is not None:
+                    eager_epoch = _installed_mono(runner.model).runner.epoch
+                    graph_eager_comparison["epoch_exact"] = bool(
+                        torch.equal(graph_epoch, eager_epoch)
+                    )
+                    graph_eager_comparison["epoch_before"] = int(
+                        mono_state["epoch"][0].item()
+                    )
+                    graph_eager_comparison["epoch_after"] = int(
+                        eager_epoch[0].item()
+                    )
             else:
                 with runtime_metadata_capture(writer, "target_layers"):
                     run_once()
@@ -783,18 +893,23 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
             snapshot_path = None
             if args.snapshot_dir is not None:
                 layer_states: dict[int, dict[str, Any]] = {}
-                handles = (
-                    _install_mono_state_observer(runner.model, layer_states)
-                    if args.mode == "mono"
-                    else _install_baseline_state_observers(
-                        runner.model, layer_states
+                if args.cuda_graph:
+                    handles = []
+                else:
+                    handles = (
+                        _install_mono_state_observer(runner.model, layer_states)
+                        if args.mode == "mono"
+                        else _install_baseline_state_observers(
+                            runner.model, layer_states
+                        )
                     )
-                )
                 output = run_once()
                 torch.cuda.synchronize()
                 for handle in handles:
                     handle.remove()
-                if set(layer_states) != set(range(TARGET_LAYERS)):
+                if not args.cuda_graph and set(layer_states) != set(
+                    range(TARGET_LAYERS)
+                ):
                     raise RuntimeError(
                         f"Target {args.mode} layer snapshots are incomplete: "
                         f"{sorted(layer_states)}"
@@ -802,14 +917,19 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
                 snapshot = {
                     "rank": rank,
                     "mode": args.mode,
+                    "execution": "cuda-graph" if args.cuda_graph else "eager",
                     "output": _cpu_snapshot(_output_hidden(output)),
-                    "layers": {
-                        layer: {
-                            name: _cpu_snapshot(value)
-                            for name, value in layer_states[layer].items()
+                    "layers": (
+                        {}
+                        if args.cuda_graph
+                        else {
+                            layer: {
+                                name: _cpu_snapshot(value)
+                                for name, value in layer_states[layer].items()
+                            }
+                            for layer in range(TARGET_LAYERS)
                         }
-                        for layer in range(TARGET_LAYERS)
-                    },
+                    ),
                     "routing_ids": {
                         layer: (
                             _cpu_snapshot(route_ids[layer])
@@ -832,7 +952,7 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
                         )
                         for layer in range(TARGET_LAYERS)
                     },
-                    "kv_cache": _snapshot_kv(runner, out_cache_loc),
+                    "kv_cache": _snapshot_kv(runner, physical_out_cache_loc),
                 }
                 snapshot_path = (
                     Path(args.snapshot_dir) / f"rank_{rank:04d}.snapshot.pt"
@@ -869,8 +989,9 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
             "latency_seconds": elapsed,
             "output_checksums": checksums,
             "snapshot": str(snapshot_path) if snapshot_path is not None else None,
+            "graph_eager_comparison": graph_eager_comparison,
             "state": _kv_state_summary(
-                runner, range(TARGET_LAYERS), out_cache_loc
+                runner, range(TARGET_LAYERS), physical_out_cache_loc
             ),
             "routing": routing,
         }
@@ -1223,14 +1344,9 @@ def main(argv: list[str] | None = None) -> int:
         args.mode != "mono" or args.target_kernel_mode != "split"
     ):
         raise SystemExit("--phase-dir requires --mode mono --target-kernel-mode split.")
-    if args.cuda_graph and (
-        args.snapshot_dir is not None
-        or args.check
-        or args.attn_dump_dir is not None
-    ):
+    if args.cuda_graph and (args.check or args.attn_dump_dir is not None):
         raise SystemExit(
-            "--cuda-graph is profiling-only and cannot be combined with "
-            "--snapshot-dir, --check, or --attn-dump-dir."
+            "--cuda-graph cannot be combined with --check or --attn-dump-dir."
         )
     if args.cuda_graph and not (Path(args.draft_checkpoint) / "config.json").is_file():
         raise SystemExit(

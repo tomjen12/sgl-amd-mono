@@ -129,6 +129,18 @@ def _score(args, qv, request, key, kv_head, lane8, scale):
     return butterfly(dot, (4, 2, 1)) * scale, slot
 
 
+def _seq_len(args, request):
+    """Load an int32 length, or the low word of an int64 length."""
+    return fx.Int32(
+        bo.buffer_load(
+            rsrc(args["seq_lens"]),
+            (args["lens64"] != 0).select(2 * request, request),
+            vec_width=1,
+            dtype=T.i32,
+        )
+    )
+
+
 @flyc.jit
 def run_kattn(c):
     """One CTA computes one (verify token, local query head) attention row."""
@@ -141,11 +153,7 @@ def run_kattn(c):
     request = token // c["QL"]
     query_token = token % c["QL"]
 
-    prefix = fx.Int32(
-        bo.buffer_load(
-            rsrc(args["prefix_lens"]), request, vec_width=1, dtype=T.i32
-        )
-    )
+    prefix = _seq_len(args, request)
     end = prefix + query_token + 1
     begin = fx.Int32(0)
     if args["window"] > 0:
@@ -566,11 +574,7 @@ def run_fused_attn(c):
 
     token0, _, _ = fused_row_coords(tile, fx.Int32(0), tokens)
     request = token0 // q_len
-    prefix = fx.Int32(
-        bo.buffer_load(
-            rsrc(args["prefix_lens"]), request, vec_width=1, dtype=T.i32
-        )
-    )
+    prefix = _seq_len(args, request)
     keys = prefix + q_len
     scale = fx.Int32(args["scale_bits"]).bitcast(fx.Float32)
     _fused_stamp(c, 0)
@@ -1113,6 +1117,282 @@ def run_fused_attn(c):
     _fused_stamp(c, 5)
 
 
+@flyc.jit
+def merge_fused_precomputed(c):
+    """Publish and merge a precomputed split partial using the stable mailbox ABI."""
+    tid, tile, split = c["tid"], c["tile"], c["split"]
+    splits, tokens, args, mb = c["splits"], c["S"], c["args"], c["mb"]
+    threads = c["threads"]
+    phase_trace = c.get("phase_trace", False)
+    stats, glob, part = c["stats"], c["global"], c["part"]
+
+    _fused_publish(
+        mb.put,
+        c["sflag"],
+        tile * FUSED_SPLITS + split,
+        tid == 0,
+    )
+    if split == 0:
+        _fused_poll_splits(mb, c["sflag"], tile, splits)
+        if tid < FUSED_ROWS:
+            global_max = fx.Float32(NEG)
+            split_pairs = []
+            for source in range_constexpr(splits):
+                pair = fx.Vector(
+                    bo.buffer_load(
+                        rsrc(stats.value),
+                        fused_stat_index(tile, source, tid),
+                        vec_width=2,
+                        dtype=T.f32,
+                        cache_modifier=2,
+                    )
+                )
+                split_pairs.append(pair)
+                global_max = fx.max(global_max, fx.Float32(pair[0]))
+            global_sum = fx.Float32(0.0)
+            for source in range_constexpr(splits):
+                pair = split_pairs[source]
+                global_sum = global_sum + fx.Float32(pair[1]) * hw_exp2(
+                    (fx.Float32(pair[0]) - global_max) * LOG2E
+                )
+            bo.buffer_store(
+                fx.Vector.from_elements(
+                    [global_max, global_sum], fx.Float32
+                ),
+                rsrc(glob.value),
+                fused_global_index(tile, tid),
+                cache_modifier=2,
+            )
+        _fused_publish(mb.put, c["gflag"], tile, tid == 0)
+    mb.poll([(c["gflag"], tile, 1)], batch=1)
+    fx.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
+    _fused_stamp(c, 2)
+    _fused_stamp(c, 3)
+    _fused_publish(
+        mb.put,
+        c["pflag"],
+        tile * FUSED_SPLITS + split,
+        tid == 0,
+    )
+    _fused_stamp(c, 4)
+
+    _fused_poll_splits(mb, c["pflag"], tile, splits)
+    global_lds = c["merge_lds"]
+    split_lds = global_lds + FUSED_ROWS * 2
+    if tid < FUSED_ROWS * 2:
+        fx.ptr_store(
+            fx.Float32(
+                bo.buffer_load(
+                    rsrc(glob.value),
+                    tile * FUSED_ROWS * 2 + tid,
+                    vec_width=1,
+                    dtype=T.f32,
+                    cache_modifier=2,
+                )
+            ),
+            global_lds + tid,
+        )
+    for load_round in range_constexpr(
+        (splits * FUSED_ROWS * 2 + threads - 1) // threads
+    ):
+        stat_item = tid + load_round * threads
+        if stat_item < splits * FUSED_ROWS * 2:
+            source = stat_item // (FUSED_ROWS * 2)
+            item = stat_item % (FUSED_ROWS * 2)
+            fx.ptr_store(
+                fx.Float32(
+                    bo.buffer_load(
+                        rsrc(stats.value),
+                        (tile * FUSED_SPLITS + source) * FUSED_ROWS * 2 + item,
+                        vec_width=1,
+                        dtype=T.f32,
+                        cache_modifier=2,
+                    )
+                ),
+                split_lds + stat_item,
+            )
+    gpu.barrier()
+    for batch in range_constexpr(
+        (FUSED_ROWS * HEAD_DIM + splits * threads - 1)
+        // (splits * threads)
+    ):
+        item = tid + (split + batch * splits) * threads
+        if item < FUSED_ROWS * HEAD_DIM:
+            row, dim = item // HEAD_DIM, item % HEAD_DIM
+            global_pair = fx.Vector.from_elements(
+                [
+                    fx.ptr_load(global_lds + row * 2),
+                    fx.ptr_load(global_lds + row * 2 + 1),
+                ],
+                fx.Float32,
+            )
+            total = fx.Float32(0.0)
+            for source in range_constexpr(splits):
+                split_pair = fx.Vector.from_elements(
+                    [
+                        fx.ptr_load(
+                            split_lds + (source * FUSED_ROWS + row) * 2
+                        ),
+                        fx.ptr_load(
+                            split_lds
+                            + (source * FUSED_ROWS + row) * 2
+                            + 1
+                        ),
+                    ],
+                    fx.Float32,
+                )
+                partial = fx.Float32(
+                    bo.buffer_load(
+                        rsrc(part.value),
+                        fused_part_index(tile, source, row, dim),
+                        vec_width=1,
+                        dtype=T.f32,
+                        cache_modifier=2,
+                    )
+                )
+                total = total + partial * hw_exp2(
+                    (
+                        fx.Float32(split_pair[0])
+                        - fx.Float32(global_pair[0])
+                    )
+                    * LOG2E
+                )
+            token, query_head, _ = fused_row_coords(tile, row, tokens)
+            bo.buffer_store(
+                (total / fx.Float32(global_pair[1])).to(fx.BFloat16),
+                rsrc(args["out"]),
+                token * Q_K + query_head * HEAD_DIM + dim,
+            )
+    if const_expr(phase_trace):
+        gpu.barrier()
+    _fused_stamp(c, 5)
+
+
+@flyc.jit
+def merge_fused_precomputed_one_stage(c):
+    """Merge complete split states after one release/acquire hand-off.
+
+    This protocol is only safe for the width-8, six-split launch where all
+    16 * 6 producers are the 96 simultaneously resident CTAs.  Each producer
+    publishes after both stats and partials are complete, then every CTA waits
+    once and reduces its disjoint output assignment.
+    """
+    tid, tile, split = c["tid"], c["tile"], c["split"]
+    splits, tokens, args, mb = c["splits"], c["S"], c["args"], c["mb"]
+    threads = c["threads"]
+    stats, part = c["stats"], c["part"]
+
+    _fused_publish(
+        mb.put,
+        c["pflag"],
+        tile * FUSED_SPLITS + split,
+        tid == 0,
+    )
+    _fused_poll_splits(mb, c["pflag"], tile, splits)
+    _fused_stamp(c, 2)
+    _fused_stamp(c, 3)
+    _fused_stamp(c, 4)
+
+    # Match _swa_verify_reduce: compute one stable split weight vector and one
+    # reciprocal per row, then reuse them for all 64 output dimensions.
+    stats_lds = c["merge_lds"]
+    weights_lds = stats_lds + splits * FUSED_ROWS * 2
+    inverse_lds = weights_lds + splits * FUSED_ROWS
+    for load_round in range_constexpr(
+        (splits * FUSED_ROWS * 2 + threads - 1) // threads
+    ):
+        stat_item = tid + load_round * threads
+        if stat_item < splits * FUSED_ROWS * 2:
+            fx.ptr_store(
+                fx.Float32(
+                    bo.buffer_load(
+                        rsrc(stats.value),
+                        tile * FUSED_SPLITS * FUSED_ROWS * 2 + stat_item,
+                        vec_width=1,
+                        dtype=T.f32,
+                        cache_modifier=2,
+                    )
+                ),
+                stats_lds + stat_item,
+            )
+    gpu.barrier()
+    if tid < FUSED_ROWS:
+        global_max = fx.Float32(NEG)
+        for source in range_constexpr(splits):
+            split_max = fx.ptr_load(
+                stats_lds + (source * FUSED_ROWS + tid) * 2
+            )
+            split_sum = fx.ptr_load(
+                stats_lds + (source * FUSED_ROWS + tid) * 2 + 1
+            )
+            valid = split_sum > 0.0
+            global_max = fx.max(
+                global_max,
+                valid.select(split_max, fx.Float32(NEG)),
+            )
+        global_max = (global_max > NEG).select(
+            global_max, fx.Float32(0.0)
+        )
+        total = fx.Float32(0.0)
+        for source in range_constexpr(splits):
+            split_max = fx.ptr_load(
+                stats_lds + (source * FUSED_ROWS + tid) * 2
+            )
+            split_sum = fx.ptr_load(
+                stats_lds + (source * FUSED_ROWS + tid) * 2 + 1
+            )
+            valid = split_sum > 0.0
+            weight = valid.select(
+                hw_exp2(
+                    (split_max - global_max) * LOG2E
+                ),
+                fx.Float32(0.0),
+            )
+            fx.ptr_store(
+                weight, weights_lds + source * FUSED_ROWS + tid
+            )
+            total = total + split_sum * weight
+        inverse = (total > 0.0).select(
+            fx.Float32(1.0) / total,
+            fx.Float32(0.0),
+        )
+        fx.ptr_store(inverse, inverse_lds + tid)
+    gpu.barrier()
+
+    for batch in range_constexpr(
+        (FUSED_ROWS * HEAD_DIM + splits * threads - 1)
+        // (splits * threads)
+    ):
+        item = tid + (split + batch * splits) * threads
+        if item < FUSED_ROWS * HEAD_DIM:
+            row, dim = item // HEAD_DIM, item % HEAD_DIM
+            total = fx.Float32(0.0)
+            for source in range_constexpr(splits):
+                partial = fx.Float32(
+                    bo.buffer_load(
+                        rsrc(part.value),
+                        fused_part_index(tile, source, row, dim),
+                        vec_width=1,
+                        dtype=T.f32,
+                        cache_modifier=2,
+                    )
+                )
+                total = total + partial * fx.ptr_load(
+                    weights_lds + source * FUSED_ROWS + row
+                )
+            token, query_head, _ = fused_row_coords(tile, row, tokens)
+            bo.buffer_store(
+                (total * fx.ptr_load(inverse_lds + row)).to(
+                    fx.BFloat16
+                ),
+                rsrc(args["out"]),
+                token * Q_K + query_head * HEAD_DIM + dim,
+            )
+    if const_expr(c.get("phase_trace", False)):
+        gpu.barrier()
+    _fused_stamp(c, 5)
+
+
 def _fused_q_fp8_fragment(args, tile, tokens, lane, scale):
     token, query_head, _ = fused_row_coords(
         tile, lane % FUSED_ROWS, tokens
@@ -1220,11 +1500,7 @@ def run_fused_attn_fp8(c):
 
     token0, _, kv_head = fused_row_coords(tile, fx.Int32(0), tokens)
     request = token0 // q_len
-    prefix = fx.Int32(
-        bo.buffer_load(
-            rsrc(args["prefix_lens"]), request, vec_width=1, dtype=T.i32
-        )
-    )
+    prefix = _seq_len(args, request)
     keys = prefix + q_len
     scale = fx.Int32(args["scale_bits"]).bitcast(fx.Float32)
     _fused_stamp(c, 0)

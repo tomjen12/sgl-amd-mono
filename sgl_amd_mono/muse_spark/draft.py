@@ -76,6 +76,21 @@ DFLASH_CONFIG = dict(
     attention_mode="gqa",
 )
 
+
+def _mono_table_width(table_width, lens, lens_cpu):
+    """Bound the compact request table without a GPU read during capture."""
+    if lens_cpu is not None:
+        host_max = (
+            int(lens_cpu.max().item())
+            if isinstance(lens_cpu, torch.Tensor)
+            else max(int(value) for value in lens_cpu)
+        )
+        return min(table_width, host_max + DRAFT_TOKENS)
+    if torch.cuda.is_current_stream_capturing():
+        return table_width
+    return min(table_width, int((lens + DRAFT_TOKENS).max().item()))
+
+
 # The SGLang names this module reads, by file under the sglang package (``f(p)``: a
 # parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
 SGLANG_READS = {
@@ -444,7 +459,9 @@ class DraftRunner:
             # int32 physical request table for Mono D-attn from the
             # authoritative mapping instead of reinterpreting that buffer.
             request_rows = table.index_select(0, rpi)
-            mono_table_width = int((lens + DRAFT_TOKENS).max().item())
+            mono_table_width = _mono_table_width(
+                table.shape[1], lens, forward_batch.seq_lens_cpu
+            )
             mono_table = (
                 request_rows[:, :mono_table_width]
                 .to(dtype=torch.int32)

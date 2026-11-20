@@ -264,3 +264,65 @@ def test_state_observers_synchronize_reused_buffers(monkeypatch):
     assert stream.calls == 2
     assert baseline_states[0]["hidden"].item() == 1.0
     assert mono_states[0]["routing_ids"].tolist() == [[7]]
+
+
+def test_graph_eager_comparison_checks_multiple_replays_and_kv():
+    output = torch.arange(16, dtype=torch.float32).reshape(2, 8)
+    graph_kv = {
+        layer: {
+            "key": torch.full((1, 2), layer, dtype=torch.int8),
+            "value": torch.full((1, 2), -layer, dtype=torch.int8),
+        }
+        for layer in range(10)
+    }
+    eager_kv = {
+        layer: {name: value.clone() for name, value in state.items()}
+        for layer, state in graph_kv.items()
+    }
+
+    first = replay._compare_replay_snapshots(
+        output, graph_kv, output.clone(), eager_kv
+    )
+    second = replay._compare_replay_snapshots(
+        output, graph_kv, output.clone(), eager_kv
+    )
+
+    assert first == second
+    assert first["minimum_output_row_cosine"] == pytest.approx(1.0)
+    assert first["kv_exact"] is True
+    eager_kv[4]["key"][0, 0] += 1
+    mismatch = replay._compare_replay_snapshots(
+        output, graph_kv, output.clone(), eager_kv
+    )
+    assert mismatch["kv_exact"] is False
+    assert mismatch["mismatched_kv"] == ["layer_4.key"]
+
+
+def test_mono_graph_state_restores_across_multiple_iterations():
+    class Peer:
+        def __init__(self, value):
+            self.bytes = torch.tensor([value], dtype=torch.uint8)
+
+    runner = SimpleNamespace(
+        epoch=torch.tensor([7], dtype=torch.int32),
+        scratch_k1=torch.tensor([1], dtype=torch.uint8),
+        scratch_kattn=torch.tensor([2], dtype=torch.uint8),
+        scratch_k2=torch.tensor([3], dtype=torch.uint8),
+        scratch_k3=torch.tensor([4], dtype=torch.uint8),
+        scratch_layer=torch.tensor([5], dtype=torch.uint8),
+        peers=Peer(6),
+        peers_k2=Peer(7),
+        peers_k3=Peer(8),
+        _k1_done=9,
+    )
+    pristine = replay._snapshot_mono_replay_state(runner)
+
+    for _ in range(3):
+        runner.epoch.add_(1)
+        runner.scratch_kattn.add_(10)
+        runner.peers_k2.bytes.add_(10)
+        replay._restore_mono_replay_state(runner, pristine)
+        assert runner.epoch.tolist() == [7]
+        assert runner.scratch_kattn.tolist() == [2]
+        assert runner.peers_k2.bytes.tolist() == [7]
+        assert runner._k1_done == -1

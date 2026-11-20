@@ -192,6 +192,8 @@ class KAttnBuild(msgspec.Struct, frozen=True):
     stage_q: bool = True
     key_block: int = FUSED_KEY_BLOCK
     load_bits: int = 64
+    triton_parity_v3: bool = False
+    block_b_parity: bool = False
 
 
 def build_kattn(key: KAttnBuild):
@@ -225,7 +227,8 @@ def build_kattn(key: KAttnBuild):
         v_cache: Int64,
         table: Int64,
         table_stride: Int32,
-        prefix_lens: Int64,
+        seq_lens: Int64,
+        lens64: Int32,
         window: Int32,
         scale_bits: Int32,
     ):
@@ -239,7 +242,8 @@ def build_kattn(key: KAttnBuild):
             "v_cache": v_cache,
             "table": table,
             "table_stride": table_stride,
-            "prefix_lens": prefix_lens,
+            "seq_lens": seq_lens,
+            "lens64": lens64,
             "window": window,
             "scale_bits": scale_bits,
         }
@@ -269,7 +273,8 @@ def build_kattn(key: KAttnBuild):
         v_cache: Int64,
         table: Int64,
         table_stride: Int32,
-        prefix_lens: Int64,
+        seq_lens: Int64,
+        lens64: Int32,
         window: Int32,
         scale_bits: Int32,
         stream: fx.Stream = _STREAM,
@@ -282,7 +287,8 @@ def build_kattn(key: KAttnBuild):
             v_cache,
             table,
             table_stride,
-            prefix_lens,
+            seq_lens,
+            lens64,
             window,
             scale_bits,
         ).launch(grid=(RESIDENT_BLOCKS,), block=(THREADS,), stream=stream)
@@ -352,6 +358,17 @@ def build_tiled_kattn(key: KAttnBuild):
         key.key_block != FUSED_KEY_BLOCK or key.load_bits != 64
     ):
         raise ValueError("FP8 K-attn only supports the retained BN32/64-bit load")
+    if key.triton_parity_v3 and (
+        key.tokens != DRAFT_TOKENS
+        or key.splits != FUSED_SPLITS
+        or key.fp8_wmma
+    ):
+        raise ValueError(
+            "Triton-parity v3 opt-in requires width8, six splits, "
+            "and BF16 WMMA"
+        )
+    if key.block_b_parity and not key.triton_parity_v3:
+        raise ValueError("Block B parity requires the Block A v3 opt-in")
     if key.stage_q and (key.fp8_wmma or not key.register_probability):
         raise ValueError(
             "Q LDS staging requires BF16 WMMA with register probabilities"
@@ -368,23 +385,33 @@ def build_tiled_kattn(key: KAttnBuild):
         y=int(key.stage_q),
         n=key.key_block,
         l=key.load_bits,
+        v=int(key.triton_parity_v3),
+        b=int(key.block_b_parity),
     )
     keyed = key_tuple(key, SOURCES)
     layout = _tiled_kattn_layout()
-    Lds = (
-        attention.fused_attn_fp8_lds()
-        if key.fp8_wmma
-        else attention.fused_attn_lds(
-            key.register_probability, key.key_block
+    if key.triton_parity_v3:
+        from sgl_amd_mono.muse_spark.gfx1250.prototypes.kattn_triton_parity_v3 import (
+            run_triton_parity_v3_compute,
+            triton_parity_v3_lds,
         )
-    )
+        Lds = triton_parity_v3_lds(compact_kv=True)
+    else:
+        Lds = (
+            attention.fused_attn_fp8_lds()
+            if key.fp8_wmma
+            else attention.fused_attn_lds(
+                key.register_probability, key.key_block
+            )
+        )
     run_attention = (
         attention.run_fused_attn_fp8
         if key.fp8_wmma
         else attention.run_fused_attn
     )
+    block_threads = 64 if key.triton_parity_v3 else THREADS
 
-    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name=name, known_block_size=[block_threads, 1, 1])
     def tiled_kattn(
         q: Int64,
         out: Int64,
@@ -392,7 +419,8 @@ def build_tiled_kattn(key: KAttnBuild):
         v_cache: Int64,
         table: Int64,
         table_stride: Int32,
-        prefix_lens: Int64,
+        seq_lens: Int64,
+        lens64: Int32,
         window: Int32,
         scale_bits: Int32,
         scratch: Int64,
@@ -423,7 +451,8 @@ def build_tiled_kattn(key: KAttnBuild):
             "v_cache": v_cache,
             "table": table,
             "table_stride": table_stride,
-            "prefix_lens": prefix_lens,
+            "seq_lens": seq_lens,
+            "lens64": lens64,
             "window": window,
             "scale_bits": scale_bits,
         }
@@ -432,7 +461,7 @@ def build_tiled_kattn(key: KAttnBuild):
         ):
             task = bid + task_round * RESIDENT_BLOCKS
             if task < fused_tasks(key.tokens, key.splits):
-                run_attention(
+                context = (
                     {
                         "S": key.tokens,
                         "QL": key.q_len,
@@ -445,22 +474,6 @@ def build_tiled_kattn(key: KAttnBuild):
                         "key_block": key.key_block,
                         "load_bits": key.load_bits,
                         "mb": mb,
-                        "wave_stats": lds.wave_stats.ptr,
-                        "row_stats": lds.row_stats.ptr,
-                        "q": (
-                            lds.q.ptr
-                            if not key.fp8_wmma
-                            and key.register_probability
-                            else lds.probabilities.ptr
-                        ),
-                        "probabilities": (
-                            lds.q.ptr
-                            if not key.fp8_wmma
-                            and key.register_probability
-                            else lds.probabilities.ptr
-                        ),
-                        "pv": lds.pv.ptr,
-                        "kv": lds.kv.ptr,
                         "phase_trace": key.phase_trace,
                         "register_probability": key.register_probability,
                         "stage_q": key.stage_q,
@@ -473,6 +486,77 @@ def build_tiled_kattn(key: KAttnBuild):
                         "args": args,
                     }
                 )
+                if const_expr(not key.triton_parity_v3):
+                    context.update(
+                        {
+                            "wave_stats": lds.wave_stats.ptr,
+                            "row_stats": lds.row_stats.ptr,
+                            "q": (
+                                lds.q.ptr
+                                if not key.fp8_wmma
+                                and key.register_probability
+                                else lds.probabilities.ptr
+                            ),
+                            "probabilities": (
+                                lds.q.ptr
+                                if not key.fp8_wmma
+                                and key.register_probability
+                                else lds.probabilities.ptr
+                            ),
+                            "pv": lds.pv.ptr,
+                            "kv": lds.kv.ptr,
+                        }
+                    )
+                if const_expr(key.triton_parity_v3):
+                    attention._fused_stamp(context, 0)
+                    run_triton_parity_v3_compute(
+                        {
+                            "tid": tid,
+                            "lane": lane,
+                            "wave": wave,
+                            "tile": task // key.splits,
+                            "split": task % key.splits,
+                            "splits": key.splits,
+                            "q": lds.q.ptr,
+                            "probabilities": lds.probabilities.ptr,
+                            "maximum": lds.maximum.ptr,
+                            "denominator": lds.denominator.ptr,
+                            "alpha": lds.alpha.ptr,
+                            "page_indices": lds.page_indices.ptr,
+                            "k": lds.k.ptr,
+                            "v": lds.v.ptr,
+                            "hoist_q": True,
+                            "register_probability": True,
+                            "dedup_page": True,
+                            "compact_kv": True,
+                            "vector_epilogue": True,
+                            "stage_pages": True,
+                            "interleave_pv_pack": True,
+                            "paired_page_load": True,
+                            "inline_wmma_pair": False,
+                            "interleaved_stats": True,
+                            "partial": regions["part"].value,
+                            "maximum_out": regions["stats"].value,
+                            "denominator_out": regions["stats"].value,
+                            "args": args,
+                        }
+                    )
+                    attention._fused_stamp(context, 1)
+                    merge_context = {
+                        **context,
+                        "merge_lds": fx.recast_iter(
+                            fx.Float32, lds.q.ptr
+                        ),
+                        "threads": 64,
+                    }
+                    if const_expr(key.block_b_parity):
+                        attention.merge_fused_precomputed_one_stage(
+                            merge_context
+                        )
+                    else:
+                        attention.merge_fused_precomputed(merge_context)
+                else:
+                    run_attention(context)
 
     @flyc.jit
     def launch(
@@ -482,7 +566,8 @@ def build_tiled_kattn(key: KAttnBuild):
         v_cache: Int64,
         table: Int64,
         table_stride: Int32,
-        prefix_lens: Int64,
+        seq_lens: Int64,
+        lens64: Int32,
         window: Int32,
         scale_bits: Int32,
         scratch: Int64,
@@ -498,12 +583,17 @@ def build_tiled_kattn(key: KAttnBuild):
             v_cache,
             table,
             table_stride,
-            prefix_lens,
+            seq_lens,
+            lens64,
             window,
             scale_bits,
             scratch,
             epoch,
             layer_id,
-        ).launch(grid=(RESIDENT_BLOCKS,), block=(THREADS,), stream=stream)
+        ).launch(
+            grid=(RESIDENT_BLOCKS,),
+            block=(block_threads,),
+            stream=stream,
+        )
 
     return launch

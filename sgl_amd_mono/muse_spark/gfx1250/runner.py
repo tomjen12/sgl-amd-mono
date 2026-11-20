@@ -37,6 +37,7 @@ from sgl_amd_mono.muse_spark.gfx1250.config import (
     MOE_HIDDEN,
     PAGE,
     Q_K,
+    RESIDENT_BLOCKS,
     TOP_K,
     WINDOW,
     WIDTHS,
@@ -66,11 +67,32 @@ USE_K3_TDM = os.environ.get("SGLANG_AMD_MONO_MUSE_K3_TDM", "0") == "1"
 USE_K2_JOINT_RP = (
     os.environ.get("SGLANG_AMD_MONO_MUSE_K2_JOINT_RP", "0") == "1"
 )
+# Baseline-shaped M16xN64xK256 six-slot async LDS mainloop for the packed path.
+# It has a separate qualification switch so the existing packed scaffold and
+# production default remain independently selectable.
+USE_K2_JOINT_RP_TDM = (
+    os.environ.get("SGLANG_AMD_MONO_MUSE_K2_JOINT_RP_TDM", "0") == "1"
+)
+if USE_K2_JOINT_RP_TDM and not USE_K2_JOINT_RP:
+    raise ValueError(
+        "K2 joint TDM requires SGLANG_AMD_MONO_MUSE_K2_JOINT_RP=1"
+    )
 # Opt-in compile-time specialization for standalone sliding-window attention.
 # Full attention and the scratch ABI remain fixed at the max-six layout.
 WINDOW_KATTN_SPLITS = validate_fused_splits(
     int(os.environ.get("SGLANG_AMD_MONO_MUSE_KATTN_WINDOW_SPLITS", FUSED_SPLITS))
 )
+USE_KATTN_TRITON_PARITY_V3 = (
+    os.environ.get("SGLANG_AMD_MONO_MUSE_KATTN_TRITON_PARITY_V3", "0") == "1"
+)
+USE_KATTN_BLOCK_B_PARITY = (
+    os.environ.get("SGLANG_AMD_MONO_MUSE_KATTN_BLOCK_B_PARITY", "0") == "1"
+)
+if USE_KATTN_BLOCK_B_PARITY and not USE_KATTN_TRITON_PARITY_V3:
+    raise ValueError(
+        "K-attn Block B parity requires "
+        "SGLANG_AMD_MONO_MUSE_KATTN_TRITON_PARITY_V3=1"
+    )
 
 # SGLang classes imported lazily by cache validation and page-table binding.
 SGLANG_READS = {
@@ -85,6 +107,19 @@ def _ptr(value) -> int:
 
 def _f32_bits(value: float) -> int:
     return struct.unpack("i", struct.pack("f", value))[0]
+
+
+def _seq_lens_abi(seq_lens: torch.Tensor, requests: int) -> tuple[int, int]:
+    if (
+        seq_lens.dtype not in (torch.int32, torch.int64)
+        or not seq_lens.is_contiguous()
+        or seq_lens.numel() < requests
+    ):
+        raise RuntimeError(
+            f"gfx1250 K-attn seq_lens: {seq_lens.dtype} "
+            f"{tuple(seq_lens.shape)} contiguous={seq_lens.is_contiguous()}"
+        )
+    return _ptr(seq_lens), int(seq_lens.dtype == torch.int64)
 
 
 def _ensure_writable_flydsl_cache() -> None:
@@ -200,9 +235,6 @@ class MuseMonoRunner:
             MAX_TOKENS, MOE_HIDDEN, dtype=bf16, device=dev
         )
         self.attn_in = torch.empty(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev)
-        self.prefix = torch.empty(
-            MAX_TOKENS // DRAFT_TOKENS, dtype=torch.int32, device=dev
-        )
         tables = [view.cos_sin for view in self.views if view.cos_sin is not None]
         if not tables:
             raise RuntimeError("Muse Spark gfx1250: no rotary table")
@@ -479,7 +511,19 @@ class MuseMonoRunner:
 
     def kattn_kernel(self, rows: int, q_len: int, splits: int = FUSED_SPLITS):
         validate_fused_splits(splits)
-        key = rows, q_len, splits
+        use_triton_parity_v3 = (
+            USE_KATTN_TRITON_PARITY_V3
+            and rows == DRAFT_TOKENS
+            and splits == FUSED_SPLITS
+        )
+        use_block_b_parity = USE_KATTN_BLOCK_B_PARITY and use_triton_parity_v3
+        key = (
+            rows,
+            q_len,
+            splits,
+            use_triton_parity_v3,
+            use_block_b_parity,
+        )
         if key not in self._kattn:
             from sgl_amd_mono.muse_spark.gfx1250.layer import (
                 KAttnBuild,
@@ -493,14 +537,17 @@ class MuseMonoRunner:
                     q_len=q_len,
                     phase_trace=PHASE_TRACE,
                     splits=splits,
+                    triton_parity_v3=use_triton_parity_v3,
+                    block_b_parity=use_block_b_parity,
                 )
             )
         return self._kattn[key]
 
     def _kattn_splits(self, index: int) -> int:
+        windows = getattr(self, "windows", None)
         return (
             WINDOW_KATTN_SPLITS
-            if self.windows is not None and self.windows[index] > 0
+            if windows is not None and windows[index] > 0
             else FUSED_SPLITS
         )
 
@@ -516,6 +563,7 @@ class MuseMonoRunner:
                     fault_site=self.fault_site,
                     fault_after=self.fault_after,
                     joint_rp=USE_K2_JOINT_RP,
+                    joint_rp_tdm=USE_K2_JOINT_RP_TDM,
                     phase_trace=PHASE_TRACE,
                 )
             )
@@ -765,17 +813,20 @@ class MuseMonoRunner:
                 f"gfx1250 K-attn page table: "
                 f"{None if table is None else (table.dtype, tuple(table.shape))}"
             )
-        if forward_batch.seq_lens.numel() < requests or table.shape[0] < requests:
+        seq_lens = forward_batch.seq_lens
+        if table.shape[0] < requests:
             raise RuntimeError(
                 f"gfx1250 attention needs {requests} requests, got "
-                f"{forward_batch.seq_lens.numel()} lengths and table {tuple(table.shape)}"
+                f"{seq_lens.dtype} {tuple(seq_lens.shape)} lengths and "
+                f"table {tuple(table.shape)}"
             )
-        self.prefix[:requests].copy_(forward_batch.seq_lens[:requests])
+        seq_lens_ptr, lens64 = _seq_lens_abi(seq_lens, requests)
         scale = float(self.modules[index].self_attn.attn.scaling)
         return (
             _ptr(table),
             table.stride(0),
-            _ptr(self.prefix),
+            seq_lens_ptr,
+            lens64,
             self.windows[index],
             _f32_bits(scale),
         )
@@ -875,7 +926,7 @@ class MuseMonoRunner:
             if next_view.cos_sin is not None
             else self.any_cos_sin
         )
-        table, table_stride, prefix, window, scale_bits = self._attention_args(
+        table, table_stride, seq_lens, lens64, window, scale_bits = self._attention_args(
             i, rows, q_len, forward_batch
         )
         from sglang.srt.rocm_muse_spark.replay_capture import (
@@ -903,7 +954,8 @@ class MuseMonoRunner:
                 v_cache,
                 table,
                 table_stride,
-                prefix,
+                seq_lens,
+                lens64,
                 window,
                 scale_bits,
                 _ptr(self.scratch_kattn),
@@ -980,7 +1032,8 @@ class MuseMonoRunner:
             v_cache,
             table,
             table_stride,
-            prefix,
+            seq_lens,
+            lens64,
             window,
             scale_bits,
             _ptr(self.g),

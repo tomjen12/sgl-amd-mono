@@ -465,6 +465,12 @@ def _install_mono_state_observer(
             return output
 
         attention_op.forward = capture_attention
+        original_save_kv_cache = layer.self_attn.save_kv_cache
+        # The production Draft path disables native KV stores because Mono
+        # writes the rows in D-pre.  A correctness reference must explicitly
+        # re-enable the native store; otherwise reference_kv_* observes stale
+        # rows from an earlier replay iteration.
+        layer.self_attn.save_kv_cache = True
         try:
             reference_o = layer.self_attn(
                 positions=positions,
@@ -472,6 +478,7 @@ def _install_mono_state_observer(
                 forward_batch=forward_batch,
             )
         finally:
+            layer.self_attn.save_kv_cache = original_save_kv_cache
             attention_op.forward = original_attention_forward
         if reference_raw is None or reference_qkv is None:
             raise RuntimeError(f"Draft layer {i} did not execute native attention.")
@@ -866,6 +873,66 @@ def _rank_worker(
             trace_file = str(trace_path)
         assert output is not None
 
+        graph_eager_comparison = None
+        if cuda_graph:
+            import torch.nn.functional as F
+            from sglang.srt.rocm_muse_spark.replay_capture import (
+                force_eager_model_runner,
+            )
+
+            mono_runner = (
+                _installed_mono(runner.model).runner if mode == "mono" else None
+            )
+            mono_state = None
+            if mono_runner is not None:
+                mono_state = {
+                    name: getattr(mono_runner, name).clone()
+                    for name in (
+                        "epoch",
+                        "scratch",
+                        "scratch_pre",
+                        "scratch_attn",
+                        "scratch_post",
+                    )
+                }
+                mono_state["peers"] = mono_runner.peers.bytes.clone()
+                mono_state["peers_post"] = mono_runner.peers_post.bytes.clone()
+            graph_output = run_once()
+            torch.cuda.synchronize()
+            graph_output = graph_output.detach().clone()
+            graph_epoch = mono_runner.epoch.clone() if mono_runner is not None else None
+            if mono_state is not None:
+                for name in (
+                    "epoch",
+                    "scratch",
+                    "scratch_pre",
+                    "scratch_attn",
+                    "scratch_post",
+                ):
+                    getattr(mono_runner, name).copy_(mono_state[name])
+                mono_runner.peers.bytes.copy_(mono_state["peers"])
+                mono_runner.peers_post.bytes.copy_(mono_state["peers_post"])
+            runner.attn_backend.init_forward_metadata(batch)
+            with force_eager_model_runner(runner):
+                eager_output = run_once()
+            torch.cuda.synchronize()
+            graph_rows = graph_output.float().reshape(graph_output.shape[0], -1)
+            eager_rows = eager_output.float().reshape(eager_output.shape[0], -1)
+            graph_eager_comparison = {
+                "minimum_output_row_cosine": float(
+                    F.cosine_similarity(graph_rows, eager_rows, dim=-1).min().item()
+                )
+            }
+            if graph_epoch is not None:
+                eager_epoch = mono_runner.epoch
+                graph_eager_comparison.update(
+                    {
+                        "epoch_exact": bool(torch.equal(graph_epoch, eager_epoch)),
+                        "epoch_before": int(mono_state["epoch"][0].item()),
+                        "epoch_after": int(eager_epoch[0].item()),
+                    }
+                )
+
         # Run one unprofiled snapshot iteration. Capturing clones must not alter
         # the trace whose kernel sequence is compared separately in Gate 1.
         layer_states: dict[int, dict[str, Any]] = {}
@@ -963,6 +1030,7 @@ def _rank_worker(
             "tp_size": WORLD_SIZE,
             "warmup": warmup,
             "iterations": iterations,
+            "graph_eager_comparison": graph_eager_comparison,
             "output": _tensor_summary(output),
             "input_embeddings": _tensor_summary(batch.input_embeds),
             "positions": batch.positions.cpu().tolist(),

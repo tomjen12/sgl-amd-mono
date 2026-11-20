@@ -13,6 +13,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     ptr_arg,
     ptr_buf_tensor,
 )
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, rocdl
 from flydsl.expr.typing import T
 
@@ -134,3 +135,55 @@ def test_gfx1250_global_load_async_to_lds_b128_single_copy():
     }
     print("GFX1250_DIRECT_LDS_PROBE=" + json.dumps(result), flush=True)
     assert exact
+
+
+def build_ds_load_2addr_b32_probe():
+    """Load two dwords 16 elements apart with one gfx1250 DS instruction."""
+
+    @flyc.kernel(
+        name="gfx1250_ds_load_2addr_b32_probe",
+        known_block_size=[THREADS, 1, 1],
+    )
+    def kernel(dst: fx.Pointer):
+        lane = fx.Int32(fx.thread_idx.x)
+        storage = fx.SharedAllocator(static=False).allocate(32 * 4)
+        words = fx.recast_iter(fx.Int32, storage._ptr)
+        fx.ptr_store(lane, words + lane)
+        gpu.barrier()
+
+        address = fx.Int32(fx.ptrtoint(words + lane % 16))
+        pair = fx.Vector(
+            llvm.inline_asm(
+                T.vec(2, T.i32),
+                [address.ir_value()],
+                "ds_load_2addr_b32 $0, $1 offset1:16",
+                "=v,v,~{memory}",
+                has_side_effects=True,
+            )
+        )
+        rocdl.s_wait_dscnt(0)
+        output = ptr_buf_tensor(dst, fx.Int32)
+        output[lane * 2] = pair[0]
+        output[lane * 2 + 1] = pair[1]
+
+    @flyc.jit
+    def launch(dst: fx.Pointer, stream: fx.Stream = _STREAM):
+        kernel(dst).launch(grid=(1,), block=(THREADS,), stream=stream)
+
+    return launch
+
+
+def test_gfx1250_ds_load_2addr_b32_pair():
+    destination = torch.full(
+        (THREADS, 2), -1, dtype=torch.int32, device="cuda"
+    )
+    launch = build_ds_load_2addr_b32_probe()
+    _run_compiled(
+        launch,
+        ptr_arg(destination, fx.Int32),
+        torch.cuda.current_stream(),
+    )
+    torch.cuda.synchronize()
+    lane = torch.arange(THREADS, dtype=torch.int32, device="cuda") % 16
+    expected = torch.stack((lane, lane + 16), dim=1)
+    torch.testing.assert_close(destination, expected, rtol=0, atol=0)

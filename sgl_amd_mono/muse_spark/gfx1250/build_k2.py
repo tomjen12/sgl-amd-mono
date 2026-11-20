@@ -36,11 +36,8 @@ _STREAM = fx.Stream(None)
 THREADS = 256
 WAVES = THREADS // 32
 _ALIGN = 256
-JOINT_TDM_BUFFERS = 6
-JOINT_TDM_A_ELEMS = 16 * (256 + 8) + 8
-JOINT_TDM_B_ELEMS = 64 * (256 + 8) + 8
-JOINT_TDM_ARENA_ELEMS = JOINT_TDM_BUFFERS * (
-    JOINT_TDM_A_ELEMS + JOINT_TDM_B_ELEMS
+JOINT_TDM_ARENA_ELEMS = (
+    post_attn.JOINT_TDM_BUFFERS * post_attn.JOINT_TDM_SLOT_ELEMS
 )
 O_GROUPS = HIDDEN // (post_attn.ROWS * post_attn.WAVES)
 ROUTER_GROUPS = EXPERTS // (post_attn.ROWS * post_attn.WAVES)
@@ -130,6 +127,7 @@ class K2Build(msgspec.Struct, frozen=True):
     single_boundary_wait: bool = False
     lds_x_rp: bool = False
     joint_rp: bool = False
+    joint_rp_tdm: bool = False
     phase_trace: bool = False
 
 
@@ -184,6 +182,8 @@ def build_k2(key: K2Build):
         raise ValueError("K2 joint Router/Pooler overlays the O-projection LDS")
     if key.joint_rp and key.staged_profile:
         raise ValueError("K2 joint Router/Pooler requires the persistent path")
+    if key.joint_rp_tdm and not key.joint_rp:
+        raise ValueError("K2 joint TDM requires the packed joint Router/Pooler")
 
     W = key.npes
     name = kernel_symbol(
@@ -198,6 +198,7 @@ def build_k2(key: K2Build):
         q=int(key.single_boundary_wait),
         u=int(key.lds_x_rp),
         j=int(key.joint_rp),
+        m=int(key.joint_rp_tdm),
         t=int(key.phase_trace),
     )
     keyed = key_tuple(key, SOURCES)
@@ -454,6 +455,18 @@ def build_k2(key: K2Build):
             # separate reduction allocation would not.
             arena: fx.Array[fx.BFloat16, JOINT_TDM_ARENA_ELEMS, 16]
 
+        def persistent_lds_views(lds):
+            arena_addr = fx.Int32(fx.ptrtoint(lds.arena.ptr))
+            lds_f32 = fx.inttoptr(
+                fx.PointerType.get(
+                    elem_ty=fx.Float32.ir_type,
+                    address_space=fx.AddressSpace.Shared,
+                    alignment=16,
+                ),
+                arena_addr,
+            )
+            return lds_f32, lds_f32 + post_attn.RED_FLOATS
+
     else:
 
         @fx.struct
@@ -462,6 +475,9 @@ def build_k2(key: K2Build):
             red: fx.Array[fx.Float32, post_attn.RED_FLOATS, 16]
             xrp: fx.Array[fx.Float32, post_attn.RP_X_PAIRS, 16]
             picked: fx.Array[fx.Float32, TOP_K, 16]
+
+        def persistent_lds_views(lds):
+            return lds.red.ptr, lds.picked.ptr
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def persistent(
@@ -490,21 +506,7 @@ def build_k2(key: K2Build):
         layer: Int32,
     ):
         lds = fx.SharedAllocator().allocate(PersistentLds).peek()
-        if key.joint_rp:
-            arena_addr = fx.Int32(fx.ptrtoint(lds.arena.ptr))
-            lds_f32 = fx.inttoptr(
-                fx.PointerType.get(
-                    elem_ty=fx.Float32.ir_type,
-                    address_space=fx.AddressSpace.Shared,
-                    alignment=16,
-                ),
-                arena_addr,
-            )
-            red_lds = lds_f32
-            picked_lds = lds_f32 + post_attn.RED_FLOATS
-        else:
-            red_lds = lds.red.ptr
-            picked_lds = lds.picked.ptr
+        red_lds, picked_lds = persistent_lds_views(lds)
         tid, bid = fx.thread_idx.x, fx.block_idx.x
         lane, wave = tid % 32, tid // 32
         mb = Mailbox(
@@ -669,21 +671,24 @@ def build_k2(key: K2Build):
                 ],
             )
             if bid < post_attn.JOINT_TASKS:
-                post_attn.stage_joint_router_pool(
-                    {
-                        "S": key.tokens,
-                        "task": bid,
-                        "tid": tid,
-                        "lane": lane,
-                        "wave": wave,
-                        "x": ptr(scratch, "k2_x"),
-                        # Joint mode reuses the existing w_pool ABI slot.  The
-                        # runner binds it to LayerViews.w_joint.
-                        "w_joint": w_pool,
-                        "out": ptr(scratch, "k2_joint"),
-                        "red": red_lds,
-                    }
-                )
+                joint_context = {
+                    "S": key.tokens,
+                    "task": bid,
+                    "tid": tid,
+                    "lane": lane,
+                    "wave": wave,
+                    "x": ptr(scratch, "k2_x"),
+                    # Joint mode reuses the existing w_pool ABI slot.  The
+                    # runner binds it to LayerViews.w_joint.
+                    "w_joint": w_pool,
+                    "out": ptr(scratch, "k2_joint"),
+                    "red": red_lds,
+                    "tdm": lds.arena.ptr,
+                }
+                if key.joint_rp_tdm:
+                    post_attn.stage_joint_router_pool_tdm(joint_context)
+                else:
+                    post_attn.stage_joint_router_pool(joint_context)
                 fx.memory_fence(
                     syncscope="agent", ordering=fx.AtomicOrdering.Release
                 )

@@ -17,6 +17,14 @@ pytestmark = pytest.mark.skipif(
 LAYER = 7
 
 
+def test_gfx1250_k2_default_persistent_cold_compiles():
+    """Keep build-time LDS view selection outside FlyDSL branch rewriting."""
+    from sgl_amd_mono.muse_spark.gfx1250.build_k2 import K2Build, build_k2
+    from sgl_amd_mono.muse_spark.gfx1250.runner import compile_only
+
+    compile_only(build_k2(K2Build(tokens=8, npes=4)))
+
+
 def _epoch(device, seconds=30.0):
     from sgl_amd_mono.common import guard
 
@@ -164,6 +172,7 @@ def test_gfx1250_k2_matches_explicit_reference_for_two_epochs():
             single_boundary_wait=os.environ.get("MUSE_K2_SINGLE_BOUNDARY_WAIT") == "1",
             lds_x_rp=os.environ.get("MUSE_K2_LDS_X_RP") == "1",
             joint_rp=os.environ.get("MUSE_K2_JOINT_RP") == "1",
+            joint_rp_tdm=os.environ.get("MUSE_K2_JOINT_RP_TDM") == "1",
         )
     )
     got = stream.clone()

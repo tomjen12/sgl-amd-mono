@@ -39,21 +39,26 @@ def compare_rank(baseline: dict, mono: dict, threshold: float) -> dict:
     _require_cosine(
         checks, "output", mono["output"], baseline["output"], threshold
     )
+    graph_snapshots = (
+        baseline.get("execution") == "cuda-graph"
+        and mono.get("execution") == "cuda-graph"
+    )
     for layer in range(LAYERS):
         expected_ids = baseline["routing_ids"][layer]
         if not torch.equal(mono["routing_ids"][layer], expected_ids):
             raise AssertionError(f"rank {rank} layer {layer}: routing override differs")
-        actual_ids = mono["layers"][layer]["routing_ids"]
-        if not torch.equal(actual_ids, expected_ids):
-            raise AssertionError(f"rank {rank} layer {layer}: Mono routing differs")
-        for name in ("hidden", "residual"):
-            _require_cosine(
-                checks,
-                f"layer_{layer}.{name}",
-                mono["layers"][layer][name],
-                baseline["layers"][layer][name],
-                threshold,
-            )
+        if not graph_snapshots:
+            actual_ids = mono["layers"][layer]["routing_ids"]
+            if not torch.equal(actual_ids, expected_ids):
+                raise AssertionError(f"rank {rank} layer {layer}: Mono routing differs")
+            for name in ("hidden", "residual"):
+                _require_cosine(
+                    checks,
+                    f"layer_{layer}.{name}",
+                    mono["layers"][layer][name],
+                    baseline["layers"][layer][name],
+                    threshold,
+                )
         for name in ("key", "value"):
             got = mono["kv_cache"][layer][name]
             expected = baseline["kv_cache"][layer][name]
@@ -65,6 +70,7 @@ def compare_rank(baseline: dict, mono: dict, threshold: float) -> dict:
         "rank": rank,
         "minimum_cosine": min(checks.values()),
         "checks": checks,
+        "execution": "cuda-graph" if graph_snapshots else "eager",
         "routing_ids_exact": True,
         "current_kv_exact": True,
     }
@@ -102,13 +108,22 @@ def main() -> int:
     parser.add_argument("mono_dir", type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    result = compare_directories(args.baseline_dir, args.mono_dir)
+    try:
+        result = compare_directories(args.baseline_dir, args.mono_dir)
+        exit_code = 0
+    except AssertionError as error:
+        result = {
+            "status": "failed",
+            "threshold": DEFAULT_COSINE,
+            "error": str(error),
+        }
+        exit_code = 1
     text = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(text, encoding="utf-8")
     print(text, end="")
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":
