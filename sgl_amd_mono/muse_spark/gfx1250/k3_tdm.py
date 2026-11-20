@@ -108,7 +108,6 @@ def _build_task(
         defer_c_wait=int(fast_drain and stage1_quant_out and stage1_act),
         tdm_snop=1,
         k_waves=1,
-        single_row_store=0,
     )
 
 
