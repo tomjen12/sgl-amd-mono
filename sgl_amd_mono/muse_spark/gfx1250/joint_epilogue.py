@@ -32,7 +32,6 @@ from sgl_amd_mono.muse_spark.gfx1250.stages.post_attn import (
     _sigmoid,
 )
 
-M = 24
 N = 4608
 POOL = 4096
 EXPERTS = 256
@@ -66,6 +65,7 @@ def _store_bf16_pair(resource, pair, lo, hi):
 
 @cache
 def _compile_joint_epilogue(
+    m,
     sched_strategy=None,
     expert_scheduling=True,
     diagnostic_task="both",
@@ -95,7 +95,7 @@ def _compile_joint_epilogue(
     ):
         pid = fx.block_idx.x
         if diagnostic_task == "pool":
-            pid += M
+            pid += m
         tid = fx.thread_idx.x
         lane = tid & 31
         wave = tid >> 5
@@ -116,7 +116,7 @@ def _compile_joint_epilogue(
         quant_rsrc = ptr_rsrc(quant)
         quant_scale_rsrc = ptr_rsrc(quant_scale)
 
-        if pid < M:
+        if pid < m:
             candidates = (tid, tid + THREADS)
             raw = []
             biased = []
@@ -199,7 +199,7 @@ def _compile_joint_epilogue(
                             pid * TOP_K + pick,
                         )
         else:
-            row = pid - M
+            row = pid - m
             base = row * N + tid * VALUES_PER_THREAD
             values = []
             sum_sq = fx.Float32(0.0)
@@ -297,7 +297,7 @@ def _compile_joint_epilogue(
                 "rocdl.waves_per_eu": 1,
             },
         )
-        grid_x = 2 * M if diagnostic_task == "both" else M
+        grid_x = 2 * m if diagnostic_task == "both" else m
         launcher.launch(
             grid=(grid_x, 1, 1),
             block=(THREADS, 1, 1),
@@ -333,8 +333,11 @@ def joint_epilogue(
     diagnostic_task="both",
 ) -> None:
     """Launch the fixed M24/SK1 Joint epilogue parity kernel."""
-    assert partial.shape == (1, M, N) and partial.dtype == torch.float32
+    m = partial.shape[1]
+    assert m in (8, 24)
+    assert partial.shape == (1, m, N) and partial.dtype == torch.float32
     launch = _compile_joint_epilogue(
+        m,
         sched_strategy,
         expert_scheduling,
         diagnostic_task,

@@ -126,6 +126,7 @@ def main() -> int:
     parser.add_argument("--multiplier", type=float, default=1.0)
     parser.add_argument("--route-scale", type=float, default=1.0)
     parser.add_argument("--eps", type=float, default=1e-6)
+    parser.add_argument("--triton-only", action="store_true")
     parser.add_argument(
         "--flydsl-sched",
         choices=("default", "max-ilp", "max-memory-clause"),
@@ -141,8 +142,8 @@ def main() -> int:
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
-    if args.m != 24 or args.sk != 1:
-        raise ValueError("Parity contract is fixed to M=24 and SK=1")
+    if args.m not in (8, 24) or args.sk != 1:
+        raise ValueError("Baseline contract supports M=8/24 and SK=1")
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
     partial = torch.randn(
@@ -164,7 +165,7 @@ def main() -> int:
         )
 
     triton_outputs = outputs()
-    flydsl_outputs = outputs()
+    flydsl_outputs = None if args.triton_only else outputs()
     triton_launch = lambda: _launch_triton(
         partial,
         bias,
@@ -174,20 +175,25 @@ def main() -> int:
         args.route_scale,
         args.eps,
     )
-    flydsl_launch = lambda: _launch_flydsl(
-        partial,
-        bias,
-        norm,
-        *flydsl_outputs,
-        args.multiplier,
-        args.route_scale,
-        args.eps,
-        None if args.flydsl_sched == "default" else args.flydsl_sched,
-        not args.no_expert_scheduling,
-        args.flydsl_task,
+    flydsl_launch = (
+        None
+        if args.triton_only
+        else lambda: _launch_flydsl(
+            partial,
+            bias,
+            norm,
+            *flydsl_outputs,
+            args.multiplier,
+            args.route_scale,
+            args.eps,
+            None if args.flydsl_sched == "default" else args.flydsl_sched,
+            not args.no_expert_scheduling,
+            args.flydsl_task,
+        )
     )
     triton_launch()
-    flydsl_launch()
+    if flydsl_launch is not None:
+        flydsl_launch()
     torch.cuda.synchronize()
 
     logits = partial[:, :, 4096:4352].sum(0)
@@ -217,7 +223,9 @@ def main() -> int:
                 .item()
             ),
         },
-        "flydsl_vs_triton": {
+    }
+    if flydsl_outputs is not None:
+        correctness["flydsl_vs_triton"] = {
             "scores_max_error": float(
                 (flydsl_outputs[0] - triton_outputs[0]).abs().max().item()
             ),
@@ -251,8 +259,7 @@ def main() -> int:
             "quant_scale_mismatch_count": int(
                 (flydsl_outputs[4] != triton_outputs[4]).sum().item()
             ),
-        },
-    }
+        }
 
     triton_samples = _device_benchmark(
         triton_launch,
@@ -260,14 +267,20 @@ def main() -> int:
         warmup=args.warmup,
         rounds=args.rounds,
     )
-    flydsl_samples = _device_benchmark(
-        flydsl_launch,
-        dispatches=args.dispatches,
-        warmup=args.warmup,
-        rounds=args.rounds,
+    flydsl_samples = (
+        None
+        if flydsl_launch is None
+        else _device_benchmark(
+            flydsl_launch,
+            dispatches=args.dispatches,
+            warmup=args.warmup,
+            rounds=args.rounds,
+        )
     )
     triton_median = statistics.median(triton_samples)
-    flydsl_median = statistics.median(flydsl_samples)
+    flydsl_median = (
+        None if flydsl_samples is None else statistics.median(flydsl_samples)
+    )
     result = {
         "shape": {"m": args.m, "sk": args.sk, "n": 4608},
         "config": {
@@ -294,15 +307,16 @@ def main() -> int:
             "min_us": min(triton_samples),
             "max_us": max(triton_samples),
         },
-        "flydsl": {
+    }
+    if flydsl_samples is not None:
+        result["flydsl"] = {
             "samples_us": flydsl_samples,
             "median_us": flydsl_median,
             "mean_us": statistics.mean(flydsl_samples),
             "min_us": min(flydsl_samples),
             "max_us": max(flydsl_samples),
-        },
-        "flydsl_over_triton": flydsl_median / triton_median,
-    }
+        }
+        result["flydsl_over_triton"] = flydsl_median / triton_median
     text = json.dumps(result, indent=2, sort_keys=True)
     print(text)
     if args.output is not None:

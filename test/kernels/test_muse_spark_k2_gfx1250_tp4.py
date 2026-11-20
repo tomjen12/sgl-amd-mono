@@ -204,6 +204,7 @@ def _worker(rank, port, queue):
                             "start",
                             "norm_oproj",
                             "boundary",
+                            "joint_ready",
                             "router",
                             "pool",
                             "top8",
@@ -222,12 +223,26 @@ def _worker(rank, port, queue):
                         "points": [
                             "norm_oproj",
                             "boundary",
+                            "joint_ready",
                             "router",
                             "pool",
                             "top8",
                             "pooled_norm",
                         ],
                         "deltas": critical.tolist(),
+                    }
+                ),
+                flush=True,
+            )
+            joint_compute_us = deltas[:, 3].float() / ticks_per_us
+            print(
+                "K2_TP4_JOINT_COMPUTE_US="
+                + json.dumps(
+                    {
+                        "rank": rank,
+                        "min": float(joint_compute_us.min()),
+                        "median": float(joint_compute_us.median()),
+                        "max": float(joint_compute_us.max()),
                     }
                 ),
                 flush=True,

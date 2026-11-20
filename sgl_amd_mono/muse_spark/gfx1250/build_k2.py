@@ -36,15 +36,13 @@ _STREAM = fx.Stream(None)
 THREADS = 256
 WAVES = THREADS // 32
 _ALIGN = 256
-JOINT_TDM_ARENA_ELEMS = (
-    post_attn.JOINT_TDM_BUFFERS * post_attn.JOINT_TDM_SLOT_ELEMS
-)
+JOINT_TDM_ARENA_ELEMS = post_attn.tdm_arena_elems()
 O_GROUPS = HIDDEN // (post_attn.ROWS * post_attn.WAVES)
 ROUTER_GROUPS = EXPERTS // (post_attn.ROWS * post_attn.WAVES)
 POOL_GROUPS = MOE_HIDDEN // (post_attn.ROWS * post_attn.WAVES)
 ROUTER_TILES = EXPERTS // post_attn.ROWS
 POOL_TILES = MOE_HIDDEN // post_attn.ROWS
-K2_PHASE_POINTS = 7
+K2_PHASE_POINTS = 8
 
 
 def _raw_layout(items):
@@ -593,7 +591,12 @@ def build_k2(key: K2Build):
                 )
                 _publish_wave(sync["put"], norm_done, norm_task, lane)
 
-        if bid < O_GROUPS:
+        o_active = (
+            bid < post_attn.O_TDM_FIRST_TASKS
+            if key.joint_rp_tdm
+            else bid < O_GROUPS
+        )
+        if o_active:
             if not key.lds_og:
                 _wait(
                     sync["poll"],
@@ -604,30 +607,60 @@ def build_k2(key: K2Build):
                         )
                     ],
                 )
-            post_attn.stage_o_projection(
-                {
+            if key.joint_rp_tdm:
+                o_context = {
                     "W": W,
                     "S": key.tokens,
-                    "bid": bid,
+                    "task": bid,
                     "tid": tid,
                     "lane": lane,
                     "wave": wave,
                     "red": red_lds,
                     "rank": rank,
-                    "og": (
-                        lds.og.ptr
-                        if key.lds_og
-                        else ptr(scratch, "k2_og")
-                    ),
-                    "local_og": key.lds_og,
+                    "og": ptr(scratch, "k2_og"),
                     "w_o": w_o,
+                    "tdm": lds.arena.ptr,
+                    "tdm_pairs": red_lds,
                     "put_bf": sync["put_bf"],
                     "peer_attn": [
                         preg(base, sy["k2_attn"][0], "k2_attn")
                         for base in bases
                     ],
                 }
-            )
+                post_attn.stage_o_projection_tdm(o_context)
+                if bid < (
+                    post_attn.O_TDM_TASKS
+                    - post_attn.O_TDM_FIRST_TASKS
+                ):
+                    o_context["task"] = (
+                        bid + post_attn.O_TDM_FIRST_TASKS
+                    )
+                    post_attn.stage_o_projection_tdm(o_context)
+            else:
+                post_attn.stage_o_projection(
+                    {
+                        "W": W,
+                        "S": key.tokens,
+                        "bid": bid,
+                        "tid": tid,
+                        "lane": lane,
+                        "wave": wave,
+                        "red": red_lds,
+                        "rank": rank,
+                        "og": (
+                            lds.og.ptr
+                            if key.lds_og
+                            else ptr(scratch, "k2_og")
+                        ),
+                        "local_og": key.lds_og,
+                        "w_o": w_o,
+                        "put_bf": sync["put_bf"],
+                        "peer_attn": [
+                            preg(base, sy["k2_attn"][0], "k2_attn")
+                            for base in bases
+                        ],
+                    }
+                )
         _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 1)
 
         if bid < key.tokens:
@@ -661,6 +694,24 @@ def build_k2(key: K2Build):
 
         if key.joint_rp:
             _wait(sync["poll"], [(joint_counter_ready, 0, 1)])
+            joint_context = {
+                "S": key.tokens,
+                "task": bid,
+                "tid": tid,
+                "lane": lane,
+                "wave": wave,
+                "x": ptr(scratch, "k2_x"),
+                # Joint mode reuses the existing w_pool ABI slot.  The
+                # runner binds it to LayerViews.w_joint.
+                "w_joint": w_pool,
+                "out": ptr(scratch, "k2_joint"),
+                "red": red_lds,
+                "tdm": lds.arena.ptr,
+                "tdm_pairs": red_lds,
+                "weights_prefetched": key.joint_rp_tdm,
+            }
+            if key.joint_rp_tdm:
+                post_attn.stage_joint_prefetch_weights_tdm(joint_context)
             _wait(
                 sync["poll"],
                 [
@@ -668,27 +719,13 @@ def build_k2(key: K2Build):
                     for token in range(key.tokens)
                 ],
             )
+            _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 3)
             joint_active = (
                 bid < RESIDENT_BLOCKS
                 if key.joint_rp_tdm
                 else bid < post_attn.JOINT_TASKS
             )
             if joint_active:
-                joint_context = {
-                    "S": key.tokens,
-                    "task": bid,
-                    "tid": tid,
-                    "lane": lane,
-                    "wave": wave,
-                    "x": ptr(scratch, "k2_x"),
-                    # Joint mode reuses the existing w_pool ABI slot.  The
-                    # runner binds it to LayerViews.w_joint.
-                    "w_joint": w_pool,
-                    "out": ptr(scratch, "k2_joint"),
-                    "red": red_lds,
-                    "tdm": lds.arena.ptr,
-                    "tdm_pairs": red_lds,
-                }
                 if key.joint_rp_tdm:
                     for task_round in range_constexpr(
                         post_attn.JOINT_TDM_TASKS // RESIDENT_BLOCKS
@@ -717,8 +754,8 @@ def build_k2(key: K2Build):
                         _publish_wave(
                             sync["put"], joint_all_done, 0, fx.Int32(0)
                         )
-            _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 3)
             _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 4)
+            _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 5)
         elif key.cooperative_rp:
             _wait(
                 sync["poll"],
@@ -731,6 +768,7 @@ def build_k2(key: K2Build):
                     ]
                 ),
             )
+            _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 3)
             if (bid >= 64) & (bid < 64 + ROUTER_TILES):
                 router_task = bid - 64
                 post_attn.stage_router_pool_cooperative(
@@ -751,7 +789,7 @@ def build_k2(key: K2Build):
                     }
                 )
                 _publish(sync["put"], router_done, router_task, tid)
-            _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 3)
+            _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 4)
 
             pool_task = bid
             while pool_task < POOL_TILES:
@@ -774,8 +812,9 @@ def build_k2(key: K2Build):
                 )
                 pool_task = pool_task + RESIDENT_BLOCKS
             _publish(sync["put"], pool_done, bid, tid)
-            _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 4)
+            _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 5)
         else:
+            _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 3)
             if key.single_boundary_wait and bid < POOL_GROUPS:
                 _wait(
                     sync["poll"],
@@ -816,7 +855,7 @@ def build_k2(key: K2Build):
                     }
                 )
                 _publish(sync["put"], router_done, bid, tid)
-            _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 3)
+            _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 4)
 
             if bid < POOL_GROUPS:
                 if not key.single_boundary_wait:
@@ -846,7 +885,7 @@ def build_k2(key: K2Build):
                     }
                 )
                 _publish(sync["put"], pool_done, bid, tid)
-            _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 4)
+            _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 5)
 
         if bid < key.tokens:
             if key.joint_rp:
@@ -913,7 +952,7 @@ def build_k2(key: K2Build):
                             )
                         )
                         bo.buffer_store(score, rsrc(scores), offset)
-        _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 5)
+        _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 6)
 
         if key.joint_rp:
             if (bid >= key.tokens) & (bid < 2 * key.tokens):
@@ -955,7 +994,7 @@ def build_k2(key: K2Build):
                         "xin": xin,
                     }
                 )
-        _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 6)
+        _stamp_phase(key.phase_trace, phase_ticks, bid, tid, 7)
 
     @flyc.jit
     def launch(

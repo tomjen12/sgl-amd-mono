@@ -6,7 +6,7 @@ import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import gpu, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.ops import (
@@ -28,6 +28,7 @@ from sgl_amd_mono.muse_spark.gfx1250.config import (
     MOE_HIDDEN,
     POST_EPS,
     Q_K,
+    RESIDENT_BLOCKS,
     RMS_EPS,
     ROUTE_EPS,
     ROUTE_SCALE,
@@ -47,13 +48,15 @@ RP_X_PAIRS = RP_X_ROWS * RP_X_TILE_K // 2
 JOINT_ROWS = MOE_HIDDEN + 2 * EXPERTS
 JOINT_WAVES = 4
 JOINT_TASKS = JOINT_ROWS // (ROWS * JOINT_WAVES)
-JOINT_TDM_TASKS = JOINT_ROWS // ROWS
+JOINT_TDM_N_WAVES = 3
+JOINT_TDM_LOADER_WAVES = 2
+JOINT_TDM_TASKS = JOINT_ROWS // (ROWS * JOINT_TDM_N_WAVES)
 JOINT_TDM_K = 512
-JOINT_TDM_BUFFERS = 4
+JOINT_TDM_BUFFERS = 3
 JOINT_TDM_PAD = 8
 JOINT_TDM_STRIDE = JOINT_TDM_K + JOINT_TDM_PAD
 JOINT_TDM_A_ROWS = ROWS
-JOINT_TDM_B_ROWS = ROWS
+JOINT_TDM_B_ROWS = ROWS * JOINT_TDM_N_WAVES
 JOINT_TDM_A_ELEMS = JOINT_TDM_A_ROWS * JOINT_TDM_STRIDE + JOINT_TDM_PAD
 JOINT_TDM_B_ELEMS = JOINT_TDM_B_ROWS * JOINT_TDM_STRIDE + JOINT_TDM_PAD
 JOINT_TDM_SLOT_ELEMS = JOINT_TDM_A_ELEMS + JOINT_TDM_B_ELEMS
@@ -63,11 +66,28 @@ JOINT_TDM_COPIES_PER_THREAD = (
     JOINT_TDM_A_CHUNKS + JOINT_TDM_B_CHUNKS
 ) // THREADS
 JOINT_TDM_K_TILES = HIDDEN // JOINT_TDM_K
+O_TDM_N_WAVES = 2
+O_TDM_TASKS = HIDDEN // (ROWS * O_TDM_N_WAVES)
+O_TDM_FIRST_TASKS = RESIDENT_BLOCKS
+O_TDM_B_ROWS = ROWS * O_TDM_N_WAVES
+O_TDM_SLOT_ELEMS = (
+    JOINT_TDM_A_ELEMS
+    + O_TDM_B_ROWS * JOINT_TDM_STRIDE
+    + JOINT_TDM_PAD
+)
 
 
 def joint_tdm_lds_bytes():
-    """Four padded M16xK512 / N16xK512 BF16 slots."""
+    """Three padded M16xK512 / N48xK512 BF16 slots."""
     return 2 * JOINT_TDM_BUFFERS * JOINT_TDM_SLOT_ELEMS
+
+
+def tdm_arena_elems():
+    """LDS overlay large enough for either O-proj N64 or Joint N48."""
+    return JOINT_TDM_BUFFERS * max(
+        JOINT_TDM_SLOT_ELEMS,
+        O_TDM_SLOT_ELEMS,
+    )
 
 
 def joint_tdm_copy_coordinates(chunk):
@@ -542,7 +562,7 @@ def _joint_tdm_async_copy(global_address, lds_bf16):
 
 @flyc.jit
 def _issue_joint_tdm_tile(c, k_tile, slot):
-    """Fill one padded M16xK512 / N16xK512 ring slot cooperatively."""
+    """Fill one padded M16xK512 / N48xK512 ring slot cooperatively."""
     tid = c["tid"]
     slot_base = slot * JOINT_TDM_SLOT_ELEMS
     for issue in range_constexpr(JOINT_TDM_COPIES_PER_THREAD):
@@ -626,80 +646,356 @@ def stage_joint_router_pool(c):
 
 
 @flyc.jit
-def stage_joint_router_pool_tdm(c):
-    """Packed M16xN16xK512 GEMM with a four-slot async LDS ring.
+def stage_o_projection_tdm(c):
+    """M16xN32xK512 O projection with a three-slot TDM ring."""
+    tid, lane, wave = c["tid"], c["lane"], c["wave"]
+    acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
+    a_tile = (JOINT_TDM_A_ROWS, JOINT_TDM_K)
+    b_tile = (O_TDM_B_ROWS, JOINT_TDM_K)
+    global_bf16_ptr = fx.PointerType.get(
+        elem_ty=fx.BFloat16.ir_type,
+        address_space=fx.AddressSpace.Global,
+        alignment=16,
+    )
 
-    This is the rows=8 Baseline geometry. All resident waves prefetch while
-    wave 0 owns the valid M8xN16 output; each persistent CTA executes three
-    N16 tasks to cover all 4608 output rows over the 96-CTA grid.
+    def make_tdm(ptr, shape, tile):
+        gt = fx.Tensor(
+            fx.make_view(ptr, fx.make_layout(shape, (HIDDEN, 1)))
+        )
+        atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+            fx.rocdl.TensorLoad(),
+            gt,
+            fx.make_layout(tile, (JOINT_TDM_STRIDE, 1)),
+            tile,
+            num_warps=JOINT_TDM_LOADER_WAVES,
+        )
+        return atom, fx.zipped_divide(coord, tile)[None, (0, None)]
+
+    atom_a, block_a = make_tdm(
+        fx.inttoptr(global_bf16_ptr, fx.Int64(c["og"])),
+        (fx.Int32(c["S"]), HIDDEN),
+        a_tile,
+    )
+    atom_b, block_b = make_tdm(
+        fx.add_offset(
+            fx.inttoptr(global_bf16_ptr, fx.Int64(c["w_o"])),
+            fx.Int64(c["task"] * O_TDM_B_ROWS * HIDDEN),
+        ),
+        (O_TDM_B_ROWS, HIDDEN),
+        b_tile,
+    )
+
+    def issue_tdm_loads(slot, k_tile):
+        if wave < JOINT_TDM_LOADER_WAVES:
+            def issue(atom, block, tile, lds_offset):
+                lds_box = fx.Tensor(
+                    fx.make_view(
+                        fx.add_offset(
+                            c["tdm"],
+                            slot * O_TDM_SLOT_ELEMS + lds_offset,
+                        ),
+                        fx.make_layout(
+                            (tile, 1),
+                            (
+                                (JOINT_TDM_STRIDE, 1),
+                                tile[0] * JOINT_TDM_STRIDE,
+                            ),
+                        ),
+                    )
+                )
+                ts, tg = fx.rocdl.cdna5.tdm_partition(
+                    atom,
+                    wave,
+                    fx.make_layout(JOINT_TDM_LOADER_WAVES, 1),
+                    lds_box,
+                    block,
+                )
+                fx.copy(atom, tg[None, fx.Int32(k_tile)], ts[None, 0])
+
+            issue(atom_a, block_a, a_tile, 0)
+            issue(atom_b, block_b, b_tile, JOINT_TDM_A_ELEMS)
+
+    for tile in range_constexpr(JOINT_TDM_BUFFERS):
+        issue_tdm_loads(tile, tile)
+    rocdl.sched_barrier(0)
+
+    for k_tile in range_constexpr(JOINT_TDM_K_TILES):
+        tdm_ops.tensor_wait(
+            min(
+                (JOINT_TDM_BUFFERS - 1) * 2,
+                max(0, JOINT_TDM_K_TILES - 1 - k_tile) * 2,
+            )
+        )
+        gpu.barrier()
+        slot = k_tile % JOINT_TDM_BUFFERS
+        slot_base = slot * O_TDM_SLOT_ELEMS
+        if wave < O_TDM_N_WAVES:
+            token = lane % ROWS
+            row = wave * ROWS + lane % ROWS
+            a_fragments = []
+            b_fragments = []
+            for inner in range_constexpr(JOINT_TDM_K // WMMA_K):
+                a_fragments.append(
+                    _lds_fragment(
+                        c["tdm_pairs"],
+                        slot_base + token * JOINT_TDM_STRIDE,
+                        inner * WMMA_K,
+                        lane,
+                    )
+                )
+                b_fragments.append(
+                    _lds_fragment(
+                        c["tdm_pairs"],
+                        slot_base
+                        + JOINT_TDM_A_ELEMS
+                        + row * JOINT_TDM_STRIDE,
+                        inner * WMMA_K,
+                        lane,
+                    )
+                )
+            rocdl.s_wait_dscnt(0)
+            next_tile = k_tile + JOINT_TDM_BUFFERS
+            if next_tile < JOINT_TDM_K_TILES:
+                issue_tdm_loads(slot, next_tile)
+            rocdl.sched_barrier(0)
+            for inner in range_constexpr(JOINT_TDM_K // WMMA_K):
+                acc = _wmma(b_fragments[inner], a_fragments[inner], acc)
+        gpu.barrier()
+        rocdl.sched_barrier(0)
+
+    if wave < O_TDM_N_WAVES:
+        fx.ptr_store(acc, c["red"] + (wave * 32 + lane) * WMMA_ACC)
+    gpu.barrier()
+    out = tid
+    count = c["S"] * O_TDM_N_WAVES * (ROWS // 2)
+    if out < count:
+        tile_wave = out // (c["S"] * (ROWS // 2))
+        within = out % (c["S"] * (ROWS // 2))
+        token = within // (ROWS // 2)
+        dim = 2 * (within % (ROWS // 2))
+        row = c["task"] * O_TDM_B_ROWS + tile_wave * ROWS + dim
+        a0 = bf16_round(_wave_value(c["red"], tile_wave, dim, token))
+        a1 = bf16_round(_wave_value(c["red"], tile_wave, dim + 1, token))
+        peer_element = (c["rank"] * MAX_TOKENS + token) * HIDDEN + row
+        for peer in range_constexpr(c["W"]):
+            c["put_bf"](c["peer_attn"][peer], peer_element, [a0, a1])
+    gpu.barrier()
+
+
+@flyc.jit
+def stage_joint_prefetch_weights_tdm(c):
+    """Issue the initial weight-ring fills before polling boundary readiness."""
+    wave = c["wave"]
+    b_tile = (JOINT_TDM_B_ROWS, JOINT_TDM_K)
+    global_bf16_ptr = fx.PointerType.get(
+        elem_ty=fx.BFloat16.ir_type,
+        address_space=fx.AddressSpace.Global,
+        alignment=16,
+    )
+    gt = fx.Tensor(
+        fx.make_view(
+            fx.add_offset(
+                fx.inttoptr(global_bf16_ptr, fx.Int64(c["w_joint"])),
+                fx.Int64(c["task"] * JOINT_TDM_B_ROWS * HIDDEN),
+            ),
+            fx.make_layout((JOINT_TDM_B_ROWS, HIDDEN), (HIDDEN, 1)),
+        )
+    )
+    atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+        fx.rocdl.TensorLoad(),
+        gt,
+        fx.make_layout(b_tile, (JOINT_TDM_STRIDE, 1)),
+        b_tile,
+        num_warps=JOINT_TDM_LOADER_WAVES,
+    )
+    block = fx.zipped_divide(coord, b_tile)[None, (0, None)]
+    if wave < JOINT_TDM_LOADER_WAVES:
+        for slot in range_constexpr(JOINT_TDM_BUFFERS):
+            lds_box = fx.Tensor(
+                fx.make_view(
+                    fx.add_offset(
+                        c["tdm"],
+                        slot * JOINT_TDM_SLOT_ELEMS + JOINT_TDM_A_ELEMS,
+                    ),
+                    fx.make_layout(
+                        (b_tile, 1),
+                        (
+                            (JOINT_TDM_STRIDE, 1),
+                            b_tile[0] * JOINT_TDM_STRIDE,
+                        ),
+                    ),
+                )
+            )
+            ts, tg = fx.rocdl.cdna5.tdm_partition(
+                atom,
+                wave,
+                fx.make_layout(JOINT_TDM_LOADER_WAVES, 1),
+                lds_box,
+                block,
+            )
+            fx.copy(atom, tg[None, fx.Int32(slot)], ts[None, 0])
+    tdm_ops.tensor_wait(0)
+    rocdl.sched_barrier(0)
+
+
+@flyc.jit
+def stage_joint_router_pool_tdm(c):
+    """Packed M16xN48xK512 GEMM with a three-slot async LDS ring.
+
+    Three compute waves share one activation tile and own one N16 weight tile
+    each. This covers all 288 Baseline N16 tasks concurrently over 96 CTAs
+    instead of running three complete K loops serially per CTA.
     """
     tid, lane, wave = c["tid"], c["lane"], c["wave"]
     acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
 
-    for tile in range_constexpr(JOINT_TDM_BUFFERS):
-        _issue_joint_tdm_tile(c, tile, tile)
+    def make_tdm(ptr, shape, tile, lds_stride):
+        gt = fx.Tensor(
+            fx.make_view(
+                ptr,
+                fx.make_layout(shape, (HIDDEN, 1)),
+            )
+        )
+        atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+            fx.rocdl.TensorLoad(),
+            gt,
+            fx.make_layout(tile, (lds_stride, 1)),
+            tile,
+            num_warps=JOINT_TDM_LOADER_WAVES,
+        )
+        return atom, fx.zipped_divide(coord, tile)[None, (0, None)]
+
+    a_tile = (JOINT_TDM_A_ROWS, JOINT_TDM_K)
+    b_tile = (JOINT_TDM_B_ROWS, JOINT_TDM_K)
+    global_bf16_ptr = fx.PointerType.get(
+        elem_ty=fx.BFloat16.ir_type,
+        address_space=fx.AddressSpace.Global,
+        alignment=16,
+    )
+    atom_a, block_a = make_tdm(
+        fx.inttoptr(global_bf16_ptr, fx.Int64(c["x"])),
+        (fx.Int32(c["S"]), HIDDEN),
+        a_tile,
+        JOINT_TDM_STRIDE,
+    )
+    atom_b, block_b = make_tdm(
+        fx.add_offset(
+            fx.inttoptr(global_bf16_ptr, fx.Int64(c["w_joint"])),
+            fx.Int64(c["task"] * JOINT_TDM_B_ROWS * HIDDEN),
+        ),
+        (JOINT_TDM_B_ROWS, HIDDEN),
+        b_tile,
+        JOINT_TDM_STRIDE,
+    )
+
+    def issue_tdm_loads(slot, k_tile, load_a=True, load_b=True):
+        if wave < JOINT_TDM_LOADER_WAVES:
+            def issue(atom, block, tile, lds_offset):
+                lds_box = fx.Tensor(
+                    fx.make_view(
+                        fx.add_offset(
+                            c["tdm"],
+                            slot * JOINT_TDM_SLOT_ELEMS + lds_offset,
+                        ),
+                        fx.make_layout(
+                            (tile, 1),
+                            (
+                                (JOINT_TDM_STRIDE, 1),
+                                tile[0] * JOINT_TDM_STRIDE,
+                            ),
+                        ),
+                    )
+                )
+                ts, tg = fx.rocdl.cdna5.tdm_partition(
+                    atom,
+                    wave,
+                    fx.make_layout(JOINT_TDM_LOADER_WAVES, 1),
+                    lds_box,
+                    block,
+                )
+                fx.copy(atom, tg[None, fx.Int32(k_tile)], ts[None, 0])
+
+            if load_a:
+                issue(atom_a, block_a, a_tile, 0)
+            if load_b:
+                issue(atom_b, block_b, b_tile, JOINT_TDM_A_ELEMS)
+
+    if c.get("weights_prefetched", False):
+        tdm_ops.tensor_wait(0)
+        for tile in range_constexpr(JOINT_TDM_BUFFERS):
+            issue_tdm_loads(tile, tile, load_b=False)
+        tdm_ops.tensor_wait(0)
+    else:
+        for tile in range_constexpr(JOINT_TDM_BUFFERS):
+            issue_tdm_loads(tile, tile)
     rocdl.sched_barrier(0)
 
     for k_tile in range_constexpr(JOINT_TDM_K_TILES):
-        remaining = (
-            min(JOINT_TDM_BUFFERS - 1, JOINT_TDM_K_TILES - 1 - k_tile)
-            * JOINT_TDM_COPIES_PER_THREAD
+        tdm_ops.tensor_wait(
+            min(
+                (JOINT_TDM_BUFFERS - 1) * 2,
+                max(0, JOINT_TDM_K_TILES - 1 - k_tile) * 2,
+            )
         )
-        rocdl.s_wait_asynccnt(remaining)
         gpu.barrier()
 
         slot = k_tile % JOINT_TDM_BUFFERS
         slot_base = slot * JOINT_TDM_SLOT_ELEMS
-        # Keep fragment construction outside a dynamic branch: loader-only
-        # waves read valid clamped rows, while wave 0 owns the useful M8 tile.
-        token = lane % ROWS
-        row = lane % ROWS
-        a_fragments = []
-        b_fragments = []
-        for inner in range_constexpr(JOINT_TDM_K // WMMA_K):
-            a_fragments.append(
-                _lds_fragment(
-                    c["tdm_pairs"],
-                    slot_base + token * JOINT_TDM_STRIDE,
-                    inner * WMMA_K,
-                    lane,
-                )
-            )
-            b_fragments.append(
-                _lds_fragment(
-                    c["tdm_pairs"],
-                    slot_base
-                    + JOINT_TDM_A_ELEMS
-                    + row * JOINT_TDM_STRIDE,
-                    inner * WMMA_K,
-                    lane,
-                )
-            )
-        rocdl.s_wait_dscnt(0)
-        gpu.barrier()
-
-        next_tile = k_tile + JOINT_TDM_BUFFERS
-        if next_tile < JOINT_TDM_K_TILES:
-            _issue_joint_tdm_tile(c, next_tile, slot)
-        rocdl.sched_barrier(0)
-
-        if wave == 0:
+        if wave < JOINT_TDM_N_WAVES:
+            token = lane % ROWS
+            row = fx.min(wave, JOINT_TDM_N_WAVES - 1) * ROWS + lane % ROWS
+            a_fragments = []
+            b_fragments = []
             for inner in range_constexpr(JOINT_TDM_K // WMMA_K):
-                acc = _wmma(b_fragments[inner], a_fragments[inner], acc)
+                a_fragments.append(
+                    _lds_fragment(
+                        c["tdm_pairs"],
+                        slot_base + token * JOINT_TDM_STRIDE,
+                        inner * WMMA_K,
+                        lane,
+                    )
+                )
+                b_fragments.append(
+                    _lds_fragment(
+                        c["tdm_pairs"],
+                        slot_base
+                        + JOINT_TDM_A_ELEMS
+                        + row * JOINT_TDM_STRIDE,
+                        inner * WMMA_K,
+                        lane,
+                    )
+                )
+            rocdl.s_wait_dscnt(0)
+            next_tile = k_tile + JOINT_TDM_BUFFERS
+            if next_tile < JOINT_TDM_K_TILES:
+                issue_tdm_loads(slot, next_tile)
+            rocdl.sched_barrier(0)
+            if wave < JOINT_TDM_N_WAVES:
+                for inner in range_constexpr(JOINT_TDM_K // WMMA_K):
+                    acc = _wmma(b_fragments[inner], a_fragments[inner], acc)
+        gpu.barrier()
         rocdl.sched_barrier(0)
 
-    if wave == 0:
-        fx.ptr_store(acc, c["red"] + lane * WMMA_ACC)
+    if wave < JOINT_TDM_N_WAVES:
+        fx.ptr_store(acc, c["red"] + (wave * 32 + lane) * WMMA_ACC)
     gpu.barrier()
-    out = tid
-    if out < c["S"] * ROWS:
-        token, dim = out // ROWS, out % ROWS
-        row = c["task"] * ROWS + dim
-        bo.buffer_store(
-            _wave_value(c["red"], 0, dim, token),
-            rsrc(c["out"]),
-            token * JOINT_ROWS + row,
-        )
+    count = c["S"] * JOINT_TDM_N_WAVES * ROWS
+    for p in range_constexpr(2):
+        out = tid + p * THREADS
+        if out < count:
+            tile_wave = out // (c["S"] * ROWS)
+            within = out % (c["S"] * ROWS)
+            token, dim = within // ROWS, within % ROWS
+            row = (
+                c["task"] * JOINT_TDM_N_WAVES * ROWS
+                + tile_wave * ROWS
+                + dim
+            )
+            bo.buffer_store(
+                _wave_value(c["red"], tile_wave, dim, token),
+                rsrc(c["out"]),
+                token * JOINT_ROWS + row,
+            )
     gpu.barrier()
 
 

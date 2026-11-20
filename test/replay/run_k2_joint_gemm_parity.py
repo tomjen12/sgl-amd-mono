@@ -45,10 +45,15 @@ def _launch_flydsl(
         gemm_a16w16 as flydsl_gemm_a16w16,
     )
 
-    if config["num_warps"] != 4:
-        raise RuntimeError(
-            "The exact Gluon-to-FlyDSL wave mapping currently requires four waves"
-        )
+    if config["num_warps"] == 4:
+        m_warp, n_warp = 2, 2
+    elif config["num_warps"] == 2:
+        # BM16xBN16 has one WMMA output tile. The generic FlyDSL GEMM maps it
+        # to one compute wave; the M8-specific two-wave pipeline is the next
+        # parity step if this diagnostic misses the performance gate.
+        m_warp, n_warp = 1, 1
+    else:
+        raise RuntimeError(f"Unsupported parity wave count: {config['num_warps']}")
     result = flydsl_gemm_a16w16(
         x,
         weight,
@@ -57,8 +62,8 @@ def _launch_flydsl(
         tile_m=config["BLOCK_M"],
         tile_n=config["BLOCK_N"],
         tile_k=config["BLOCK_K"],
-        m_warp=2,
-        n_warp=2,
+        m_warp=m_warp,
+        n_warp=n_warp,
         num_buffers=config["NUM_BUFFERS"],
         waves_per_eu=config["waves_per_eu"],
         kernarg_preload=kernarg_preload,
@@ -149,15 +154,29 @@ def main() -> int:
     device = torch.device("cuda")
     x = torch.randn((args.m, args.k), device=device, dtype=torch.bfloat16)
     weight = torch.randn((args.n, args.k), device=device, dtype=torch.bfloat16)
-    config = {
-        "BLOCK_M": 32,
-        "BLOCK_N": 32,
-        "BLOCK_K": 512,
-        "NUM_BUFFERS": 3,
-        "num_warps": 4,
-        "waves_per_eu": 1,
-        "kernel_type": "bandwidth_bound",
+    configs = {
+        8: {
+            "BLOCK_M": 16,
+            "BLOCK_N": 16,
+            "BLOCK_K": 512,
+            "NUM_BUFFERS": 4,
+            "num_warps": 2,
+            "waves_per_eu": 1,
+            "kernel_type": "bandwidth_bound",
+        },
+        24: {
+            "BLOCK_M": 32,
+            "BLOCK_N": 32,
+            "BLOCK_K": 512,
+            "NUM_BUFFERS": 3,
+            "num_warps": 4,
+            "waves_per_eu": 1,
+            "kernel_type": "bandwidth_bound",
+        },
     }
+    if args.m not in configs:
+        raise ValueError(f"No fixed parity contract for M={args.m}")
+    config = configs[args.m]
     tuned = False
     reference = x.float() @ weight.float().T
     gluon_output = None
