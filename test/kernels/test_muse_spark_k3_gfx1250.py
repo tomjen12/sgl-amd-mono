@@ -327,6 +327,10 @@ def test_k3_matches_explicit_native_quark_reference(last, shuffled):
                 os.environ.get("MUSE_K3_EXPERT_PROFILE_MODE", "1") == "1"
             ),
             tdm_expert=tdm_expert,
+            tdm_fast_drain=(
+                os.environ.get("SGLANG_AMD_MONO_MUSE_K3_TDM_FAST_DRAIN")
+                == "1"
+            ),
         )
     )
     try:

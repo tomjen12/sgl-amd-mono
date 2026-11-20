@@ -274,6 +274,9 @@ def _make_layer(rank, index, device, shared_generator, local_generator, layout):
     routed_ids = (0, 1, 64, 65, 128, 129, 192, 193)
     for priority, expert in enumerate(routed_ids):
         weights["bias"][expert] = float(len(routed_ids) - priority)
+    weights["w_joint"] = torch.cat(
+        [weights["w_pool"], weights["w_hi"], weights["w_lo"]], dim=0
+    ).contiguous()
 
     qkvg = (
         torch.randn(
@@ -643,7 +646,16 @@ def _worker(rank, port, queue, rows):
             if differential_kattn
             else None
         )
-        k2 = build_k2(K2Build(tokens=rows, npes=NP))
+        use_k2_joint = os.environ.get("MUSE_K2_JOINT_RP") == "1"
+        use_k2_tdm = os.environ.get("MUSE_K2_JOINT_RP_TDM") == "1"
+        k2 = build_k2(
+            K2Build(
+                tokens=rows,
+                npes=NP,
+                joint_rp=use_k2_joint,
+                joint_rp_tdm=use_k2_tdm,
+            )
+        )
         k3_variants = {
             False: build_k3(
                 K3Build(tokens=rows, npes=NP, last=False, shuffled=True)
@@ -832,7 +844,12 @@ def _worker(rank, port, queue, rows):
                 weights["w_o"].data_ptr(), weights["attn_alpha"].data_ptr(),
                 weights["attn_beta"].data_ptr(), weights["pre_w"].data_ptr(),
                 weights["w_hi"].data_ptr(), weights["w_lo"].data_ptr(),
-                weights["bias"].data_ptr(), weights["w_pool"].data_ptr(),
+                weights["bias"].data_ptr(),
+                (
+                    weights["w_joint"]
+                    if use_k2_joint
+                    else weights["w_pool"]
+                ).data_ptr(),
                 weights["xn_w"].data_ptr(), outputs["ids"].data_ptr(),
                 outputs["scores"].data_ptr(), 0, 0, outputs["xin"].data_ptr(),
                 k2_scratch.data_ptr(), split_k2_peers.local,

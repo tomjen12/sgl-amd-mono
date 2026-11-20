@@ -62,6 +62,13 @@ PHASE_TRACE = os.environ.get("MUSE_PHASE_TRACE", "0") == "1"
 # while retaining one persistent K3 launch. GPU runtime remains opt-in until
 # the dedicated correctness gate passes.
 USE_K3_TDM = os.environ.get("SGLANG_AMD_MONO_MUSE_K3_TDM", "0") == "1"
+# Persistent-only TDM drain overlap. This remains independently default-off
+# until focused and TP4 state-carry qualification passes.
+USE_K3_TDM_FAST_DRAIN = (
+    os.environ.get("SGLANG_AMD_MONO_MUSE_K3_TDM_FAST_DRAIN", "0") == "1"
+)
+if USE_K3_TDM_FAST_DRAIN and not USE_K3_TDM:
+    raise ValueError("K3 TDM fast drain requires SGLANG_AMD_MONO_MUSE_K3_TDM=1")
 # Experimental packed Pooler/Router K2 path.  It remains opt-in until the
 # TP1/TP4 and strict replay gates pass.
 USE_K2_JOINT_RP = (
@@ -77,6 +84,13 @@ if USE_K2_JOINT_RP_TDM and not USE_K2_JOINT_RP:
     raise ValueError(
         "K2 joint TDM requires SGLANG_AMD_MONO_MUSE_K2_JOINT_RP=1"
     )
+
+
+def _use_k2_joint_rp(rows: int) -> bool:
+    """Restrict the experimental packed ABI to its qualified width."""
+    return USE_K2_JOINT_RP and rows == DRAFT_TOKENS
+
+
 # Opt-in compile-time specialization for standalone sliding-window attention.
 # Full attention and the scratch ABI remain fixed at the max-six layout.
 WINDOW_KATTN_SPLITS = validate_fused_splits(
@@ -555,6 +569,7 @@ class MuseMonoRunner:
         if rows not in self._k2:
             from sgl_amd_mono.muse_spark.gfx1250.build_k2 import K2Build, build_k2
 
+            use_joint_rp = _use_k2_joint_rp(rows)
             no_capture("K2 first reached")
             self._k2[rows] = build_k2(
                 K2Build(
@@ -562,15 +577,15 @@ class MuseMonoRunner:
                     npes=self.npes,
                     fault_site=self.fault_site,
                     fault_after=self.fault_after,
-                    joint_rp=USE_K2_JOINT_RP,
-                    joint_rp_tdm=USE_K2_JOINT_RP_TDM,
+                    joint_rp=use_joint_rp,
+                    joint_rp_tdm=USE_K2_JOINT_RP_TDM and use_joint_rp,
                     phase_trace=PHASE_TRACE,
                 )
             )
         return self._k2[rows]
 
     def k3_kernel(self, rows: int, last: bool, shuffled: bool):
-        key = rows, last, shuffled, USE_K3_TDM
+        key = rows, last, shuffled, USE_K3_TDM, USE_K3_TDM_FAST_DRAIN
         if key not in self._k3:
             from sgl_amd_mono.muse_spark.gfx1250.build_k3 import K3Build, build_k3
 
@@ -588,6 +603,7 @@ class MuseMonoRunner:
                         os.environ.get("MUSE_K3_UNPOOL_PROFILE_MODE", "2")
                     ),
                     tdm_expert=USE_K3_TDM,
+                    tdm_fast_drain=USE_K3_TDM_FAST_DRAIN,
                 )
             )
         return self._k3[key]
@@ -947,6 +963,7 @@ class MuseMonoRunner:
         )
         if not self.use_layer:
             peers_k2, peers_k3 = self.peers_k2, self.peers_k3
+            use_joint_rp = _use_k2_joint_rp(rows)
             self.kattn_kernel(rows, q_len, self._kattn_splits(i))(
                 _ptr(self.q),
                 _ptr(self.o),
@@ -974,7 +991,7 @@ class MuseMonoRunner:
                 _ptr(view.gate_hi),
                 _ptr(view.gate_lo),
                 _ptr(view.bias),
-                _ptr(view.w_joint if USE_K2_JOINT_RP else view.w_pool),
+                _ptr(view.w_joint if use_joint_rp else view.w_pool),
                 _ptr(view.xn_w),
                 _ptr(self.ids),
                 _ptr(self.scores),
@@ -1045,7 +1062,7 @@ class MuseMonoRunner:
             _ptr(view.gate_hi),
             _ptr(view.gate_lo),
             _ptr(view.bias),
-            _ptr(view.w_joint if USE_K2_JOINT_RP else view.w_pool),
+            _ptr(view.w_pool),
             _ptr(view.xn_w),
             _ptr(self.ids),
             _ptr(self.scores),

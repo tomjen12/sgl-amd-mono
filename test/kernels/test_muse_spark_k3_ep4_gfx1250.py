@@ -164,6 +164,12 @@ def _worker(rank, port, queue):
                 shuffled=tdm_expert,
                 phase_trace=phase_trace,
                 tdm_expert=tdm_expert,
+                tdm_fast_drain=(
+                    os.environ.get(
+                        "SGLANG_AMD_MONO_MUSE_K3_TDM_FAST_DRAIN"
+                    )
+                    == "1"
+                ),
             )
         )
         repeated = []

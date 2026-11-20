@@ -300,15 +300,31 @@ def _output_hidden(output):
     raise RuntimeError("Target replay output has no hidden states tensor.")
 
 
-def _kv_state_summary(runner, layer_ids: Iterable[int], out_cache_loc) -> dict[str, Any]:
+def _layer_write_ids(runner, forward_batch, layer_id: int):
+    from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+
+    _, is_swa = runner.token_to_kv_pool.layers_mapping[layer_id]
+    kind = IdSpaceKind.SLIDING_WINDOW if is_swa else IdSpaceKind.FULL
+    ids = runner.runner_ids.write_ids(forward_batch, kind)
+    if ids is None:
+        raise RuntimeError(f"Target layer {layer_id} has no bound write ids.")
+    return ids
+
+
+def _kv_state_summary(runner, layer_ids: Iterable[int], forward_batch) -> dict[str, Any]:
     import torch
 
-    state: dict[str, Any] = {"write_ids": [int(v) for v in out_cache_loc.cpu().tolist()]}
+    state: dict[str, Any] = {}
     for layer in layer_ids:
         try:
             key = runner.token_to_kv_pool.get_key_buffer(layer)
             value = runner.token_to_kv_pool.get_value_buffer(layer)
-            ids = out_cache_loc.to(device=key.device, dtype=torch.int64)
+            ids = _layer_write_ids(runner, forward_batch, layer).to(
+                device=key.device, dtype=torch.int64
+            )
+            state[f"layer_{layer}.write_ids"] = [
+                int(v) for v in ids.cpu().tolist()
+            ]
             state[f"layer_{layer}.k"] = _tensor_checksum(key[ids])
             state[f"layer_{layer}.v"] = _tensor_checksum(value[ids])
         except (AttributeError, KeyError, TypeError, RuntimeError) as error:
@@ -444,14 +460,16 @@ def _install_mono_state_observer(model, states: dict[int, dict[str, Any]]):
     return [_Restore(runner, "launch", original)]
 
 
-def _snapshot_kv(runner, out_cache_loc) -> dict[int, dict[str, Any]]:
+def _snapshot_kv(runner, forward_batch) -> dict[int, dict[str, Any]]:
     import torch
 
     snapshots = {}
     for layer_id in range(TARGET_LAYERS):
         key = runner.token_to_kv_pool.get_key_buffer(layer_id)
         value = runner.token_to_kv_pool.get_value_buffer(layer_id)
-        ids = out_cache_loc.to(device=key.device, dtype=torch.int64)
+        ids = _layer_write_ids(runner, forward_batch, layer_id).to(
+            device=key.device, dtype=torch.int64
+        )
         snapshots[layer_id] = {
             "key": _cpu_snapshot(key[ids]),
             "value": _cpu_snapshot(value[ids]),
@@ -459,14 +477,16 @@ def _snapshot_kv(runner, out_cache_loc) -> dict[int, dict[str, Any]]:
     return snapshots
 
 
-def _restore_kv(runner, out_cache_loc, snapshots) -> None:
+def _restore_kv(runner, forward_batch, snapshots) -> None:
     """Restore the write window so two execution modes start identically."""
     import torch
 
     for layer_id, state in snapshots.items():
         key = runner.token_to_kv_pool.get_key_buffer(layer_id)
         value = runner.token_to_kv_pool.get_value_buffer(layer_id)
-        ids = out_cache_loc.to(device=key.device, dtype=torch.int64)
+        ids = _layer_write_ids(runner, forward_batch, layer_id).to(
+            device=key.device, dtype=torch.int64
+        )
         key[ids].copy_(state["key"].to(device=key.device, dtype=key.dtype))
         value[ids].copy_(state["value"].to(device=value.device, dtype=value.dtype))
 
@@ -805,11 +825,6 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
         forward_batch, out_cache_loc, positions = _prepare_verify_batch(
             runner, descriptor, cuda_graph=args.cuda_graph
         )
-        # The scheduler allocation is virtual.  KV tensors are indexed in the
-        # runner's physical id space after IterationIds.bind(); correctness
-        # snapshots must use the bound ids, not the scheduler allocation.
-        physical_out_cache_loc = forward_batch.out_cache_loc
-
         def run_once():
             with replay_scope("target/verify"):
                 return runner.forward(forward_batch)
@@ -829,7 +844,7 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
                 # Compare an unprofiled replay with forced eager execution on
                 # this same runner and bound iteration state. Clone graph-owned
                 # outputs before eager execution reuses their static buffers.
-                initial_kv = _snapshot_kv(runner, physical_out_cache_loc)
+                initial_kv = _snapshot_kv(runner, forward_batch)
                 mono_runner = (
                     _installed_mono(runner.model).runner
                     if args.mode == "mono"
@@ -843,14 +858,14 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
                 graph_output = run_once()
                 torch.cuda.synchronize()
                 graph_hidden = _cpu_snapshot(_output_hidden(graph_output))
-                graph_kv = _snapshot_kv(runner, physical_out_cache_loc)
+                graph_kv = _snapshot_kv(runner, forward_batch)
                 graph_epoch = mono_runner.epoch.clone() if mono_runner is not None else None
 
                 # Python metadata hooks are bypassed by graph replay. The eager
                 # half also collects the routing metadata needed by reports.
                 # Restore every mutable input read by attention so both halves
                 # execute the same logical replay iteration.
-                _restore_kv(runner, physical_out_cache_loc, initial_kv)
+                _restore_kv(runner, forward_batch, initial_kv)
                 if mono_state is not None:
                     _restore_mono_replay_state(mono_runner, mono_state)
                 runner.attn_backend.init_forward_metadata(forward_batch)
@@ -859,7 +874,7 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
                         eager_output = run_once()
                 torch.cuda.synchronize()
                 eager_hidden = _cpu_snapshot(_output_hidden(eager_output))
-                eager_kv = _snapshot_kv(runner, physical_out_cache_loc)
+                eager_kv = _snapshot_kv(runner, forward_batch)
                 graph_eager_comparison = _compare_replay_snapshots(
                     graph_hidden, graph_kv, eager_hidden, eager_kv
                 )
@@ -952,7 +967,7 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
                         )
                         for layer in range(TARGET_LAYERS)
                     },
-                    "kv_cache": _snapshot_kv(runner, physical_out_cache_loc),
+                    "kv_cache": _snapshot_kv(runner, forward_batch),
                 }
                 snapshot_path = (
                     Path(args.snapshot_dir) / f"rank_{rank:04d}.snapshot.pt"
@@ -991,7 +1006,7 @@ def _worker(args, server_args, port_args, gpu_id: int, rank: int, result_path: s
             "snapshot": str(snapshot_path) if snapshot_path is not None else None,
             "graph_eager_comparison": graph_eager_comparison,
             "state": _kv_state_summary(
-                runner, range(TARGET_LAYERS), physical_out_cache_loc
+                runner, range(TARGET_LAYERS), forward_batch
             ),
             "routing": routing,
         }

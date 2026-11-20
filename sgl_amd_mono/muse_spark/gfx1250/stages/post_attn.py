@@ -47,12 +47,13 @@ RP_X_PAIRS = RP_X_ROWS * RP_X_TILE_K // 2
 JOINT_ROWS = MOE_HIDDEN + 2 * EXPERTS
 JOINT_WAVES = 4
 JOINT_TASKS = JOINT_ROWS // (ROWS * JOINT_WAVES)
-JOINT_TDM_K = 256
-JOINT_TDM_BUFFERS = 6
+JOINT_TDM_TASKS = JOINT_ROWS // ROWS
+JOINT_TDM_K = 512
+JOINT_TDM_BUFFERS = 4
 JOINT_TDM_PAD = 8
 JOINT_TDM_STRIDE = JOINT_TDM_K + JOINT_TDM_PAD
-JOINT_TDM_A_ROWS = 16
-JOINT_TDM_B_ROWS = ROWS * JOINT_WAVES
+JOINT_TDM_A_ROWS = ROWS
+JOINT_TDM_B_ROWS = ROWS
 JOINT_TDM_A_ELEMS = JOINT_TDM_A_ROWS * JOINT_TDM_STRIDE + JOINT_TDM_PAD
 JOINT_TDM_B_ELEMS = JOINT_TDM_B_ROWS * JOINT_TDM_STRIDE + JOINT_TDM_PAD
 JOINT_TDM_SLOT_ELEMS = JOINT_TDM_A_ELEMS + JOINT_TDM_B_ELEMS
@@ -65,7 +66,7 @@ JOINT_TDM_K_TILES = HIDDEN // JOINT_TDM_K
 
 
 def joint_tdm_lds_bytes():
-    """Six padded M16xK256 / N64xK256 BF16 slots."""
+    """Four padded M16xK512 / N16xK512 BF16 slots."""
     return 2 * JOINT_TDM_BUFFERS * JOINT_TDM_SLOT_ELEMS
 
 
@@ -541,7 +542,7 @@ def _joint_tdm_async_copy(global_address, lds_bf16):
 
 @flyc.jit
 def _issue_joint_tdm_tile(c, k_tile, slot):
-    """Fill one padded M16xK256 / N64xK256 ring slot cooperatively."""
+    """Fill one padded M16xK512 / N16xK512 ring slot cooperatively."""
     tid = c["tid"]
     slot_base = slot * JOINT_TDM_SLOT_ELEMS
     for issue in range_constexpr(JOINT_TDM_COPIES_PER_THREAD):
@@ -626,10 +627,11 @@ def stage_joint_router_pool(c):
 
 @flyc.jit
 def stage_joint_router_pool_tdm(c):
-    """Packed M16xN64xK256 GEMM with a six-slot async LDS ring.
+    """Packed M16xN16xK512 GEMM with a four-slot async LDS ring.
 
-    All eight waves cooperatively prefetch each A/B tile.  Four compute waves
-    retain one N16 accumulator each, preserving the 72-task output ABI.
+    This is the rows=8 Baseline geometry. All resident waves prefetch while
+    wave 0 owns the valid M8xN16 output; each persistent CTA executes three
+    N16 tasks to cover all 4608 output rows over the 96-CTA grid.
     """
     tid, lane, wave = c["tid"], c["lane"], c["wave"]
     acc = fx.Vector.filled(WMMA_ACC, 0.0, fx.Float32)
@@ -648,30 +650,31 @@ def stage_joint_router_pool_tdm(c):
 
         slot = k_tile % JOINT_TDM_BUFFERS
         slot_base = slot * JOINT_TDM_SLOT_ELEMS
-        if wave < JOINT_WAVES:
-            token = lane % ROWS
-            row = wave * ROWS + lane % ROWS
-            a_fragments = []
-            b_fragments = []
-            for inner in range_constexpr(JOINT_TDM_K // WMMA_K):
-                a_fragments.append(
-                    _lds_fragment(
-                        c["tdm"],
-                        slot_base + token * JOINT_TDM_STRIDE,
-                        inner * WMMA_K,
-                        lane,
-                    )
+        # Keep fragment construction outside a dynamic branch: loader-only
+        # waves read valid clamped rows, while wave 0 owns the useful M8 tile.
+        token = lane % ROWS
+        row = lane % ROWS
+        a_fragments = []
+        b_fragments = []
+        for inner in range_constexpr(JOINT_TDM_K // WMMA_K):
+            a_fragments.append(
+                _lds_fragment(
+                    c["tdm_pairs"],
+                    slot_base + token * JOINT_TDM_STRIDE,
+                    inner * WMMA_K,
+                    lane,
                 )
-                b_fragments.append(
-                    _lds_fragment(
-                        c["tdm"],
-                        slot_base
-                        + JOINT_TDM_A_ELEMS
-                        + row * JOINT_TDM_STRIDE,
-                        inner * WMMA_K,
-                        lane,
-                    )
+            )
+            b_fragments.append(
+                _lds_fragment(
+                    c["tdm_pairs"],
+                    slot_base
+                    + JOINT_TDM_A_ELEMS
+                    + row * JOINT_TDM_STRIDE,
+                    inner * WMMA_K,
+                    lane,
                 )
+            )
         rocdl.s_wait_dscnt(0)
         gpu.barrier()
 
@@ -680,27 +683,23 @@ def stage_joint_router_pool_tdm(c):
             _issue_joint_tdm_tile(c, next_tile, slot)
         rocdl.sched_barrier(0)
 
-        if wave < JOINT_WAVES:
+        if wave == 0:
             for inner in range_constexpr(JOINT_TDM_K // WMMA_K):
                 acc = _wmma(b_fragments[inner], a_fragments[inner], acc)
         rocdl.sched_barrier(0)
 
-    if wave < JOINT_WAVES:
-        fx.ptr_store(acc, c["red"] + (wave * 32 + lane) * WMMA_ACC)
+    if wave == 0:
+        fx.ptr_store(acc, c["red"] + lane * WMMA_ACC)
     gpu.barrier()
-    count = c["S"] * JOINT_WAVES * ROWS
-    for p in range_constexpr(2):
-        out = tid + p * THREADS
-        if out < count:
-            tile_wave = out // (c["S"] * ROWS)
-            within = out % (c["S"] * ROWS)
-            token, dim = within // ROWS, within % ROWS
-            row = (c["task"] * JOINT_WAVES + tile_wave) * ROWS + dim
-            bo.buffer_store(
-                _wave_value(c["red"], tile_wave, dim, token),
-                rsrc(c["out"]),
-                token * JOINT_ROWS + row,
-            )
+    out = tid
+    if out < c["S"] * ROWS:
+        token, dim = out // ROWS, out % ROWS
+        row = c["task"] * ROWS + dim
+        bo.buffer_store(
+            _wave_value(c["red"], 0, dim, token),
+            rsrc(c["out"]),
+            token * JOINT_ROWS + row,
+        )
     gpu.barrier()
 
 
@@ -723,35 +722,33 @@ def stage_joint_top8(c):
         selected_ids, selected_scores = [], []
         for pick in range_constexpr(TOP_K):
             best = fx.Float32(-1.0e30)
+            best_score = fx.Float32(0.0)
             best_id = fx.Int32(EXPERTS)
             for q in range_constexpr(EXPERTS // 32):
                 expert = fx.Int32(lane + q * 32)
-                used = fx.Int32(0)
-                for previous in range_constexpr(pick):
-                    used = used | fx.Int32(expert == selected_ids[previous])
-                candidate = (used == 0).select(
-                    biased[q], fx.Float32(-1.0e30)
-                )
+                candidate = biased[q]
                 take = (candidate > best) | (
                     (candidate == best) & (expert < best_id)
                 )
                 best = take.select(candidate, best)
+                best_score = take.select(raw[q], best_score)
                 best_id = take.select(expert, best_id)
             for offset in (16, 8, 4, 2, 1):
                 other = xshfl(best, offset)
+                other_score = xshfl(best_score, offset)
                 other_id = xshfl(best_id, offset)
                 take = (other > best) | (
                     (other == best) & (other_id < best_id)
                 )
                 best = take.select(other, best)
+                best_score = take.select(other_score, best_score)
                 best_id = take.select(other_id, best_id)
             selected_ids.append(best_id)
-            chosen = _f32(c["joint"], joint_base + best_id) + _f32(
-                c["joint"], joint_base + EXPERTS + best_id
-            )
-            selected_scores.append(
-                _sigmoid(chosen * fx.Float32(ROUTER_MULT))
-            )
+            selected_scores.append(best_score)
+            for q in range_constexpr(EXPERTS // 32):
+                biased[q] = (fx.Int32(lane + q * 32) == best_id).select(
+                    fx.Float32(-1.0e30), biased[q]
+                )
 
         if lane == 0:
             denom = fx.Float32(0.0)

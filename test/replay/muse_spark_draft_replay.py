@@ -523,6 +523,22 @@ def _install_mono_state_observer(
         mono_k, mono_v = backend.token_to_kv_pool.get_kv_buffer(
             layer.self_attn.attn.layer_id
         )
+        expected_kv_key = (
+            runner.k[:rows]
+            .float()
+            .clamp_(-448.0, 448.0)
+            .to(torch.float8_e4m3fn)
+            .float()
+            .reshape_as(mono_k[slots])
+        )
+        expected_kv_value = (
+            runner.v[:rows]
+            .float()
+            .clamp_(-448.0, 448.0)
+            .to(torch.float8_e4m3fn)
+            .float()
+            .reshape_as(mono_v[slots])
+        )
         states.setdefault(i, {}).update(
             {
                 "attention": output[0].detach().clone(),
@@ -543,6 +559,8 @@ def _install_mono_state_observer(
                 "reference_attention_coefficient": reference_coefficient.detach().clone(),
                 "kv_key": mono_k[slots].float().clone(),
                 "kv_value": mono_v[slots].float().clone(),
+                "expected_kv_key": expected_kv_key.detach().clone(),
+                "expected_kv_value": expected_kv_value.detach().clone(),
                 "reference_kv_key": reference_k,
                 "reference_kv_value": reference_v,
             }
@@ -901,7 +919,10 @@ def _rank_worker(
             torch.cuda.synchronize()
             graph_output = graph_output.detach().clone()
             graph_epoch = mono_runner.epoch.clone() if mono_runner is not None else None
-            if mono_state is not None:
+
+            def restore_mono_state():
+                if mono_state is None:
+                    return
                 for name in (
                     "epoch",
                     "scratch",
@@ -912,6 +933,12 @@ def _rank_worker(
                     getattr(mono_runner, name).copy_(mono_state[name])
                 mono_runner.peers.bytes.copy_(mono_state["peers"])
                 mono_runner.peers_post.bytes.copy_(mono_state["peers_post"])
+
+            restore_mono_state()
+            repeated_graph_output = run_once()
+            torch.cuda.synchronize()
+            repeated_graph_output = repeated_graph_output.detach().clone()
+            restore_mono_state()
             runner.attn_backend.init_forward_metadata(batch)
             with force_eager_model_runner(runner):
                 eager_output = run_once()
@@ -919,6 +946,17 @@ def _rank_worker(
             graph_rows = graph_output.float().reshape(graph_output.shape[0], -1)
             eager_rows = eager_output.float().reshape(eager_output.shape[0], -1)
             graph_eager_comparison = {
+                "minimum_graph_repeat_row_cosine": float(
+                    F.cosine_similarity(
+                        graph_rows,
+                        repeated_graph_output.float().reshape(
+                            repeated_graph_output.shape[0], -1
+                        ),
+                        dim=-1,
+                    )
+                    .min()
+                    .item()
+                ),
                 "minimum_output_row_cosine": float(
                     F.cosine_similarity(graph_rows, eager_rows, dim=-1).min().item()
                 )
@@ -991,7 +1029,11 @@ def _rank_worker(
         snapshot = {
             "rank": rank,
             "mode": mode,
+            "execution": "cuda-graph" if cuda_graph else "eager",
             "output": _cpu_snapshot(output),
+            "graph_output": (
+                _cpu_snapshot(graph_output) if cuda_graph else None
+            ),
             "layers": {
                 layer: {
                     name: _cpu_snapshot(value)

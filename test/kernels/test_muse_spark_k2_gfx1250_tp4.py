@@ -181,11 +181,25 @@ def _worker(rank, port, queue):
             )
             deltas = ticks[:, 1:] - ticks[:, :-1]
             assert bool((deltas >= 0).all()), "K2 phase timestamps are unordered"
+            completion = ticks.max(dim=0).values
+            critical = completion[1:] - completion[:-1]
+            boundary_paths = torch.stack(
+                (
+                    deltas[:MAX_TOKENS, 0],
+                    deltas[:MAX_TOKENS, 1],
+                    deltas[:MAX_TOKENS, 2:].sum(dim=1),
+                ),
+                dim=1,
+            )
+            critical_cta = int(boundary_paths.sum(dim=1).argmax())
+            stage_ticks = boundary_paths[critical_cta]
+            ticks_per_us = torch.cuda.get_device_properties(rank).clock_rate / 1000.0
             print(
                 "K2_TP4_PHASE_TICKS="
                 + json.dumps(
                     {
                         "rank": rank,
+                        "critical_cta": critical_cta,
                         "points": [
                             "start",
                             "norm_oproj",
@@ -196,6 +210,43 @@ def _worker(rank, port, queue):
                             "pooled_norm",
                         ],
                         "deltas": deltas.tolist(),
+                    }
+                ),
+                flush=True,
+            )
+            print(
+                "K2_TP4_PHASE_CRITICAL_TICKS="
+                + json.dumps(
+                    {
+                        "rank": rank,
+                        "points": [
+                            "norm_oproj",
+                            "boundary",
+                            "router",
+                            "pool",
+                            "top8",
+                            "pooled_norm",
+                        ],
+                        "deltas": critical.tolist(),
+                    }
+                ),
+                flush=True,
+            )
+            print(
+                "K2_TP4_STAGE_SPANS="
+                + json.dumps(
+                    {
+                        "rank": rank,
+                        "stages": [
+                            "norm_gate_local_oproj",
+                            "tp_wait_boundary",
+                            "router_pool",
+                        ],
+                        "ticks": stage_ticks.tolist(),
+                        "us": [
+                            float(value) / ticks_per_us
+                            for value in stage_ticks.tolist()
+                        ],
                     }
                 ),
                 flush=True,

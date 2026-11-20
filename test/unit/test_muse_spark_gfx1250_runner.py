@@ -73,6 +73,14 @@ def test_fused_precompile_remains_default_shape(monkeypatch):
     }
 
 
+def test_joint_k2_opt_in_is_limited_to_width_8(monkeypatch):
+    monkeypatch.setattr(runner, "USE_K2_JOINT_RP", True)
+
+    assert runner._use_k2_joint_rp(8)
+    assert not runner._use_k2_joint_rp(16)
+    assert not runner._use_k2_joint_rp(32)
+
+
 def test_routing_overrides_must_be_paired_and_exact():
     value = runner.MuseMonoRunner.__new__(runner.MuseMonoRunner)
     value.ids = torch.empty(8, 8, dtype=torch.int32)

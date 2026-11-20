@@ -64,6 +64,7 @@ class K3Build(msgspec.Struct, frozen=True):
     expert_profile_mode: bool = True
     finalize_profile_mode: bool = True
     tdm_expert: bool = False
+    tdm_fast_drain: bool = False
 
 
 def _byte_layout(items, align=256):
@@ -226,12 +227,15 @@ def build_k3(key: K3Build):
     assert key.unpool_profile_mode in (0, 1, 2), key.unpool_profile_mode
     if key.tdm_expert and not key.expert_profile_mode:
         raise ValueError("K3 TDM requires the staged expert scheduler")
+    if key.tdm_fast_drain and not key.tdm_expert:
+        raise ValueError("K3 TDM fast drain requires the TDM expert path")
     Lds = ffn.k3_lds()
     tdm = (
         build_k3_tdm_tasks(
             threads=THREADS,
             persistent_workers=RESIDENT_BLOCKS,
             shuffled=key.shuffled,
+            fast_drain=key.tdm_fast_drain,
         )
         if key.tdm_expert
         else None
@@ -249,6 +253,7 @@ def build_k3(key: K3Build):
         e=int(key.expert_profile_mode),
         z=int(key.finalize_profile_mode),
         x=int(key.tdm_expert),
+        r=int(key.tdm_fast_drain),
     )
     persistent_name = kernel_symbol("muse_spark_gfx1250_k3", **suffix)
     persistent_layout = _persistent_layout()

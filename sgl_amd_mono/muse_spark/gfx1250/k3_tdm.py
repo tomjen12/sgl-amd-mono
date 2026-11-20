@@ -59,6 +59,7 @@ def _build_task(
     row_major_ascale: int,
     a_row_stride_bytes: int,
     persistent_workers: int,
+    fast_drain: bool,
     lds_holder: list,
     tile_meta_holder: list,
 ):
@@ -103,15 +104,21 @@ def _build_task(
         a_ready=None,
         tile_meta=tile_meta_holder,
         item_hooks=None,
-        raw_drain=0,
-        defer_c_wait=0,
+        raw_drain=int(fast_drain),
+        defer_c_wait=int(fast_drain and stage1_quant_out and stage1_act),
         tdm_snop=1,
         k_waves=1,
         single_row_store=0,
     )
 
 
-def build_k3_tdm_tasks(*, threads: int, persistent_workers: int, shuffled: bool):
+def build_k3_tdm_tasks(
+    *,
+    threads: int,
+    persistent_workers: int,
+    shuffled: bool,
+    fast_drain: bool = False,
+):
     """Build Gate/Up and Down helpers for one 256-thread persistent K3.
 
     AITER's TDM path consumes the preshuffled Muse weights.  Native Quark
@@ -129,6 +136,7 @@ def build_k3_tdm_tasks(*, threads: int, persistent_workers: int, shuffled: bool)
         row_major_ascale=1,
         a_row_stride_bytes=ROW_STRIDE_BYTES,
         persistent_workers=persistent_workers,
+        fast_drain=fast_drain,
         lds_holder=gate_lds,
         tile_meta_holder=gate_meta,
     )
@@ -138,6 +146,7 @@ def build_k3_tdm_tasks(*, threads: int, persistent_workers: int, shuffled: bool)
         row_major_ascale=0,
         a_row_stride_bytes=MOE_HIDDEN,
         persistent_workers=persistent_workers,
+        fast_drain=fast_drain,
         lds_holder=down_lds,
         tile_meta_holder=down_meta,
     )

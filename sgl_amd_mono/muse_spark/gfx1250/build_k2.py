@@ -451,8 +451,6 @@ def build_k2(key: K2Build):
         @fx.struct
         class PersistentLds:
             # The TDM arena overlays O-projection/boundary reduction storage.
-            # At 253,632 B it fits the gfx1250 256-KiB LDS budget while a
-            # separate reduction allocation would not.
             arena: fx.Array[fx.BFloat16, JOINT_TDM_ARENA_ELEMS, 16]
 
         def persistent_lds_views(lds):
@@ -670,7 +668,12 @@ def build_k2(key: K2Build):
                     for token in range(key.tokens)
                 ],
             )
-            if bid < post_attn.JOINT_TASKS:
+            joint_active = (
+                bid < RESIDENT_BLOCKS
+                if key.joint_rp_tdm
+                else bid < post_attn.JOINT_TASKS
+            )
+            if joint_active:
                 joint_context = {
                     "S": key.tokens,
                     "task": bid,
@@ -684,9 +687,16 @@ def build_k2(key: K2Build):
                     "out": ptr(scratch, "k2_joint"),
                     "red": red_lds,
                     "tdm": lds.arena.ptr,
+                    "tdm_pairs": red_lds,
                 }
                 if key.joint_rp_tdm:
-                    post_attn.stage_joint_router_pool_tdm(joint_context)
+                    for task_round in range_constexpr(
+                        post_attn.JOINT_TDM_TASKS // RESIDENT_BLOCKS
+                    ):
+                        joint_context["task"] = (
+                            bid + task_round * RESIDENT_BLOCKS
+                        )
+                        post_attn.stage_joint_router_pool_tdm(joint_context)
                 else:
                     post_attn.stage_joint_router_pool(joint_context)
                 fx.memory_fence(
@@ -698,7 +708,12 @@ def build_k2(key: K2Build):
                             joint_arrivals, fx.Int32(1)
                         )
                     )
-                    if arrival == post_attn.JOINT_TASKS - 1:
+                    expected = (
+                        RESIDENT_BLOCKS
+                        if key.joint_rp_tdm
+                        else post_attn.JOINT_TASKS
+                    )
+                    if arrival == expected - 1:
                         _publish_wave(
                             sync["put"], joint_all_done, 0, fx.Int32(0)
                         )
@@ -853,6 +868,8 @@ def build_k2(key: K2Build):
                     {
                         "bid": bid,
                         "tid": tid,
+                        "lane": lane,
+                        "wave": wave,
                         "bias": bias,
                         "ids": ids,
                         "scores": scores,

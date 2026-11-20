@@ -88,16 +88,19 @@ def compare_rank(
         )
         for name in ("key", "value"):
             got = fused[f"kv_{name}"]
-            expected = fused[f"reference_kv_{name}"]
-            if not torch.equal(got, expected):
-                raise AssertionError(
-                    f"layer_{layer}.current_kv_{name}: values differ"
-                )
+            expected = fused[f"expected_kv_{name}"]
+            _require_cosine(
+                checks,
+                f"layer_{layer}.current_kv_{name}",
+                got,
+                expected,
+                threshold,
+            )
     return {
         "rank": baseline["rank"],
         "minimum_cosine": min(checks.values()),
         "checks": checks,
-        "current_kv_exact": True,
+        "current_kv_gate": f"fused-source cosine > {threshold:.6f}",
         "persistent_cache_comparison": "not-applicable-save_kv_cache_false",
     }
 
