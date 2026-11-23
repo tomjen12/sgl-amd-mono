@@ -90,7 +90,7 @@ def _bench(launch_once, n=30, fenced=False):
     return e0.elapsed_time(e1) * 1000 / n
 
 
-def _k3_worker(rank, rows, trace, q):
+def _k3_worker(rank, rows, trace, q, deterministic=False):
     import test_muse_spark_k3_gfx1250 as T
     import torch.distributed as dist
 
@@ -123,13 +123,32 @@ def _k3_worker(rank, rows, trace, q):
     w2, s2, dec2 = T._fp4_weight(NP * U, MOE_HIDDEN, INTER, dev, gen)
     xin = (torch.randn(rows, MOE_HIDDEN, device=dev) * 0.5).to(bf)
     tab = torch.empty(rows, TOP_K, dtype=torch.int64, device=dev)  # table indices
-    for t in range(rows):
-        tab[t, 0] = 0  # every token's slot 0: rank 0's expert 0 (its widest column set)
-        tab[t, 1:] = (
-            torch.randperm(NP * U - 1, device=dev, generator=gen)[: TOP_K - 1] + 1
+    if deterministic:
+        from tp8_synthetic_contract import deterministic_ep8_routing
+
+        fixture_ids, fixture_scores = deterministic_ep8_routing(rows, U)
+        ids = torch.tensor(fixture_ids, dtype=torch.int32, device=dev)
+        scores = torch.tensor(fixture_scores, dtype=torch.float32, device=dev)
+        logical_rank = ids // E_RANK
+        local_expert = ids % E_RANK
+        tab.copy_(
+            torch.where(
+                logical_rank < NP,
+                logical_rank * U + local_expert,
+                torch.full_like(logical_rank, -1),
+            )
         )
-    ids = ((tab // U) * E_RANK + tab % U).to(torch.int32)
-    scores = torch.rand(rows, TOP_K, device=dev) * 0.3
+    else:
+        for t in range(rows):
+            tab[t, 0] = 0  # every token's slot 0: rank 0's expert 0 (its widest column set)
+            tab[t, 1:] = (
+                torch.randperm(NP * U - 1, device=dev, generator=gen)[
+                    : TOP_K - 1
+                ]
+                + 1
+            )
+        ids = ((tab // U) * E_RANK + tab % U).to(torch.int32)
+        scores = torch.rand(rows, TOP_K, device=dev) * 0.3
     stream = torch.randn(rows, HIDDEN, device=dev)
     w = {
         "pen_w": (1.0 + 0.1 * torch.randn(MOE_HIDDEN, device=dev)).to(bf),
@@ -153,6 +172,8 @@ def _k3_worker(rank, rows, trace, q):
     for t in range(rows):
         for s in range(TOP_K):
             e = int(tab[t, s])
+            if e < 0:
+                continue
             gu = xq[t] @ dec13[e].T
             gate, up = gu[:INTER], gu[INTER:]
             y[t, s] = T._bf(T.mx8_dequant(gate * torch.sigmoid(gate) * up) @ dec2[e].T)
@@ -217,7 +238,7 @@ def _k3_worker(rank, rows, trace, q):
         peers.close()
 
 
-def _k2_worker(rank, rows, pshard, trace, q):
+def _k2_worker(rank, rows, pshard, trace, q, xq_pre=True):
     import test_muse_spark_k2_gfx1250 as T
     import torch.distributed as dist
 
@@ -275,7 +296,7 @@ def _k2_worker(rank, rows, pshard, trace, q):
     peers = _peers(sym_bytes(NP) + guard.FLAG_BYTES, rank, dev)
     epoch = T._epoch(dev, 5.0)
     launch = build_k2(
-        K2Build(tokens=rows, npes=NP, xq_pre=True, pshard=pshard, trace=trace)
+        K2Build(tokens=rows, npes=NP, xq_pre=xq_pre, pshard=pshard, trace=trace)
     )
     pool_rows = MOE_HIDDEN // NP
     pool_ptr = (

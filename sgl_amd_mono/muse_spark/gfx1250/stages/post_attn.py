@@ -235,7 +235,7 @@ def router_js(tokens: int) -> list:
         return first
     # preference: no task at all, then the xn / route CTAs (their polls wait for a cross-GPU hop anyway), last the
     # boundary CTAs (their pred task polls this GPU's partials right away)
-    poll_js = {b // P_PARTS for b in range(XN0, XN0 + 2 * tokens)}
+    poll_js = {b // P_PARTS for b in range(XN0, XN0 + 2 * aux_ctas(tokens))}
     bnd_js = {b // P_PARTS for b in range(AP0, AP0 + a_parts(tokens) * tokens)}
     order = sorted(
         range(NJ), key=lambda j: (2 if j in bnd_js else (1 if j in poll_js else 0), j)
@@ -273,10 +273,23 @@ assert HIDDEN == 16 * THREADS and MOE_HIDDEN == 8 * THREADS and Q_K == 2 * THREA
 assert MAX_TOKENS % TILE == 0 and OG_THREADS <= THREADS and AP0 > 0
 
 
+def aux_ctas(s: int) -> int:
+    """CTAs assigned to each of route and xn.
+
+    With a 96-CTA persistent grid the last 64 CTAs are reserved for boundary
+    work, leaving 16 CTAs for each auxiliary stage.  Wider steps let each CTA
+    process several tokens in a fixed stride.
+    """
+    n = min(s, AP0 // 2)
+    assert n >= 1 and s % n == 0, (s, n)
+    return n
+
+
 def route0(s: int) -> int:
     """The route tasks' first CTA (past the xn tasks, before the boundary CTAs)."""
-    assert 2 * s <= AP0, f"K2 at {s} rows needs more than the {BLOCKS} resident CTAs"
-    return XN0 + s
+    n = aux_ctas(s)
+    assert 2 * n <= AP0, f"K2 at {s} rows needs more than the {BLOCKS} resident CTAs"
+    return XN0 + n
 
 
 def a_parts(s: int) -> int:
@@ -1181,8 +1194,13 @@ def router_w(c, job, vr=0):
     past the part's router jobs loads the last job's (unused)."""
     a, tid = c["args"], c["tid"]
     part, j, _, _ = job
+    # ``vr`` is a virtual rank slice when fewer than eight physical ranks are
+    # active.  Keep the physical-rank interleave: W=4 maps rank r to slices
+    # r and r+4, not to the overlapping slices r and r+1.
     e0 = (
-        local_start(c) + R32_LOCAL * vr + R32_Q * fx.max(router_slot(c, j), fx.Int32(0))
+        local_start(c)
+        + R32_LOCAL * c["W"] * vr
+        + R32_Q * fx.max(router_slot(c, j), fx.Int32(0))
     )
     k0 = part * K_PER_PART + tid
     return (
@@ -1617,6 +1635,7 @@ def run_k2(c, route_flag=None, xin_flag=None, o_flag=None, QL=8):
     once its o rows are out."""
     S, bid = c["S"], c["bid"]
     A_PARTS = a_parts(S)
+    AUX = aux_ctas(S)
     R0 = route0(S)
     stamp(c, 0)
     stage_o_all(c, o_flag, QL)
@@ -1648,8 +1667,10 @@ def run_k2(c, route_flag=None, xin_flag=None, o_flag=None, QL=8):
         if boundary:
             stage_pred(c, (bid - AP0) // A_PARTS, (bid - AP0) % A_PARTS, A_PARTS)
         stamp(c, 14)  # the pred task done (boundary CTAs)
-    if (bid >= R0) & (bid < R0 + S):
-        stage_route(c, bid - R0, route_flag)
-    if (bid >= XN0) & (bid < XN0 + S):
-        stage_xn(c, bid - XN0, xin_flag)
+    if (bid >= R0) & (bid < R0 + AUX):
+        for q in range_constexpr(S // AUX):
+            stage_route(c, bid - R0 + q * AUX, route_flag)
+    if (bid >= XN0) & (bid < XN0 + AUX):
+        for q in range_constexpr(S // AUX):
+            stage_xn(c, bid - XN0 + q * AUX, xin_flag)
     stamp(c, 7)  # end
