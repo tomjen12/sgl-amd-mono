@@ -48,6 +48,7 @@ class K3Build(msgspec.Struct, frozen=True):
     defer_k1: bool = False  # the boundary publishes a token's two norm scalars (``k3_nscal``) for the next K1
     xq_pre: bool = False  # the expert input's MXFP4 blocks come from K2 (``xinq`` arg), staged once for every token
     ug_dyn: bool = False  # the ug items past each CTA's first from a launch-wide queue (``k3_ugq``; merged + xq_pre)
+    stop: bool = True  # test-only False: record guard errors without null-page stop
 
 
 def k3_context(
@@ -189,11 +190,12 @@ def build_k3(key: K3Build):
         if const_expr(npes > 1):
             g = guard.Guard(
                 epoch, own=sym, peers=peers, rank=rank, npes=npes, flags_offset=sym_bytes,
-                fault_site=fault_site or None, fault_after=fault_after,
+                fault_site=fault_site or None, fault_after=fault_after, stop=key.stop,
             )  # fmt: skip
         else:
             g = guard.Guard(
-                epoch, fault_site=fault_site or None, fault_after=fault_after
+                epoch, fault_site=fault_site or None, fault_after=fault_after,
+                stop=key.stop,
             )
         with guard.scope(g):
             lds = fx.SharedAllocator().allocate(Lds).peek()

@@ -73,6 +73,7 @@ class K2Build(msgspec.Struct, frozen=True):
     kshard: bool = (
         False  # (not built on gfx1250: the K-sharded boundary of the gfx950 kernels)
     )
+    stop: bool = True  # test-only False: record guard errors without null-page stop
 
 
 def k2_context(
@@ -211,6 +212,7 @@ def build_k2(key: K2Build):
                 flags_offset=flags_offset,
                 fault_site=fault_site or None,
                 fault_after=fault_after,
+                stop=key.stop,
             )
         ):
             lds = fx.SharedAllocator().allocate(Lds).peek()

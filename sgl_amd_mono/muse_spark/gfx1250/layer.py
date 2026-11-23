@@ -47,6 +47,7 @@ class K1Build(msgspec.Struct, frozen=True):
         0  # the sliding layers' (SWA) KV pool rows when it is head-major (0: NHD)
     )
     kv5d: bool = False  # bf16 KV in SGLang's vectorized_5d layout, 64-key pages (else fp8 NHD, 16-key pages)
+    stop: bool = True  # test-only False: record guard errors without null-page stop
 
 
 def k1_context(
@@ -132,7 +133,12 @@ def build_k1(key: K1Build):
         # every wait runs under the guard (deadline, error words); K1 exchanges
         # nothing with its peers, so a failure stays on this GPU
         with guard.scope(
-            guard.Guard(epoch, fault_site=fault_site or None, fault_after=fault_after)
+            guard.Guard(
+                epoch,
+                fault_site=fault_site or None,
+                fault_after=fault_after,
+                stop=key.stop,
+            )
         ):
             lds = fx.SharedAllocator().allocate(Lds).peek()
             args = {
@@ -196,6 +202,7 @@ class KAttnBuild(msgspec.Struct, frozen=True):
     swa_rows: int = 0  # the sliding layers' (SWA) KV pool rows when head-major (0: NHD)
     kv5d: bool = False  # bf16 KV in SGLang's vectorized_5d layout, 64-key pages (else fp8 NHD, 16-key pages)
     plan_in: bool = False  # the step's partition plan comes from the plan launch (``build_attn_plan``)
+    stop: bool = True  # test-only False: record guard errors without null-page stop
 
 
 def _attn_views(lds):
@@ -295,7 +302,12 @@ def build_kattn(key: KAttnBuild):
         layer: Int32,
     ):
         with guard.scope(
-            guard.Guard(epoch, fault_site=fault_site or None, fault_after=fault_after)
+            guard.Guard(
+                epoch,
+                fault_site=fault_site or None,
+                fault_after=fault_after,
+                stop=key.stop,
+            )
         ):
             lds = fx.SharedAllocator().allocate(Lds)
             args = {
@@ -455,6 +467,7 @@ class LayerBuild(msgspec.Struct, frozen=True):
     kv5d: bool = False  # bf16 KV in SGLang's vectorized_5d layout, 64-key pages (K1Build / KAttnBuild.kv5d)
     pf: bool = False  # before the next K1, warm each XCD's L2 with the next layer's kernel code (code_prefetch)
     plan_in: bool = False  # the attention's partition plan comes from the plan launch (KAttnBuild.plan_in)
+    stop: bool = True  # test-only False: record guard errors without null-page stop
 
 
 # The code prefetch's table, past K1's scratch: entry (tokens, layer) = the code (address, bytes) of the kernel the
@@ -543,6 +556,7 @@ def build_layer(key: LayerBuild):
         key.kv_rows,
         swa_rows=key.swa_rows,
         kv5d=key.kv5d,
+        stop=key.stop,
     )
     ka_key = KAttnBuild(
         S,
@@ -555,6 +569,7 @@ def build_layer(key: LayerBuild):
         swa_rows=key.swa_rows,
         kv5d=key.kv5d,
         plan_in=key.plan_in,
+        stop=key.stop,
     )
     xq = key.xq_pre and S <= 16
     assert not key.pshard or (W == 8 and not key.fp8_dense), (
@@ -571,10 +586,12 @@ def build_layer(key: LayerBuild):
         xq,
         key.pshard,
         key.kshard,
+        key.stop,
     )
     ugd = key.ug_dyn and xq and S >= 16  # (it pays from 16 rows on: more items a CTA)
     k3_key = K3Build(
-        S, W, last, fault_site, fault_after, tr, key.fp8_dense, key.tpx, defer, xq, ugd
+        S, W, last, fault_site, fault_after, tr, key.fp8_dense, key.tpx, defer, xq,
+        ugd, key.stop
     )
     k1_layout, ka_layout = k1_scratch_layout(), kattn_scratch_layout(S, QL)
     k2_layout, k3_layout = k2_scratch_layout(), ffn.k3_scratch_layout()
@@ -629,6 +646,7 @@ def build_layer(key: LayerBuild):
                 flags_offset=flags_offset,
                 fault_site=fault_site or None,
                 fault_after=fault_after,
+                stop=key.stop,
             )  # fmt: skip
         ):
             lds_alloc = fx.SharedAllocator()
