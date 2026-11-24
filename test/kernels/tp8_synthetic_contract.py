@@ -42,9 +42,34 @@ class TP8ShapeContract:
 CONTRACT = TP8ShapeContract()
 
 
+@dataclass(frozen=True)
+class TP8WorkloadContract:
+    logical_npes: int = 8
+    active_npes: int = 4
+    peer_slots: int = 8
+    router_slices_per_active_rank: int = 1
+    router_experts_per_active_rank: int = 32
+    local_experts: int = 32
+    pooler_mode: str = "sharded"
+    resident_blocks: int = 96
+
+
+WORKLOAD = TP8WorkloadContract()
+SUPPORTED_ACTIVE_NPES = (1, 2, 4)
+
+
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise ContractError(message)
+
+
+def validate_active_npes(active_npes: int) -> int:
+    active = int(active_npes)
+    _require(
+        active in SUPPORTED_ACTIVE_NPES,
+        f"active npes {active}, expected one of {SUPPORTED_ACTIVE_NPES}",
+    )
+    return active
 
 
 def parse_widths(value: str | Iterable[int]) -> tuple[int, ...]:
@@ -84,6 +109,13 @@ def virtual_expert_ranges(
     )
 
 
+def local_expert_range(rank: int) -> tuple[int, int]:
+    """The one logical EP8 slice an active rank owns in workload-parity mode."""
+    _require(0 <= rank < CONTRACT.active_npes, f"rank {rank} outside active world")
+    start = rank * CONTRACT.local_experts
+    return start, start + CONTRACT.local_experts
+
+
 def deterministic_ep8_routing(
     rows: int, experts_used_per_rank: int = 4
 ) -> tuple[tuple[tuple[int, ...], ...], tuple[tuple[float, ...], ...]]:
@@ -105,6 +137,60 @@ def deterministic_ep8_routing(
     total = sum(weights)
     scores = tuple(tuple(weight / total for weight in weights) for _ in range(rows))
     return ids, scores
+
+
+def ep8_expert_coverage_suite(
+    rows: int,
+) -> tuple[tuple[tuple[tuple[int, ...], ...], tuple[tuple[float, ...], ...]], ...]:
+    """Deterministic cases that cover every one of the 32 experts per EP8 rank."""
+    _require(rows in (8, 16), f"coverage width {rows}, expected 8 or 16")
+    cases = []
+    weights = tuple(float(CONTRACT.top_k - slot) for slot in range(CONTRACT.top_k))
+    total = sum(weights)
+    scores = tuple(tuple(value / total for value in weights) for _ in range(rows))
+    for offset in range(0, CONTRACT.local_experts, rows):
+        ids = tuple(
+            tuple(
+                logical_rank * CONTRACT.local_experts
+                + (offset + token) % CONTRACT.local_experts
+                for logical_rank in range(CONTRACT.logical_ep)
+            )
+            for token in range(rows)
+        )
+        cases.append((ids, scores))
+    return tuple(cases)
+
+
+def validate_ep8_expert_coverage(
+    cases: Sequence[
+        tuple[Sequence[Sequence[int]], Sequence[Sequence[float]]]
+    ],
+) -> dict[str, Any]:
+    covered = [set() for _ in range(CONTRACT.logical_ep)]
+    picks = [0] * CONTRACT.logical_ep
+    for ids, scores in cases:
+        _require(len(ids) == len(scores), "routing ids/scores row count differs")
+        for id_row, score_row in zip(ids, scores):
+            _require(len(id_row) == CONTRACT.top_k, "routing row is not Top-8")
+            _require(len(score_row) == CONTRACT.top_k, "score row is not Top-8")
+            _require(abs(sum(score_row) - 1.0) < 1e-6, "routing scores are not normalized")
+            for slot, expert in enumerate(id_row):
+                logical_rank = expert // CONTRACT.local_experts
+                _require(
+                    logical_rank == slot,
+                    f"slot {slot} expert {expert} does not cover logical rank {slot}",
+                )
+                covered[logical_rank].add(expert % CONTRACT.local_experts)
+                picks[logical_rank] += 1
+    expected = set(range(CONTRACT.local_experts))
+    for rank, actual in enumerate(covered):
+        _require(actual == expected, f"logical rank {rank} covers experts {sorted(actual)}")
+    return {
+        "logical_rank_pick_counts": picks,
+        "experts_covered_per_logical_rank": [len(item) for item in covered],
+        "missing_logical_ranks": list(range(CONTRACT.active_npes, CONTRACT.logical_ep)),
+        "missing_expert_output": "tagged-zero",
+    }
 
 
 def routing_histogram(
@@ -161,11 +247,11 @@ def validate_rank(
     widths: str | Iterable[int],
 ) -> tuple[int, ...]:
     checked_widths = parse_widths(widths)
+    active_world_size = validate_active_npes(active_world_size)
     _require(
-        active_world_size == CONTRACT.active_npes,
-        f"active world size {active_world_size}, expected {CONTRACT.active_npes}",
+        0 <= rank < active_world_size,
+        f"rank {rank} outside active world {active_world_size}",
     )
-    _require(0 <= rank < active_world_size, f"rank {rank} outside active world")
     _require(logical_tp == CONTRACT.logical_tp, f"logical TP {logical_tp}, expected 8")
     _require(logical_ep == CONTRACT.logical_ep, f"logical EP {logical_ep}, expected 8")
     _require(
@@ -185,6 +271,211 @@ def validate_rank(
         f"resident blocks {resident_blocks}, expected {CONTRACT.resident_blocks}",
     )
     return checked_widths
+
+
+def workload_manifest(
+    *,
+    rank: int,
+    kernel_npes: int,
+    peer_slots: int,
+    router_ranges: Sequence[Sequence[int]],
+    pooler_mode: str,
+    resident_blocks: int,
+    active_npes: int = WORKLOAD.active_npes,
+) -> dict[str, Any]:
+    """Validate and describe one rank's actual logical-TP8 workload."""
+    active_npes = validate_active_npes(active_npes)
+    _require(0 <= rank < active_npes, f"rank {rank} outside active world")
+    _require(
+        kernel_npes == WORKLOAD.logical_npes,
+        f"kernel npes {kernel_npes}, expected logical W8",
+    )
+    _require(
+        peer_slots == WORKLOAD.peer_slots,
+        f"peer slots {peer_slots}, expected {WORKLOAD.peer_slots}",
+    )
+    ranges = tuple(tuple(int(v) for v in item) for item in router_ranges)
+    _require(
+        ranges == (local_expert_range(rank),),
+        f"rank {rank} router ranges {ranges}, expected one local slice "
+        f"{local_expert_range(rank)}",
+    )
+    _require(
+        pooler_mode == WORKLOAD.pooler_mode,
+        f"pooler mode {pooler_mode!r}, expected {WORKLOAD.pooler_mode!r}",
+    )
+    _require(
+        resident_blocks == WORKLOAD.resident_blocks,
+        f"resident blocks {resident_blocks}, expected {WORKLOAD.resident_blocks}",
+    )
+    return {
+        "rank": rank,
+        "active_npes": active_npes,
+        "logical_npes": kernel_npes,
+        "peer_slots": peer_slots,
+        "router_ranges": [list(item) for item in ranges],
+        "router_experts": sum(end - start for start, end in ranges),
+        "local_experts": WORKLOAD.local_experts,
+        "pooler_mode": pooler_mode,
+        "resident_blocks": resident_blocks,
+    }
+
+
+def validate_workload_manifests(
+    manifests: Sequence[Mapping[str, Any]],
+    *,
+    active_npes: int = WORKLOAD.active_npes,
+) -> None:
+    """Validate all four active ranks' W8 workload attestations."""
+    active_npes = validate_active_npes(active_npes)
+    _require(
+        len(manifests) == active_npes,
+        f"received {len(manifests)} workload manifests, expected "
+        f"{active_npes}",
+    )
+    for rank, manifest in enumerate(manifests):
+        _require(manifest["rank"] == rank, f"manifest {rank} rank mismatch")
+        _require(
+            manifest["active_npes"] == active_npes,
+            f"rank {rank} active npes mismatch",
+        )
+        _require(
+            manifest["logical_npes"] == WORKLOAD.logical_npes,
+            f"rank {rank} is not W8",
+        )
+        _require(
+            manifest["peer_slots"] == WORKLOAD.peer_slots,
+            f"rank {rank} peer slot mismatch",
+        )
+        _require(
+            manifest["router_ranges"] == [list(local_expert_range(rank))],
+            f"rank {rank} router slice mismatch",
+        )
+        _require(
+            manifest["router_experts"]
+            == WORKLOAD.router_experts_per_active_rank,
+            f"rank {rank} router workload mismatch",
+        )
+        _require(
+            manifest["local_experts"] == WORKLOAD.local_experts,
+            f"rank {rank} local experts mismatch",
+        )
+        _require(
+            manifest["pooler_mode"] == WORKLOAD.pooler_mode,
+            f"rank {rank} pooler is not sharded",
+        )
+
+
+def specialization_attestation(stage: str, rows: int) -> dict[str, Any]:
+    """Expected build-key and per-rank work for a logical-W8 launch.
+
+    This is host-side evidence.  The measured kernel symbol is checked against
+    these fields separately when profiler dispatch is captured.
+    """
+    _require(rows in (8, 16), f"attestation width {rows}, expected 8 or 16")
+    _require(
+        stage in ("k2", "k3", "layer_v1", "layer_v2"),
+        f"stage {stage!r} has no W8 specialization contract",
+    )
+    value: dict[str, Any] = {
+        "stage": stage,
+        "width": rows,
+        "kernel_npes": WORKLOAD.logical_npes,
+        "active_npes": WORKLOAD.active_npes,
+        "peer_slots": WORKLOAD.peer_slots,
+        "resident_ctas": WORKLOAD.resident_blocks,
+        "expected_symbol_fragments": [f"s{rows}", "w8"],
+    }
+    if stage in ("k2", "layer_v1", "layer_v2"):
+        value.update(
+            router_tasks_per_active_rank=1,
+            router_experts_per_active_rank=WORKLOAD.router_experts_per_active_rank,
+            pooler_mode="sharded",
+            pooler_rows_per_active_rank=CONTRACT.moe_hidden // CONTRACT.logical_tp,
+        )
+        value["expected_symbol_fragments"].append("ps1")
+    if stage in ("k3", "layer_v1", "layer_v2"):
+        value.update(
+            local_experts_per_active_rank=CONTRACT.local_experts,
+            unpool_rows_per_active_rank=CONTRACT.global_hidden
+            // CONTRACT.logical_tp,
+        )
+    return value
+
+
+def validate_kernel_symbol(attestation: Mapping[str, Any], symbol: str) -> None:
+    _require(bool(symbol), "kernel symbol is empty")
+    missing = [
+        fragment
+        for fragment in attestation["expected_symbol_fragments"]
+        if fragment not in symbol
+    ]
+    _require(
+        not missing,
+        f"{attestation['stage']} symbol {symbol!r} misses W8 fragments {missing}",
+    )
+
+
+def runtime_workload_manifest(
+    *,
+    implementation: str,
+    stage: str,
+    width: int,
+    rank: int,
+    active_npes: int,
+) -> dict[str, Any]:
+    """Comparable runtime workload fields shared by Baseline and Mono."""
+    _require(implementation in ("baseline", "mono"), "invalid implementation")
+    active_npes = validate_active_npes(active_npes)
+    _require(0 <= rank < active_npes, f"rank {rank} outside active world")
+    _require(width in (8, 16), f"runtime workload width {width}")
+    _require(
+        stage in ("k1", "kattn_full", "kattn_window", "k2", "k3"),
+        f"unsupported parity stage {stage}",
+    )
+    return {
+        "implementation": implementation,
+        "stage": stage,
+        "width": width,
+        "rank": rank,
+        "active_npes": active_npes,
+        "logical_tp": CONTRACT.logical_tp,
+        "logical_ep": CONTRACT.logical_ep,
+        "local_q_heads": CONTRACT.local_q_heads,
+        "local_kv_heads": CONTRACT.local_kv_heads,
+        "local_q_width": CONTRACT.local_q_width,
+        "local_kv_width": CONTRACT.local_kv_width,
+        "local_experts": CONTRACT.local_experts,
+        "moe_hidden": CONTRACT.moe_hidden,
+        "q_len": CONTRACT.q_len,
+        "resident_blocks": CONTRACT.resident_blocks,
+        "missing_logical_ranks": list(range(active_npes, CONTRACT.logical_tp)),
+    }
+
+
+def validate_runtime_workload_parity(
+    baseline: Sequence[Mapping[str, Any]],
+    mono: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Fail if measured Baseline and Mono cases do not share workload fields."""
+    ignored = {"implementation"}
+    bmap = {
+        (item["stage"], item["width"], item["rank"]): item for item in baseline
+    }
+    mmap = {(item["stage"], item["width"], item["rank"]): item for item in mono}
+    _require(bmap.keys() == mmap.keys(), "Baseline/Mono workload cases differ")
+    for key in sorted(bmap):
+        b = {name: value for name, value in bmap[key].items() if name not in ignored}
+        m = {name: value for name, value in mmap[key].items() if name not in ignored}
+        _require(b == m, f"Baseline/Mono workload mismatch for {key}: {b} != {m}")
+    return {
+        "status": "passed",
+        "case_count": len(bmap),
+        "cases": [
+            {"stage": stage, "width": width, "rank": rank}
+            for stage, width, rank in sorted(bmap)
+        ],
+    }
 
 
 def tensor_descriptor(tensor: Any) -> dict[str, Any]:
@@ -239,8 +530,10 @@ def rank_manifest(
     )
     validate_static_contract(production_constants)
     expert_start = rank * CONTRACT.local_experts
+    contract = asdict(CONTRACT)
+    contract["active_npes"] = active_world_size
     return {
-        "contract": asdict(CONTRACT),
+        "contract": contract,
         "rank": rank,
         "active_world_size": active_world_size,
         "logical_tp": CONTRACT.logical_tp,
@@ -253,16 +546,21 @@ def rank_manifest(
     }
 
 
-def validate_manifests(manifests: Sequence[Mapping[str, Any]]) -> None:
+def validate_manifests(
+    manifests: Sequence[Mapping[str, Any]],
+    *,
+    active_npes: int = CONTRACT.active_npes,
+) -> None:
+    active_npes = validate_active_npes(active_npes)
     _require(
-        len(manifests) == CONTRACT.active_npes,
-        f"received {len(manifests)} manifests, expected {CONTRACT.active_npes}",
+        len(manifests) == active_npes,
+        f"received {len(manifests)} manifests, expected {active_npes}",
     )
     baseline = manifests[0]
     for rank, manifest in enumerate(manifests):
         _require(manifest["rank"] == rank, f"manifest {rank} reports rank {manifest['rank']}")
         _require(
-            manifest["active_world_size"] == CONTRACT.active_npes,
+            manifest["active_world_size"] == active_npes,
             f"rank {rank} active world mismatch",
         )
         _require(manifest["logical_tp"] == 8 and manifest["logical_ep"] == 8, f"rank {rank} is not logical TP8/EP8")

@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from tp8_layer_contract import (  # noqa: E402
     ACTIVE_NPES,
+    LOGICAL_NPES,
     LOCAL_EXPERTS,
     WIDTHS,
     active_expert_ranges,
@@ -98,13 +99,16 @@ def _buffers(T, rows, q_len, rank, dev, group=None):
         scratch_bytes(k3_scratch_layout()), dtype=torch.uint8, device=dev
     )
     B.peers = PeerBuffer(
-        sym_bytes(ACTIVE_NPES) + guard.FLAG_BYTES,
+        sym_bytes(LOGICAL_NPES) + guard.FLAG_BYTES,
         dist.group.WORLD if group is None else group,
         rank,
         ACTIVE_NPES,
         dev,
+        logical_npes=LOGICAL_NPES,
     )
     B.peers.bytes.zero_()
+    for shadow in B.peers.shadow_bytes:
+        shadow.zero_()
     torch.cuda.synchronize()
     dist.barrier()
     return B
@@ -124,28 +128,30 @@ def _kernels(rows, q_len):
 
     # Match Runner: split K2/K3 do not hand MXFP4 activation through scratch;
     # the merged Layer uses its production XQ_PRE path.
-    split = dict(tokens=rows, npes=ACTIVE_NPES)
+    split = dict(tokens=rows, npes=LOGICAL_NPES)
     return {
         "k1": build_k1(K1Build(tokens=rows)),
         "ka": build_kattn(KAttnBuild(tokens=rows, q_len=q_len)),
-        "k2": build_k2(K2Build(**split)),
+        "k2": build_k2(K2Build(**split, pshard=True)),
         "k3": build_k3(K3Build(**split)),
         "v1": build_layer(
             LayerBuild(
                 tokens=rows,
                 q_len=q_len,
-                npes=ACTIVE_NPES,
+                npes=LOGICAL_NPES,
                 next_k1=False,
                 xq_pre=True,
+                pshard=True,
             )
         ),
         "v2": build_layer(
             LayerBuild(
                 tokens=rows,
                 q_len=q_len,
-                npes=ACTIVE_NPES,
+                npes=LOGICAL_NPES,
                 next_k1=True,
                 xq_pre=True,
+                pshard=True,
             )
         ),
     }
@@ -154,6 +160,18 @@ def _kernels(rows, q_len):
 def _k3_args(T, layer, buffers, rank):
     args = list(T._k3_args(layer, buffers))
     args[0] = rank * LOCAL_EXPERTS
+    return tuple(args)
+
+
+def _k2_args(T, layer, buffers, rank):
+    from sgl_amd_mono.muse_spark.gfx1250.config import MOE_HIDDEN
+
+    rows_per_rank = MOE_HIDDEN // LOGICAL_NPES
+    buffers.pool_w = layer.w2k["w_pool"][
+        rank * rows_per_rank : (rank + 1) * rows_per_rank
+    ].contiguous()
+    args = list(T._k2_args(layer, buffers))
+    args[9] = buffers.pool_w.data_ptr()
     return tuple(args)
 
 
@@ -166,7 +184,7 @@ def _split(T, kernels, layer, buffers, epoch, rank, next_k1, stream):
     )
     kernels["k2"](
         buffers.o.data_ptr(),
-        *T._k2_args(layer, buffers),
+        *_k2_args(T, layer, buffers, rank),
         buffers.peers.local,
         buffers.peers.addresses.data_ptr(),
         rank,
@@ -211,7 +229,7 @@ def _split(T, kernels, layer, buffers, epoch, rank, next_k1, stream):
 def _fused(T, kernels, layer, buffers, epoch, rank, next_k1, stream):
     kernels["v2" if next_k1 else "v1"](
         *T._attn_args(layer, buffers),
-        *T._k2_args(layer, buffers),
+        *_k2_args(T, layer, buffers, rank),
         *_k3_args(T, layer, buffers, rank),
         *T._k1_next_args(layer, buffers),
         buffers.peers.local,
@@ -239,7 +257,7 @@ def _snapshot(T, layer, buffers, epoch, rows, next_k1):
         "current V cache": layer.v_cache[current_rows].clone().cpu(),
         "guard": epoch[list(guard.ERROR_WORDS)].clone().cpu(),
         "peer guard": buffers.peers.bytes[
-            sym_bytes(ACTIVE_NPES) : sym_bytes(ACTIVE_NPES) + guard.FLAG_BYTES
+            sym_bytes(LOGICAL_NPES) : sym_bytes(LOGICAL_NPES) + guard.FLAG_BYTES
         ]
         .clone()
         .cpu(),
@@ -284,6 +302,15 @@ def _run_path(T, kernels, layer, rows, rank, next_k1, fused):
                 0,
                 stream,
             )
+            from tp8_shadow_protocol import seed_missing_rank_mailboxes
+
+            seed_missing_rank_mailboxes(
+                buffers.peers.bytes,
+                rows=rows,
+                step=int(epoch[0].item()),
+                layer=LAYER,
+                active_npes=ACTIVE_NPES,
+            )
             if fused:
                 _fused(
                     T, kernels, layer, buffers, epoch, rank, next_k1, stream
@@ -310,7 +337,7 @@ def _assert_close(name, got, expected, tol=1.0 / 128.0):
     )
 
 
-def _check_case(T, rows, rank, next_k1):
+def _check_case(T, rows, rank, next_k1, window):
     import torch.distributed as dist
 
     # Keep this direct-builder test small while preserving NHD cache semantics.
@@ -321,6 +348,7 @@ def _check_case(T, rows, rank, next_k1):
         torch.device("cuda", rank),
         seed=700 + rows,
         lens=[1000 + 137 * request for request in range(rows // 8)],
+        window=window,
     )
     layer.router.zero_()
     layer.w2k["bias"].copy_(
@@ -376,6 +404,8 @@ def _check_case(T, rows, rank, next_k1):
     return {
         "width": rows,
         "next_k1": next_k1,
+        "attention": "swa" if window else "full",
+        "window": window,
         "status": "ok",
         "guard": [int(value) for value in fused["guard"].tolist()],
     }
@@ -386,9 +416,10 @@ def run_rank_case(rank, rows):
     import torch.distributed as dist
 
     cases = []
-    for next_k1 in (False, True):
-        cases.append(_check_case(T, rows, rank, next_k1))
-        dist.barrier()
+    for window in (0, 2047):
+        for next_k1 in (False, True):
+            cases.append(_check_case(T, rows, rank, next_k1, window))
+            dist.barrier()
     return {"rank": rank, "cases": cases}
 
 

@@ -29,6 +29,63 @@ class Sample:
     total_us: float
 
 
+def _with_fair_stage_groups(samples: list[Sample]) -> list[Sample]:
+    """Add K-attn+K2 groups whose semantic boundary matches across backends."""
+    values = list(samples)
+    indexed = {
+        (
+            sample.stage,
+            sample.width,
+            sample.rank,
+            sample.implementation,
+            sample.iteration,
+        ): sample
+        for sample in values
+    }
+    for attention, combined in (
+        ("kattn_full", "kattn_k2_full"),
+        ("kattn_window", "kattn_k2_window"),
+    ):
+        keys = {
+            (sample.width, sample.rank, sample.implementation, sample.iteration)
+            for sample in values
+            if sample.stage == attention
+        }
+        for width, rank, implementation, iteration in sorted(keys):
+            combined_key = (
+                combined,
+                width,
+                rank,
+                implementation,
+                iteration,
+            )
+            if combined_key in indexed:
+                continue
+            attention_sample = indexed.get(
+                (attention, width, rank, implementation, iteration)
+            )
+            k2_sample = indexed.get(
+                ("k2", width, rank, implementation, iteration)
+            )
+            if attention_sample is None or k2_sample is None:
+                continue
+            derived = Sample(
+                run_id=attention_sample.run_id,
+                stage=combined,
+                width=width,
+                rank=rank,
+                implementation=implementation,
+                iteration=iteration,
+                launch_count=(
+                    attention_sample.launch_count + k2_sample.launch_count
+                ),
+                total_us=attention_sample.total_us + k2_sample.total_us,
+            )
+            values.append(derived)
+            indexed[combined_key] = derived
+    return values
+
+
 def _percentile(values: list[float], q: float) -> float:
     if not values:
         raise ValueError("cannot compute a percentile of no samples")
@@ -119,6 +176,24 @@ def summarize(samples: Iterable[Sample]) -> tuple[list[dict], list[dict]]:
             )
         baseline_stats = _stats(baseline)
         mono_stats = _stats(mono)
+        baseline_launches = {
+            sample.launch_count
+            for sample in values
+            if sample.rank == 0
+            and sample.stage == stage
+            and sample.width == width
+            and sample.implementation == "baseline"
+        }
+        mono_launches = {
+            sample.launch_count
+            for sample in values
+            if sample.rank == 0
+            and sample.stage == stage
+            and sample.width == width
+            and sample.implementation == "mono"
+        }
+        if len(baseline_launches) != 1 or len(mono_launches) != 1:
+            raise ValueError(f"{stage} width {width}: inconsistent launch counts")
         baseline_mean = float(baseline_stats["mean_us"])
         mono_mean = float(mono_stats["mean_us"])
         paired.append(
@@ -128,6 +203,8 @@ def summarize(samples: Iterable[Sample]) -> tuple[list[dict], list[dict]]:
                 "width": width,
                 "status": "PASS",
                 "samples": len(baseline),
+                "baseline_launch_count": baseline_launches.pop(),
+                "mono_launch_count": mono_launches.pop(),
                 "baseline_mean_us": baseline_mean,
                 "baseline_p50_us": baseline_stats["p50_us"],
                 "baseline_p90_us": baseline_stats["p90_us"],
@@ -149,7 +226,7 @@ def write_reports(
     dispatch_valid: bool,
 ) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
-    values = list(samples)
+    values = _with_fair_stage_groups(list(samples))
     raw_path = output_dir / "raw.csv"
     with raw_path.open("w", newline="") as handle:
         fields = [
@@ -201,6 +278,8 @@ def write_reports(
         "min_us",
         "max_us",
         "status",
+        "baseline_launch_count",
+        "mono_launch_count",
         "baseline_mean_us",
         "baseline_p50_us",
         "baseline_p90_us",
@@ -243,25 +322,28 @@ def render_performance_log(report: dict, artifact_path: str) -> str:
         f"widths={metadata.get('widths')} warmup={metadata.get('warmup')} "
         f"iterations={metadata.get('iterations')} profile={metadata.get('profile')}",
         "active_ranks=4 logical_tp=8 logical_ep=8 resident_blocks=96",
-        "pooler=replicated",
+        "pooler=sharded",
         "",
         "This is a four-active-rank synthetic result. It is not real eight-GPU",
         "TP8/EP8 latency and is not comparable to TP4 runtime performance.",
         "",
         "GAP SUMMARY (rank 0 latency)",
         "============================",
-        "stage width baseline_mean_us mono_mean_us gap_us speedup status",
+        "stage width baseline_launches baseline_mean_us "
+        "mono_launches mono_mean_us gap_us speedup status",
     ]
     for row in report["critical_gap"]:
         if row["status"] != "PASS":
             lines.append(
-                f"{row['stage']} {row['width']} - - - - INVALID"
+                f"{row['stage']} {row['width']} - - - - - - INVALID"
             )
             continue
         lines.append(
             f"{row['stage']} {row['width']} "
-            f"{row['baseline_mean_us']:.3f} {row['mono_mean_us']:.3f} "
-            f"{row['gap_us']:+.3f} {row['speedup']:.3f}x PASS"
+            f"{row['baseline_launch_count']} "
+            f"{row['baseline_mean_us']:.3f} {row['mono_launch_count']} "
+            f"{row['mono_mean_us']:.3f} {row['gap_us']:+.3f} "
+            f"{row['speedup']:.3f}x PASS"
         )
     lines.extend(("", f"ARTIFACTS: {artifact_path}", ""))
     return "\n".join(lines)

@@ -51,9 +51,30 @@ def test_expected_dispatch_accepts_canonical_production_kernels(stage):
         operator=expected.operator,
         backend=expected.backend,
         kernel_names=_matching_names(stage),
+        tensor_metadata={
+            f"{stage}.input": {
+                "shape": [8, 8192],
+                "dtype": "bf16",
+                "stride": [8192, 1],
+            }
+        },
     )
     assert evidence["status"] == "passed"
     assert evidence["actual"]["launch_count"] == len(expected.kernels)
+    assert [
+        launch["kernel_name"] for launch in evidence["actual"]["ordered_launches"]
+    ] == _matching_names(stage)
+    assert evidence["actual"]["tensor_metadata"][f"{stage}.input"]["shape"] == [
+        8,
+        8192,
+    ]
+    expected_class = [
+        item.classification for item in EXPECTED[stage].kernels
+    ]
+    assert [
+        launch["classification"]
+        for launch in evidence["actual"]["ordered_launches"]
+    ] == expected_class
 
 
 @pytest.mark.parametrize("field", ["operator", "backend"])
@@ -86,3 +107,36 @@ def test_dispatch_rejects_unexpected_kernel():
             backend=EXPECTED["k1"].backend,
             kernel_names=[*_matching_names("k1"), "aten_matmul_fallback"],
         )
+
+
+def test_dispatch_rejects_reordered_kernels():
+    names = list(reversed(_matching_names("k1")))
+    with pytest.raises(DispatchContractError, match="kernel order"):
+        validate_dispatch(
+            "k1",
+            operator=EXPECTED["k1"].operator,
+            backend=EXPECTED["k1"].backend,
+            kernel_names=names,
+        )
+
+
+@pytest.mark.parametrize("stage", ["k2", "k3"])
+def test_active1_dispatch_omits_collective_kernel(stage):
+    expected = EXPECTED[stage]
+    names = [
+        name
+        for name, item in zip(_matching_names(stage), expected.kernels)
+        if item.classification != "collective"
+    ]
+    evidence = validate_dispatch(
+        stage,
+        operator=expected.operator,
+        backend=expected.backend,
+        kernel_names=names,
+        active_npes=1,
+    )
+    assert evidence["actual"]["active_npes"] == 1
+    assert all(
+        launch["classification"] != "collective"
+        for launch in evidence["actual"]["ordered_launches"]
+    )

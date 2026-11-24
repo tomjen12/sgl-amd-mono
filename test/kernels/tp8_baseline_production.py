@@ -130,9 +130,26 @@ def _tensor(
     contiguous: bool = True,
 ) -> None:
     try:
-        evidence[name] = validate_tensor(
+        descriptor = validate_tensor(
             name, value, shape=shape, dtype=dtype, contiguous=contiguous
         )
+        descriptor["layout"] = (
+            "contiguous_row_major"
+            if descriptor["contiguous"]
+            else "production_noncontiguous"
+        )
+        data_ptr = getattr(value, "data_ptr", None)
+        if callable(data_ptr):
+            address = int(data_ptr())
+            alignment = 1
+            while alignment < 256 and address % (alignment * 2) == 0:
+                alignment *= 2
+            descriptor["data_ptr"] = address
+            descriptor["alignment_bytes"] = alignment
+        else:
+            descriptor["data_ptr"] = None
+            descriptor["alignment_bytes"] = None
+        evidence[name] = descriptor
     except ContractError as exc:
         raise BaselineContractError(str(exc)) from exc
 
@@ -305,13 +322,17 @@ class K2BaselineAdapter:
         )
 
 
-class Active4LogicalTP8:
-    """Four-rank collective whose absent logical ranks contribute exact zeros."""
+class ActiveLogicalTP8:
+    """Active-rank collective whose absent logical TP8 ranks contribute zeros."""
 
     logical_world_size = CONTRACT.logical_tp
-    active_world_size = CONTRACT.active_npes
 
-    def __init__(self, group: Any = None):
+    def __init__(self, active_world_size: int = CONTRACT.active_npes, group: Any = None):
+        if active_world_size not in (1, 2, 4):
+            raise BaselineContractError(
+                f"active world size {active_world_size}, expected 1, 2, or 4"
+            )
+        self.active_world_size = active_world_size
         self.group = group
 
     def validate(self) -> tuple[int, int]:
@@ -345,11 +366,14 @@ class Active4LogicalTP8:
             model.tensor_model_parallel_all_reduce = old
 
 
+Active4LogicalTP8 = ActiveLogicalTP8
+
+
 class K3BaselineAdapter:
     operator = "run_gfx1250_a8w4+finalize_allreduce+unpool_boundary"
     backend = "aiter_a8w4_tdm+sglang_rocm"
 
-    def __init__(self, distributed: Active4LogicalTP8):
+    def __init__(self, distributed: ActiveLogicalTP8):
         self.distributed = distributed
 
     def __call__(

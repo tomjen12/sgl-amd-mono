@@ -17,9 +17,14 @@ class _NoHip:
         raise AssertionError(f"close() called {name}")
 
 
-def _buffer(local: int, opened: list[int]) -> peer.PeerBuffer:
+def _buffer(
+    local: int, opened: list[int], shadows: list[int] | None = None
+) -> peer.PeerBuffer:
     buf = object.__new__(peer.PeerBuffer)
     buf.rank, buf.local, buf._opened, buf.bytes = 0, local, opened, object()
+    buf._shadows, buf.shadow_bytes = list(shadows or ()), [object()] * len(
+        shadows or ()
+    )
     return buf
 
 
@@ -42,3 +47,38 @@ def test_close_is_idempotent(retired):
     buf.close()
     buf.close()
     assert retired == [(0x1000, [])]
+
+
+def test_close_retires_logical_shadow_buffers(retired):
+    buf = _buffer(0x1000, [0x2000], [0x3000, 0x4000])
+    buf.close()
+    assert retired == [(0x1000, [0x2000, 0x3000, 0x4000])]
+    assert (buf._shadows, buf.shadow_bytes) == ([], [])
+
+
+@pytest.mark.parametrize(
+    "rank,npes,logical_npes",
+    [
+        (0, 0, 8),
+        (0, 5, 4),
+        (-1, 4, 8),
+        (4, 4, 8),
+    ],
+)
+def test_logical_topology_is_validated_before_allocation(
+    monkeypatch, rank, npes, logical_npes
+):
+    monkeypatch.setattr(
+        peer,
+        "_alloc_uncached",
+        lambda _nbytes: pytest.fail("invalid topology reached allocation"),
+    )
+    with pytest.raises(ValueError):
+        peer.PeerBuffer(
+            4096,
+            None,
+            rank,
+            npes,
+            object(),
+            logical_npes=logical_npes,
+        )

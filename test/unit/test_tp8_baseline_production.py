@@ -42,6 +42,19 @@ def _environment():
     return dict(production.PRODUCTION_ENV)
 
 
+@pytest.mark.parametrize("active", [1, 2, 4])
+def test_active_logical_tp8_accepts_supported_world_sizes(active):
+    collective = production.ActiveLogicalTP8(active)
+    assert collective.active_world_size == active
+    assert collective.logical_world_size == 8
+
+
+@pytest.mark.parametrize("active", [0, 3, 8])
+def test_active_logical_tp8_rejects_unsupported_world_sizes(active):
+    with pytest.raises(production.BaselineContractError):
+        production.ActiveLogicalTP8(active)
+
+
 def test_production_environment_accepts_recipe_and_synthetic_blocks():
     recipe = dict(production.PRODUCTION_ENV)
     recipe.pop("SGLANG_AMD_MONO_BLOCKS")

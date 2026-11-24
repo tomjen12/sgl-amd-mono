@@ -17,9 +17,9 @@ from tp8_baseline_production import (
     KAttnSWABaselineAdapter,
     K2BaselineAdapter,
     K3BaselineAdapter,
-    Active4LogicalTP8,
+    ActiveLogicalTP8,
 )
-from tp8_synthetic_contract import CONTRACT, deterministic_ep8_routing
+from tp8_synthetic_contract import CONTRACT
 
 
 @dataclass
@@ -29,6 +29,7 @@ class PreparedBaseline:
     backend: str
     launch_count: int
     launch: Callable[[], BaselineResult]
+    fixture: Any | None = None
 
 
 def _cos_sin(device: torch.device, positions: int = 16384) -> torch.Tensor:
@@ -43,47 +44,24 @@ def _cos_sin(device: torch.device, positions: int = 16384) -> torch.Tensor:
 
 
 def prepare_k1(rows: int, rank: int, device: torch.device) -> PreparedBaseline:
-    torch.manual_seed(1000 + 17 * rows + rank)
-    bf16 = torch.bfloat16
-    x = torch.randn(
-        rows, CONTRACT.global_hidden, device=device, dtype=torch.float32
-    ).to(bf16)
-    weight = (
-        torch.randn(
-            CONTRACT.local_qkvg_rows,
-            CONTRACT.global_hidden,
-            device=device,
-            dtype=torch.float32,
-        )
-        * 0.02
-    ).to(bf16)
-    cos_sin = _cos_sin(device)
-    positions = torch.arange(rows, device=device, dtype=torch.int64) + 8192
-    locations = torch.arange(rows, device=device, dtype=torch.int64)
-    cache_k = torch.zeros(
-        64,
-        CONTRACT.local_kv_heads,
-        CONTRACT.head_dim,
-        device=device,
-        dtype=torch.float8_e4m3fn,
-    )
-    cache_v = torch.zeros_like(cache_k)
-    k_scale = torch.ones(1, device=device, dtype=torch.float32)
-    v_scale = torch.ones(1, device=device, dtype=torch.float32)
+    from sgl_amd_mono.muse_spark.gfx1250.config import QK_SCALE
+    from tp8_logical_case import build_k1_case
+
+    case = build_k1_case(rows, rank, device)
     adapter = K1BaselineAdapter()
     kwargs: dict[str, Any] = {
-        "x": x,
-        "weight": weight,
-        "positions": positions,
-        "cos_sin": cos_sin,
-        "cache_k": cache_k,
-        "cache_v": cache_v,
-        "locations": locations,
+        "x": case.x,
+        "weight": case.weight,
+        "positions": case.positions,
+        "cos_sin": case.cos_sin,
+        "cache_k": case.cache_k,
+        "cache_v": case.cache_v,
+        "locations": case.locations,
         "mapping": None,
         "eps": 1e-5,
-        "q_scale": 1.0,
-        "k_scale": k_scale,
-        "v_scale": v_scale,
+        "q_scale": QK_SCALE,
+        "k_scale": case.k_scale,
+        "v_scale": case.v_scale,
         "num_heads": CONTRACT.local_q_heads,
         "num_kv_heads": CONTRACT.local_kv_heads,
     }
@@ -93,6 +71,7 @@ def prepare_k1(rows: int, rank: int, device: torch.device) -> PreparedBaseline:
         backend=adapter.backend,
         launch_count=2,
         launch=lambda: adapter(**kwargs),
+        fixture=case,
     )
 
 
@@ -107,45 +86,13 @@ def prepare_kattn(
         verify_reduce_norm_gate,
     )
     from sglang.srt.layers.attention.aiter_backend import _muse_verify_attention
+    from tp8_logical_case import build_kattn_case
 
     requests = rows // CONTRACT.q_len
     if rows not in (8, 16) or requests * CONTRACT.q_len != rows:
         raise BaselineContractError(f"unsupported K-attn width {rows}")
-    torch.manual_seed(2000 + 17 * rows + rank + window)
-    q = torch.randn(
-        rows, CONTRACT.local_q_width, device=device, dtype=torch.float32
-    ).to(torch.bfloat16)
-    k_new = torch.zeros(
-        rows, CONTRACT.local_kv_width, device=device, dtype=torch.bfloat16
-    )
-    v_new = torch.zeros_like(k_new)
-    gate = torch.randn_like(q)
-    sequence_lengths = torch.tensor(
-        [8192 + 137 * request for request in range(requests)],
-        device=device,
-        dtype=torch.int32,
-    )
-    blocks_per_request = 520
-    total_blocks = requests * blocks_per_request
-    cache = torch.randn(
-        2,
-        total_blocks,
-        16,
-        CONTRACT.local_kv_heads,
-        CONTRACT.head_dim,
-        device=device,
-        dtype=torch.float32,
-    ).to(torch.float8_e4m3fn)
-    cache_k, cache_v = cache[0], cache[1]
-    block_table = torch.arange(
-        total_blocks, device=device, dtype=torch.int32
-    ).reshape(requests, blocks_per_request)
-    cu_seqlens_q = torch.arange(
-        requests + 1, device=device, dtype=torch.int32
-    ) * CONTRACT.q_len
-    output = torch.empty_like(q)
-    k_descale = torch.ones(1, device=device, dtype=torch.float32)
-    v_descale = torch.ones(1, device=device, dtype=torch.float32)
+    case = build_kattn_case(rows, rank, window, device)
+    output = torch.empty_like(case.q)
     eps = 1e-5
     norm_weight = torch.ones(
         CONTRACT.head_dim, device=device, dtype=torch.bfloat16
@@ -160,21 +107,21 @@ def prepare_kattn(
             del save_kv_cache
             handled = _muse_verify_attention(
                 q_flat.reshape(rows, CONTRACT.local_q_heads, CONTRACT.head_dim),
-                cache_k,
-                cache_v,
+                case.cache_k,
+                case.cache_v,
                 output.reshape(
                     rows, CONTRACT.local_q_heads, CONTRACT.head_dim
                 ),
-                cu_seqlens_q,
+                case.cu_seqlens_q,
                 CONTRACT.q_len,
-                sequence_lengths,
-                sequence_lengths,
-                block_table,
+                case.sequence_lengths,
+                case.sequence_lengths,
+                case.block_table,
                 CONTRACT.head_dim**-0.5,
                 sliding_window,
                 0.0,
-                k_descale,
-                v_descale,
+                case.k_descale,
+                case.v_descale,
                 None,
                 kernels,
             )
@@ -210,17 +157,24 @@ def prepare_kattn(
         launch_count=2,
         launch=lambda: adapter(
             attention=attention,
-            q=q,
-            k=k_new,
-            v=v_new,
+            q=case.q,
+            k=case.k_new,
+            v=case.v_new,
             forward_batch=None,
-            gate=gate,
+            gate=case.gate,
             save_kv_cache=False,
         ),
+        fixture=case,
     )
 
 
-def prepare_k2(rows: int, rank: int, device: torch.device) -> PreparedBaseline:
+def prepare_k2(
+    rows: int,
+    rank: int,
+    device: torch.device,
+    *,
+    active_npes: int = CONTRACT.active_npes,
+) -> PreparedBaseline:
     from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
     from sglang.kernels.ops.moe.router_pooler_topk import (
         pack_joint_router_pooler_weight,
@@ -231,24 +185,22 @@ def prepare_k2(rows: int, rank: int, device: torch.device) -> PreparedBaseline:
     from sglang.srt.rocm_muse_spark.fused_norm_residual import (
         FusedPostNormResidualPreNorm,
     )
-
-    torch.manual_seed(3000 + 17 * rows + rank)
-    bf16 = torch.bfloat16
-    attention_output = torch.randn(
-        rows, CONTRACT.local_q_width, device=device, dtype=torch.float32
-    ).to(bf16)
-    stream = torch.randn(
-        rows, CONTRACT.global_hidden, device=device, dtype=torch.float32
+    from sglang.srt.rocm_muse_spark.layers import (
+        MuseSpark1xNormPreservingResidualConnection,
     )
-    w_o = (
-        torch.randn(
-            CONTRACT.global_hidden,
-            CONTRACT.local_q_width,
-            device=device,
-            dtype=torch.float32,
-        )
-        * 0.02
-    ).to(bf16)
+    from tp8_logical_case import build_k2_case
+    from sgl_amd_mono.muse_spark.gfx1250.config import (
+        POST_EPS,
+        RMS_EPS,
+        ROUTER_MULT,
+        ROUTE_SCALE,
+    )
+
+    case = build_k2_case(rows, rank, active_npes, device)
+    bf16 = torch.bfloat16
+    attention_output = case.attention_output
+    stream = case.stream
+    w_o = case.w_o
 
     class OProj:
         def __call__(self, value):
@@ -257,34 +209,29 @@ def prepare_k2(rows: int, rank: int, device: torch.device) -> PreparedBaseline:
 
     class Norm:
         hidden_size = CONTRACT.global_hidden
-        eps = 1e-5
-        has_weight = True
+        has_weight = False
 
-        def __init__(self):
-            self.weight = torch.ones(
-                self.hidden_size, device=device, dtype=bf16
-            )
+        def __init__(self, weight=None, eps=RMS_EPS):
+            self.weight = weight
+            self.has_weight = weight is not None
+            self.eps = eps
 
         def _get_effective_weight(self):
             return self.weight
 
-    fused = FusedPostNormResidualPreNorm(Norm(), object(), Norm())
-    boundary = SimpleNamespace(forward=fused.forward_triton)
-    router = torch.randn(
-        CONTRACT.global_hidden,
-        CONTRACT.global_experts,
-        device=device,
-        dtype=torch.float32,
+    residual = MuseSpark1xNormPreservingResidualConnection(
+        CONTRACT.global_hidden
+    ).to(device)
+    residual._alpha = case.weights["alpha"]
+    residual._beta = case.weights["beta"]
+    fused = FusedPostNormResidualPreNorm(
+        Norm(eps=POST_EPS),
+        residual,
+        Norm(case.weights["pre_w"], eps=RMS_EPS),
     )
-    pooler = (
-        torch.randn(
-            CONTRACT.moe_hidden,
-            CONTRACT.global_hidden,
-            device=device,
-            dtype=torch.float32,
-        )
-        * 0.02
-    ).to(bf16)
+    boundary = SimpleNamespace(forward=fused.forward_triton)
+    router = case.weights["router"]
+    pooler = case.weights["w_pool"]
     packed = pack_joint_router_pooler_weight(router, pooler)
 
     class EffectiveNorm:
@@ -299,17 +246,16 @@ def prepare_k2(rows: int, rank: int, device: torch.device) -> PreparedBaseline:
             return self.weight
 
     pre_expert_norm = EffectiveNorm()
+    pre_expert_norm.weight.copy_(case.weights["xn_w"])
     pre_expert_proj = SimpleNamespace(weight=packed[: CONTRACT.moe_hidden])
     mlp = SimpleNamespace(
         layer_idx=9,
         router_pooler_packed_weight=packed,
         pre_expert_proj=pre_expert_proj,
-        expert_bias=torch.zeros(
-            CONTRACT.global_experts, device=device, dtype=torch.float32
-        ),
+        expert_bias=case.weights["bias"],
         pre_expert_norm=pre_expert_norm,
-        router_multiplier=1.0,
-        route_scale=1.0,
+        router_multiplier=ROUTER_MULT,
+        route_scale=ROUTE_SCALE,
         router=SimpleNamespace(weight=router),
     )
     layer = SimpleNamespace(
@@ -322,58 +268,54 @@ def prepare_k2(rows: int, rank: int, device: torch.device) -> PreparedBaseline:
         stage="k2",
         operator=adapter.operator,
         backend=adapter.backend,
-        launch_count=5,
+        launch_count=4 if active_npes == 1 else 5,
         launch=lambda: adapter(
             layer=layer,
             stream=stream,
             attention_output=attention_output,
         ),
+        fixture=case,
     )
 
 
-def prepare_k3(rows: int, rank: int, device: torch.device) -> PreparedBaseline:
+def prepare_k3(
+    rows: int,
+    rank: int,
+    device: torch.device,
+    *,
+    active_npes: int = CONTRACT.active_npes,
+) -> PreparedBaseline:
     from types import SimpleNamespace
 
-    import test_muse_spark_k3_gfx1250 as k3_test
     from sglang.kernels.ops.gemm.unpool_gemm_norm_residual import (
         unpool_gemm_norm_residual,
     )
+    from tp8_logical_case import build_k3_case
 
-    ids_list, scores_list = deterministic_ep8_routing(rows)
-    ids = torch.tensor(ids_list, device=device, dtype=torch.int32)
-    scores = torch.tensor(scores_list, device=device, dtype=torch.float32)
-    case = k3_test.k3_case(
-        rows,
-        False,
-        4000 + 17 * rows + rank,
-        experts=CONTRACT.local_experts,
-        ids=ids,
-    )
-    case.scores.copy_(scores)
-    local_start = rank * CONTRACT.local_experts
+    case = build_k3_case(rows, rank, active_npes, device)
     mask = torch.zeros(
         CONTRACT.global_experts, device=device, dtype=torch.int32
     )
-    mask[local_start : local_start + CONTRACT.local_experts] = 1
+    mask[case.local_start : case.local_start + CONTRACT.local_experts] = 1
     experts = SimpleNamespace(
         num_local_experts=CONTRACT.local_experts,
         gfx1250_a8w4=(case.w13, case.w2, case.s13, case.s2, mask),
         expert_hidden_size=CONTRACT.moe_hidden,
     )
-    weights = case.w
+    weights = case.weights
 
-    adapter = K3BaselineAdapter(Active4LogicalTP8())
+    adapter = K3BaselineAdapter(ActiveLogicalTP8(active_npes))
     return PreparedBaseline(
         stage="k3",
         operator=adapter.operator,
         backend=adapter.backend,
-        launch_count=9,
+        launch_count=8 if active_npes == 1 else 9,
         launch=lambda: adapter(
             x=case.xin,
             scores=case.scores,
             ids=case.ids,
             experts=experts,
-            local_start=local_start,
+            local_start=case.local_start,
             norm_weight=weights["pen_w"],
             eps=1e-5,
             gain=0.0,
@@ -389,4 +331,5 @@ def prepare_k3(rows: int, rank: int, device: torch.device) -> PreparedBaseline:
                 1e-5,
             ),
         ),
+        fixture=case,
     )

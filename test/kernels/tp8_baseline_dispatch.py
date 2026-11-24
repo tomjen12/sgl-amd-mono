@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict, dataclass
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 
 class DispatchContractError(RuntimeError):
@@ -17,6 +17,7 @@ class KernelExpectation:
     semantic: str
     pattern: str
     count: int = 1
+    classification: str = "local_compute"
 
 
 @dataclass(frozen=True)
@@ -63,7 +64,11 @@ EXPECTED: dict[str, StageExpectation] = {
                 "BF16_O_GEMM",
                 r"_gemm_a16w16_gfx1250_bandwidth_bound_kernel_.*(?:\.kd)?",
             ),
-            KernelExpectation("TP_AR", r"(?:all_reduce|custom_all_reduce).*"),
+            KernelExpectation(
+                "TP_AR",
+                r"(?:all_reduce|custom_all_reduce).*",
+                classification="collective",
+            ),
             KernelExpectation(
                 "T_ATTN_BOUNDARY", r"_fused_norm_residual_triton_kernel(?:\.kd)?"
             ),
@@ -92,7 +97,11 @@ EXPECTED: dict[str, StageExpectation] = {
                 "T_MOE_DOWN", r"mxfp4_tdm_fp8_.*K4096_(?!.*act1).*(?:\.kd)?"
             ),
             KernelExpectation("T_MOE_FINALIZE", r"_finalize_rows_kernel(?:\.kd)?"),
-            KernelExpectation("TP_AR", r"(?:all_reduce|custom_all_reduce).*"),
+            KernelExpectation(
+                "TP_AR",
+                r"(?:all_reduce|custom_all_reduce).*",
+                classification="collective",
+            ),
             KernelExpectation("T_UNPOOL_GEMM", r"(?:_dense_partial|Cijk_).*(?:\.kd)?"),
             KernelExpectation(
                 "T_UNPOOL_BOUNDARY", r"_unpool_reduce_boundary(?:\.kd)?"
@@ -112,6 +121,8 @@ def validate_dispatch(
     operator: str,
     backend: str,
     kernel_names: Iterable[str],
+    tensor_metadata: Mapping[str, Mapping[str, Any]] | None = None,
+    active_npes: int = 4,
 ) -> dict:
     """Validate one measured stage and return its JSON-ready evidence."""
     if stage not in EXPECTED:
@@ -127,20 +138,43 @@ def validate_dispatch(
         )
     names = tuple(str(name) for name in kernel_names)
     matches: dict[str, list[str]] = {}
+    launches: list[dict[str, Any]] = []
     consumed: set[int] = set()
+    next_index = 0
     for item in expected.kernels:
+        count = (
+            0
+            if item.classification == "collective" and active_npes == 1
+            else item.count
+        )
         indices = [
             index
             for index, name in enumerate(names)
             if re.search(item.pattern, name, flags=re.IGNORECASE)
         ]
-        if len(indices) != item.count:
+        if len(indices) != count:
             raise DispatchContractError(
                 f"{stage}/{item.semantic}: matched {len(indices)} kernels, "
-                f"expected {item.count}; actual={names}"
+                f"expected {count}; actual={names}"
+            )
+        if indices != list(range(next_index, next_index + count)):
+            raise DispatchContractError(
+                f"{stage}/{item.semantic}: kernel order {indices}, "
+                f"expected {list(range(next_index, next_index + count))}; "
+                f"actual={names}"
             )
         matches[item.semantic] = [names[index] for index in indices]
+        launches.extend(
+            {
+                "launch_index": index,
+                "kernel_name": names[index],
+                "semantic": item.semantic,
+                "classification": item.classification,
+            }
+            for index in indices
+        )
         consumed.update(indices)
+        next_index += count
     unexpected = [name for index, name in enumerate(names) if index not in consumed]
     if unexpected:
         raise DispatchContractError(
@@ -154,6 +188,12 @@ def validate_dispatch(
             "backend": backend,
             "kernel_names": list(names),
             "launch_count": len(names),
+            "active_npes": active_npes,
+            "ordered_launches": launches,
             "semantic_matches": matches,
+            "tensor_metadata": {
+                str(name): dict(metadata)
+                for name, metadata in (tensor_metadata or {}).items()
+            },
         },
     }

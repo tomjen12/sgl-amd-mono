@@ -25,6 +25,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 NP = 8
+ACTIVE_NP = NP
 E_RANK = 32  # experts a rank
 EXPERTS_USED = 4  # experts a rank the test routes to (the table's prefix)
 K3_LAYER = 9
@@ -36,8 +37,17 @@ def _peers(nbytes, rank, dev):
 
     from sgl_amd_mono.common.peer import PeerBuffer
 
-    pb = PeerBuffer(nbytes, dist.group.WORLD, rank, NP, dev)
+    pb = PeerBuffer(
+        nbytes,
+        dist.group.WORLD,
+        rank,
+        ACTIVE_NP,
+        dev,
+        logical_npes=NP,
+    )
     pb.bytes.zero_()
+    for shadow in pb.shadow_bytes:
+        shadow.zero_()
     torch.cuda.synchronize()
     dist.barrier()
     return pb
@@ -113,32 +123,29 @@ def _k3_worker(rank, rows, trace, q, deterministic=False):
 
     dev = torch.device("cuda", rank)
     bf = torch.bfloat16
-    gen = torch.Generator(device=dev).manual_seed(
-        900 + rows
-    )  # the same tables on every rank
-    torch.manual_seed(900 + rows)
-    U = EXPERTS_USED
-    # every rank's used experts (NP U of them), table index r U + k = global expert r E_RANK + k
-    w13, s13, dec13 = T._fp4_weight(NP * U, 2 * INTER, MOE_HIDDEN, dev, gen)
-    w2, s2, dec2 = T._fp4_weight(NP * U, MOE_HIDDEN, INTER, dev, gen)
-    xin = (torch.randn(rows, MOE_HIDDEN, device=dev) * 0.5).to(bf)
-    tab = torch.empty(rows, TOP_K, dtype=torch.int64, device=dev)  # table indices
+    # Synthetic active1/2/4 uses the canonical logical fixture shared with the
+    # production Baseline adapter.  The original real-eight-GPU regression
+    # retains its smaller expert table and randomized routing.
     if deterministic:
-        from tp8_synthetic_contract import deterministic_ep8_routing
+        from tp8_logical_case import build_k3_case
 
-        fixture_ids, fixture_scores = deterministic_ep8_routing(rows, U)
-        ids = torch.tensor(fixture_ids, dtype=torch.int32, device=dev)
-        scores = torch.tensor(fixture_scores, dtype=torch.float32, device=dev)
-        logical_rank = ids // E_RANK
-        local_expert = ids % E_RANK
-        tab.copy_(
-            torch.where(
-                logical_rank < NP,
-                logical_rank * U + local_expert,
-                torch.full_like(logical_rank, -1),
-            )
-        )
+        case = build_k3_case(rows, rank, ACTIVE_NP, dev)
+        U = E_RANK
+        w13, s13, dec13 = case.w13, case.s13, case.dec13
+        w2, s2, dec2 = case.w2, case.s2, case.dec2
+        xin, ids, scores = case.xin, case.ids, case.scores
+        stream, w = case.stream, case.weights
+        g13, g2, gs13, gs2 = w13, w2, s13, s2
     else:
+        gen = torch.Generator(device=dev).manual_seed(300 + rows)
+        torch.manual_seed(300 + rows)
+        U = EXPERTS_USED
+        w13, s13, dec13 = T._fp4_weight(U, 2 * INTER, MOE_HIDDEN, dev, gen)
+        w2, s2, dec2 = T._fp4_weight(U, MOE_HIDDEN, INTER, dev, gen)
+        xin = (torch.randn(rows, MOE_HIDDEN, device=dev) * 0.5).to(bf)
+        tab = torch.empty(
+            rows, TOP_K, dtype=torch.int64, device=dev
+        )
         for t in range(rows):
             tab[t, 0] = 0  # every token's slot 0: rank 0's expert 0 (its widest column set)
             tab[t, 1:] = (
@@ -149,53 +156,55 @@ def _k3_worker(rank, rows, trace, q, deterministic=False):
             )
         ids = ((tab // U) * E_RANK + tab % U).to(torch.int32)
         scores = torch.rand(rows, TOP_K, device=dev) * 0.3
-    stream = torch.randn(rows, HIDDEN, device=dev)
-    w = {
-        "pen_w": (1.0 + 0.1 * torch.randn(MOE_HIDDEN, device=dev)).to(bf),
-        "pfw": (1.0 + 0.1 * torch.randn(HIDDEN, device=dev)).to(bf),
-        "alpha": torch.rand(HIDDEN, device=dev) * 0.5 + 0.5,
-        "beta": torch.rand(HIDDEN, device=dev) * 0.5,
-        "npw": (1.0 + 0.1 * torch.randn(HIDDEN, device=dev)).to(bf),
-        "w_unpool": (torch.randn(HIDDEN, MOE_HIDDEN, device=dev) * 0.02).to(bf),
-    }
-    lo = rank * U
-    g13, g2, gs13, gs2 = T.gfx1250_experts(
-        w13[lo : lo + U],
-        s13[lo : lo + U],
-        w2[lo : lo + U],
-        s2[lo : lo + U],
-        rank * E_RANK,
-    )
-    # the reference: each rank's partial (its picks, slot order, one rounding), summed in rank order
+        stream = torch.randn(rows, HIDDEN, device=dev)
+        w = {
+            "pen_w": (1.0 + 0.1 * torch.randn(MOE_HIDDEN, device=dev)).to(bf),
+            "pfw": (1.0 + 0.1 * torch.randn(HIDDEN, device=dev)).to(bf),
+            "alpha": torch.rand(HIDDEN, device=dev) * 0.5 + 0.5,
+            "beta": torch.rand(HIDDEN, device=dev) * 0.5,
+            "npw": (1.0 + 0.1 * torch.randn(HIDDEN, device=dev)).to(bf),
+            "w_unpool": (
+                torch.randn(HIDDEN, MOE_HIDDEN, device=dev) * 0.02
+            ).to(bf),
+        }
+        g13, g2, gs13, gs2 = T.gfx1250_experts(
+            w13, s13, w2, s2, rank * E_RANK
+        )
+    # Each process computes only its production local expert shard.  Gather the
+    # small BF16 finalized partials on the host and sum them in physical-rank
+    # order, matching the active-rank reduction while missing ranks stay zero.
     y = torch.zeros(rows, TOP_K, MOE_HIDDEN, device=dev)
     xq = T.mx8_dequant(xin.float())
     for t in range(rows):
         for s in range(TOP_K):
-            e = int(tab[t, s])
-            if e < 0:
+            e = int(ids[t, s]) - rank * E_RANK
+            if not 0 <= e < U:
                 continue
             gu = xq[t] @ dec13[e].T
             gate, up = gu[:INTER], gu[INTER:]
             y[t, s] = T._bf(T.mx8_dequant(gate * torch.sigmoid(gate) * up) @ dec2[e].T)
+    part = torch.zeros(rows, MOE_HIDDEN, device=dev)
+    for t in range(rows):
+        for s in range(TOP_K):
+            e = int(ids[t, s]) - rank * E_RANK
+            if not 0 <= e < U:
+                continue
+            v = T._bf(y[t, s] * w["pen_w"].float())
+            part[t] += (
+                float(scores[t, s]) / torch.sqrt(v.pow(2).mean() + POST_EPS) * v
+            )
+    gathered_parts: list[torch.Tensor | None] = [None] * ACTIVE_NP
+    dist.all_gather_object(gathered_parts, T._bf(part).to(bf).cpu())
     total = torch.zeros(rows, MOE_HIDDEN, device=dev)
-    for r in range(NP):
-        part = torch.zeros(rows, MOE_HIDDEN, device=dev)
-        for t in range(rows):
-            for s in range(TOP_K):
-                if int(tab[t, s]) // U != r:
-                    continue
-                v = T._bf(y[t, s] * w["pen_w"].float())
-                part[t] += (
-                    float(scores[t, s]) / torch.sqrt(v.pow(2).mean() + POST_EPS) * v
-                )
-        total += T._bf(part)
+    for rank_part in gathered_parts:
+        assert rank_part is not None
+        total += rank_part.to(device=dev, dtype=bf).float()
     branch = T._bf(T._bf(total) @ w["w_unpool"].float().T)
     post_input = T._bf(branch * w["pfw"].float())
     nb = T._bf(
         post_input * torch.rsqrt(post_input.pow(2).mean(-1, keepdim=True) + POST_EPS)
     )
     new_ref = w["alpha"] * stream + w["beta"] * nb
-    attn_ref = (new_ref * torch.rsqrt(new_ref.pow(2).mean(-1, keepdim=True) + RMS_EPS) * w["npw"].float()).to(bf)  # fmt: skip
 
     lay = k3_scratch_layout()
     attn_out = torch.full((MAX_TOKENS, HIDDEN), float("nan"), device=dev, dtype=bf)
@@ -206,6 +215,16 @@ def _k3_worker(rank, rows, trace, q, deterministic=False):
     got = stream.clone()
 
     def once():
+        if ACTIVE_NP < NP:
+            from tp8_shadow_protocol import seed_missing_rank_mailboxes
+
+            seed_missing_rank_mailboxes(
+                peers.bytes,
+                rows=rows,
+                step=int(epoch[0].item()),
+                layer=K3_LAYER,
+                active_npes=ACTIVE_NP,
+            )
         launch(
             xin.data_ptr(), ids.data_ptr(), scores.data_ptr(), rank * E_RANK,
             g13.data_ptr(), gs13.data_ptr(), g2.data_ptr(), gs2.data_ptr(),
@@ -225,11 +244,24 @@ def _k3_worker(rank, rows, trace, q, deterministic=False):
             once()
             torch.cuda.synchronize()
         errs = epoch[guard.ERR_DEADLINE : guard.ERR_FAULT + 1].tolist()
+        # Validate the final boundary against the stream the kernel actually
+        # produced.  ``stream`` is independently checked against ``new_ref``;
+        # using it here avoids compounding expert-reference reduction-order
+        # error through a second RMS normalization without changing tolerance.
+        got_nb = T._bf(
+            got
+            * torch.rsqrt(got.pow(2).mean(-1, keepdim=True) + RMS_EPS)
+        )
+        attn_boundary_ref = (got_nb * w["npw"].float()).to(bf)
         res = _compare(
             rank,
             errs,
-            [("stream", got, new_ref), ("attention input", attn_out[:rows], attn_ref)],
+            [
+                ("stream", got, new_ref),
+                ("attention input", attn_out[:rows], attn_boundary_ref),
+            ],
         )
+        res["materialized_local_experts"] = U
         if trace:
             res["launch_us"] = _bench(once)
             res["stamps"] = _stamps(scratch, lay["k3_trace"], K3_LAYER).tolist()
@@ -269,6 +301,10 @@ def _k2_worker(rank, rows, pshard, trace, q, xq_pre=True):
     stream = torch.randn(rows, HIDDEN, device=dev)
     router = torch.randn(HIDDEN, EXPERTS, device=dev) * 0.02
     w_pool = (torch.randn(MOE_HIDDEN, HIDDEN, device=dev) * 0.02).to(bf)
+    if ACTIVE_NP < NP:
+        # Missing logical ranks' router partials are precomputed below; missing
+        # sharded-pooler rows are tagged zeros because no physical rank owns them.
+        w_pool[ACTIVE_NP * (MOE_HIDDEN // NP) :].zero_()
     w = {
         "alpha": torch.rand(HIDDEN, device=dev) * 0.5 + 0.5,
         "beta": torch.rand(HIDDEN, device=dev) * 0.5,
@@ -280,11 +316,11 @@ def _k2_worker(rank, rows, pshard, trace, q, xq_pre=True):
     }
     # the reference: the ranks' bf16 o_proj partials summed in rank order in fp32, one rounding
     ao = torch.zeros(rows, HIDDEN, device=dev)
-    for r in range(NP):
+    for r in range(ACTIVE_NP):
         of = os_[r].float().reshape(rows, -1, HEAD_DIM)
         og = (of * torch.rsqrt(of.pow(2).mean(-1, keepdim=True) + RMS_EPS) * torch.sigmoid(gs_[r].float().reshape(rows, -1, HEAD_DIM))).to(bf)  # fmt: skip
         ao += (og.reshape(rows, -1).float() @ wos[r].float().T).to(bf).float()
-    new_ref, ids_ref, scores_ref, xn_ref, biased = _k2_reference_from_ao(
+    new_ref, ids_ref, scores_ref, xn_ref, biased, router_partials = _k2_reference_from_ao(
         T, ao.to(bf), stream, w
     )
 
@@ -307,6 +343,17 @@ def _k2_worker(rank, rows, pshard, trace, q, xq_pre=True):
     got = stream.clone()
 
     def once():
+        if ACTIVE_NP < NP:
+            from tp8_shadow_protocol import seed_missing_rank_mailboxes
+
+            seed_missing_rank_mailboxes(
+                peers.bytes,
+                rows=rows,
+                step=int(epoch[0].item()),
+                layer=K2_LAYER,
+                missing_router_partials=router_partials,
+                active_npes=ACTIVE_NP,
+            )
         launch(
             os_[rank].data_ptr(), gs_[rank].data_ptr(), got.data_ptr(), wos[rank].data_ptr(),
             w["alpha"].data_ptr(), w["beta"].data_ptr(), w["pre_w"].data_ptr(),
@@ -345,6 +392,7 @@ def _k2_worker(rank, rows, pshard, trace, q, xq_pre=True):
 def _k2_reference_from_ao(T, ao, stream, w):
     """``test_muse_spark_k2_gfx1250._reference`` from the all-reduced attention output on."""
     from sgl_amd_mono.muse_spark.gfx1250.config import (  # fmt: skip
+        HIDDEN,
         POST_EPS,
         RMS_EPS,
         ROUTE_EPS,
@@ -372,7 +420,19 @@ def _k2_reference_from_ao(T, ao, stream, w):
     scores = picks / (picks.sum(-1, keepdim=True) + ROUTE_EPS) * ROUTE_SCALE
     pooled = (x.float() @ w["w_pool"].float().T).to(bf)
     xn = T._rms(pooled, RMS_EPS, w["xn_w"])
-    return new, ids.to(torch.int32), scores, xn, biased
+    k_per_part = HIDDEN // NP
+    missing_start = ACTIVE_NP * E_RANK
+    missing_router_partials = torch.stack(
+        [
+            x32[:, part * k_per_part : (part + 1) * k_per_part]
+            @ w["router"][
+                part * k_per_part : (part + 1) * k_per_part,
+                missing_start:,
+            ]
+            for part in range(NP)
+        ]
+    )
+    return new, ids.to(torch.int32), scores, xn, biased, missing_router_partials
 
 
 def _compare(rank, errs, pairs):
@@ -382,6 +442,21 @@ def _compare(rank, errs, pairs):
         cos = torch.nn.functional.cosine_similarity(g, r, dim=-1).min().item()
         err = (g - r).abs()
         bad = (err > r.abs() / 32 + 2e-2).float().mean().item()
+        if bad:
+            limit = r.abs() / 32 + 2e-2
+            flat = int((err - limit).argmax().item())
+            index = tuple(
+                int(value)
+                for value in torch.unravel_index(
+                    torch.tensor(flat, device=err.device), err.shape
+                )
+            )
+            print(
+                f"rank {rank} {what} max mismatch at {index}: "
+                f"got={g[index].item():.9g} ref={r[index].item():.9g} "
+                f"error={err[index].item():.9g} limit={limit[index].item():.9g}",
+                flush=True,
+            )
         out["checks"].append((what, err.max().item(), cos, bad))
     return out
 

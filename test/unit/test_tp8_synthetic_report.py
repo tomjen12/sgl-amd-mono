@@ -48,6 +48,8 @@ def test_summary_uses_rank0_latency():
         "PASS",
     )
     assert row["samples"] == 2
+    assert row["baseline_launch_count"] == 2
+    assert row["mono_launch_count"] == 1
     assert row["baseline_mean_us"] == 10.5
     assert row["baseline_p50_us"] == 10.5
     assert row["baseline_p90_us"] == pytest.approx(10.9)
@@ -84,7 +86,7 @@ def test_reports_and_log_are_written(tmp_path):
     assert json.loads((tmp_path / "gap.json").read_text())["dispatch_valid"]
     rendered = render_performance_log(report, "artifacts/example")
     assert "logical TP8/EP8" in rendered
-    assert "k1 8 10.500 8.500 -2.000" in rendered
+    assert "k1 8 2 10.500 1 8.500 -2.000" in rendered
 
 
 def test_failed_dispatch_invalidates_gap(tmp_path):

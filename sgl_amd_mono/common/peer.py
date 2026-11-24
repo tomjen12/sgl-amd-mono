@@ -121,14 +121,41 @@ class _DeviceBytes:
 
 class PeerBuffer:
     """One uncached buffer a rank and every peer's address (``addresses``, int64
-    on the device). ``group`` is a CPU (gloo) group of the ``npes`` ranks."""
+    on the device). ``group`` is a CPU (gloo) group of the ``npes`` active ranks.
 
-    def __init__(self, nbytes: int, group, rank: int, npes: int, device: torch.device):
+    ``logical_npes`` may be larger than ``npes`` for a synthetic topology.  Its
+    missing logical ranks receive rank-local shadow buffers, so a kernel can keep
+    its production logical-world specialization without inventing physical
+    peers.  The caller owns the shadow protocol: data and mailbox tags must be
+    seeded before launch.
+    """
+
+    def __init__(
+        self,
+        nbytes: int,
+        group,
+        rank: int,
+        npes: int,
+        device: torch.device,
+        *,
+        logical_npes: int | None = None,
+    ):
+        logical_npes = npes if logical_npes is None else logical_npes
+        if not 1 <= npes <= logical_npes:
+            raise ValueError(
+                f"active npes {npes} must be in [1, logical_npes={logical_npes}]"
+            )
+        if not 0 <= rank < npes:
+            raise ValueError(f"rank {rank} outside active world {npes}")
         self.rank = rank
+        self.active_npes = npes
+        self.logical_npes = logical_npes
         self.local = _alloc_uncached(nbytes)
         # a view, not an owner of the memory under it
         self.bytes = torch.as_tensor(_DeviceBytes(self.local, nbytes), device=device)
         self._opened: list[int] = []
+        self._shadows: list[int] = []
+        self.shadow_bytes: list[torch.Tensor] = []
         addresses = [self.local]
         if npes > 1:
             handles: list = [None] * npes
@@ -156,11 +183,20 @@ class PeerBuffer:
                 raise PeerMemoryError(
                     f"peer memory handshake failed on {'this' if failure else 'another'} rank"
                 ) from failure
+        for _ in range(logical_npes - npes):
+            shadow = _alloc_uncached(nbytes)
+            self._shadows.append(shadow)
+            self.shadow_bytes.append(
+                torch.as_tensor(_DeviceBytes(shadow, nbytes), device=device)
+            )
+            addresses.append(shadow)
         self.addresses = torch.tensor(addresses, dtype=torch.int64, device=device)
 
     def close(self) -> None:
         """Drop the buffer, keeping its memory and peer mappings in ``_RETIRED``
         (idempotent)."""
         if self.local:
-            _RETIRED.append((self.local, self._opened))
+            shadows = getattr(self, "_shadows", [])
+            _RETIRED.append((self.local, self._opened + shadows))
             self.bytes, self.local, self._opened = None, 0, []
+            self._shadows, self.shadow_bytes = [], []

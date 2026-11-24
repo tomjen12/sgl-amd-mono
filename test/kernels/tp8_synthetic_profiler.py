@@ -21,7 +21,9 @@ def benchmark_us(
         if before_each is not None:
             before_each()
         launch()
-    torch.cuda.synchronize()
+        # Persistent collectives reuse mailbox/epoch storage.  Do not enqueue
+        # the next logical model step before every rank has completed this one.
+        torch.cuda.synchronize()
     samples: list[float] = []
     for _ in range(iterations):
         if before_each is not None:
@@ -81,13 +83,23 @@ def profile_kernel_iterations(
     warmup: int,
     iterations: int,
     before_each: Callable[[], None] | None = None,
+    record: bool = True,
 ) -> list[float]:
-    """Return per-iteration sums of selected GPU kernel durations, excluding gaps."""
+    """Run every rank but record kernel durations only on the reporting rank."""
     for _ in range(warmup):
         if before_each is not None:
             before_each()
         launch()
-    torch.cuda.synchronize()
+        # Match sequential runtime steps and prevent a later launch from
+        # reusing persistent-collective protocol state that is still live.
+        torch.cuda.synchronize()
+    if not record:
+        for _ in range(iterations):
+            if before_each is not None:
+                before_each()
+            launch()
+            torch.cuda.synchronize()
+        return []
     trace_path.parent.mkdir(parents=True, exist_ok=True)
     activities = [
         torch.profiler.ProfilerActivity.CPU,
@@ -105,7 +117,9 @@ def profile_kernel_iterations(
                 f"tp8_synthetic/iteration/{iteration}"
             ):
                 launch()
-        torch.cuda.synchronize()
+                # This CPU-side wait is intentionally outside the reported
+                # metric: only allowlisted GPU kernel durations are summed.
+                torch.cuda.synchronize()
     profile.export_chrome_trace(str(trace_path))
     events = json.loads(trace_path.read_text()).get("traceEvents", [])
     allowed = set(kernel_names)
