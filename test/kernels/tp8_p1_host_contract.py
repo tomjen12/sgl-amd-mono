@@ -129,6 +129,33 @@ def routing_histogram(case: RoutingCase) -> tuple[int, ...]:
     return tuple(counts)
 
 
+def logical_rank_batches(active_gpus: int) -> tuple[tuple[int, ...], ...]:
+    """Deterministic batched coverage schedule for logical ranks 0..7."""
+    _require(active_gpus in (1, 2), "batched logical-rank coverage uses active 1 or 2")
+    return tuple(
+        tuple(range(start, start + active_gpus))
+        for start in range(0, LOGICAL_TP, active_gpus)
+    )
+
+
+def validate_logical_rank_observations(
+    active_gpus: int,
+    observations: Sequence[Mapping[str, Any]],
+) -> None:
+    """Require every scheduled logical rank exactly once with its runtime mapping."""
+    batches = logical_rank_batches(active_gpus)
+    _require(len(observations) == len(batches), "logical-rank batch count mismatch")
+    observed: list[int] = []
+    for index, (expected, item) in enumerate(zip(batches, observations)):
+        actual = tuple(item.get("logical_ranks", ()))
+        _require(actual == expected, f"logical-rank batch {index} mismatch")
+        _require(item.get("active_gpus") == active_gpus, f"batch {index} active GPU mismatch")
+        _require(item.get("runtime_mapping_hash"), f"batch {index} mapping hash missing")
+        _require(item.get("status") == "passed", f"batch {index} did not pass")
+        observed.extend(actual)
+    _require(observed == list(range(LOGICAL_TP)), "logical ranks 0..7 not covered exactly once")
+
+
 @dataclass(frozen=True)
 class LayerVariant:
     width: int
@@ -222,6 +249,49 @@ def validate_execution(
     _require(
         tuple(actual) == tuple(expected),
         f"execution mismatch: actual={tuple(actual)!r}, expected={tuple(expected)!r}",
+    )
+
+
+def bf16_boundary_dispatch(
+    *, layer: int, attention: str, next_k1: bool
+) -> dict[str, Any]:
+    _require(layer in BF16_EXPERT_LAYERS, "BF16 boundary layer must be 0 or 61")
+    _require(attention in ("full", "swa"), "invalid BF16 attention mode")
+    _require(not (layer == 61 and next_k1), "last BF16 layer cannot have next K1")
+    return {
+        "layer": layer,
+        "attention": attention,
+        "mono_allowed": ("k1", "kattn", "k2"),
+        "expert_backend": "sglang_tpx_bf16",
+        "forbidden_expert_backend": "mono_mxfp4_k3",
+        "first_k1": layer == 0,
+        "next_k1": next_k1,
+        "terminal": layer == 61,
+    }
+
+
+def validate_bf16_dispatch(
+    observed: Mapping[str, Any],
+    *,
+    layer: int,
+    attention: str,
+    next_k1: bool,
+) -> None:
+    expected = bf16_boundary_dispatch(
+        layer=layer, attention=attention, next_k1=next_k1
+    )
+    for key, value in expected.items():
+        _require(observed.get(key) == value, f"BF16 dispatch {key} mismatch")
+    operators = tuple(observed.get("operator_sequence", ()))
+    _require(
+        operators[:3] == ("mono_k1", "mono_kattn", "mono_k2"),
+        "BF16 boundary Mono prefix mismatch",
+    )
+    _require("sglang_tpx_bf16" in operators, "BF16 expert operator missing")
+    _require("mono_mxfp4_k3" not in operators, "BF16 layer entered MXFP4 K3")
+    _require(
+        operators[-1:] == (("mono_k1_next",) if next_k1 else ("sglang_tpx_bf16",)),
+        "BF16 first/last/next-K1 order mismatch",
     )
 
 

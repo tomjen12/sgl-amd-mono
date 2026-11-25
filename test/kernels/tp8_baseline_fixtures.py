@@ -22,6 +22,29 @@ from tp8_baseline_production import (
 from tp8_synthetic_contract import CONTRACT
 
 
+def _validated_launch(
+    launch: Callable[[], BaselineResult],
+    *,
+    active_npes: int | None = None,
+) -> Callable[[], BaselineResult]:
+    def checked() -> BaselineResult:
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            raise BaselineContractError(
+                "Baseline launch requires an initialized process group"
+            )
+        world = dist.get_world_size()
+        expected = world if active_npes is None else active_npes
+        if world not in (1, 2, 4) or world != expected:
+            raise BaselineContractError(
+                f"active world size {world}, expected {expected} in (1, 2, 4)"
+            )
+        return launch()
+
+    return checked
+
+
 @dataclass
 class PreparedBaseline:
     stage: str
@@ -70,7 +93,7 @@ def prepare_k1(rows: int, rank: int, device: torch.device) -> PreparedBaseline:
         operator=adapter.operator,
         backend=adapter.backend,
         launch_count=2,
-        launch=lambda: adapter(**kwargs),
+        launch=_validated_launch(lambda: adapter(**kwargs)),
         fixture=case,
     )
 
@@ -155,14 +178,16 @@ def prepare_kattn(
         operator=adapter.operator,
         backend=adapter.backend,
         launch_count=2,
-        launch=lambda: adapter(
-            attention=attention,
-            q=case.q,
-            k=case.k_new,
-            v=case.v_new,
-            forward_batch=None,
-            gate=case.gate,
-            save_kv_cache=False,
+        launch=_validated_launch(
+            lambda: adapter(
+                attention=attention,
+                q=case.q,
+                k=case.k_new,
+                v=case.v_new,
+                forward_batch=None,
+                gate=case.gate,
+                save_kv_cache=False,
+            )
         ),
         fixture=case,
     )
@@ -269,10 +294,13 @@ def prepare_k2(
         operator=adapter.operator,
         backend=adapter.backend,
         launch_count=4 if active_npes == 1 else 5,
-        launch=lambda: adapter(
-            layer=layer,
-            stream=stream,
-            attention_output=attention_output,
+        launch=_validated_launch(
+            lambda: adapter(
+                layer=layer,
+                stream=stream,
+                attention_output=attention_output,
+            ),
+            active_npes=active_npes,
         ),
         fixture=case,
     )
@@ -284,6 +312,7 @@ def prepare_k3(
     device: torch.device,
     *,
     active_npes: int = CONTRACT.active_npes,
+    controlled_package=None,
 ) -> PreparedBaseline:
     from types import SimpleNamespace
 
@@ -293,6 +322,32 @@ def prepare_k3(
     from tp8_logical_case import build_k3_case
 
     case = build_k3_case(rows, rank, active_npes, device)
+    if controlled_package is not None:
+        if controlled_package.width != rows:
+            raise ValueError(
+                f"controlled routing width {controlled_package.width}, expected {rows}"
+            )
+        case.xin.copy_(
+            torch.tensor(
+                controlled_package.xin,
+                dtype=case.xin.dtype,
+                device=device,
+            )
+        )
+        case.ids.copy_(
+            torch.tensor(
+                controlled_package.ids,
+                dtype=case.ids.dtype,
+                device=device,
+            )
+        )
+        case.scores.copy_(
+            torch.tensor(
+                controlled_package.scores,
+                dtype=case.scores.dtype,
+                device=device,
+            )
+        )
     mask = torch.zeros(
         CONTRACT.global_experts, device=device, dtype=torch.int32
     )
@@ -310,26 +365,29 @@ def prepare_k3(
         operator=adapter.operator,
         backend=adapter.backend,
         launch_count=8 if active_npes == 1 else 9,
-        launch=lambda: adapter(
-            x=case.xin,
-            scores=case.scores,
-            ids=case.ids,
-            experts=experts,
-            local_start=case.local_start,
-            norm_weight=weights["pen_w"],
-            eps=1e-5,
-            gain=0.0,
-            unpool=unpool_gemm_norm_residual,
-            unpool_args=(
-                weights["w_unpool"],
-                case.stream,
-                weights["pfw"],
-                weights["npw"],
-                weights["alpha"],
-                weights["beta"],
-                1e-5,
-                1e-5,
+        launch=_validated_launch(
+            lambda: adapter(
+                x=case.xin,
+                scores=case.scores,
+                ids=case.ids,
+                experts=experts,
+                local_start=case.local_start,
+                norm_weight=weights["pen_w"],
+                eps=1e-5,
+                gain=0.0,
+                unpool=unpool_gemm_norm_residual,
+                unpool_args=(
+                    weights["w_unpool"],
+                    case.stream,
+                    weights["pfw"],
+                    weights["npw"],
+                    weights["alpha"],
+                    weights["beta"],
+                    1e-5,
+                    1e-5,
+                ),
             ),
+            active_npes=active_npes,
         ),
         fixture=case,
     )

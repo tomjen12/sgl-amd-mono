@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 KERNEL_TESTS = Path(__file__).resolve().parents[1] / "kernels"
 sys.path.insert(0, str(KERNEL_TESTS))
@@ -13,10 +14,17 @@ import tp8_baseline_production as production  # noqa: E402
 
 
 class Tensor:
-    def __init__(self, shape, dtype="bf16", contiguous=True):
+    def __init__(
+        self,
+        shape,
+        dtype=torch.bfloat16,
+        contiguous=True,
+        data_ptr=0x1000,
+    ):
         self.shape = tuple(shape)
         self.dtype = dtype
         self._contiguous = contiguous
+        self._data_ptr = data_ptr
 
     def stride(self):
         stride, values = 1, []
@@ -36,6 +44,9 @@ class Tensor:
 
     def element_size(self):
         return 2
+
+    def data_ptr(self):
+        return self._data_ptr
 
 
 def _environment():
@@ -103,11 +114,11 @@ def test_k1_calls_sglang_entrypoint_and_records_tp8_tensors(monkeypatch):
     kw = {
         "x": Tensor((8, 8192)),
         "weight": Tensor((2304, 8192)),
-        "positions": Tensor((8,), "int64"),
+        "positions": Tensor((8,), torch.int64),
         "cos_sin": None,
-        "cache_k": Tensor((64, 2, 64), "fp8"),
-        "cache_v": Tensor((64, 2, 64), "fp8"),
-        "locations": Tensor((8,), "int64"),
+        "cache_k": Tensor((64, 2, 64), torch.float8_e4m3fnuz),
+        "cache_v": Tensor((64, 2, 64), torch.float8_e4m3fnuz),
+        "locations": Tensor((8,), torch.int64),
         "mapping": None,
         "eps": 1e-5,
         "q_scale": 1.0,
@@ -173,7 +184,9 @@ def test_k2_uses_boundary_and_shared_router_pooler(monkeypatch):
         _fused_attn_boundary=SimpleNamespace(
             forward=lambda stream, output, branch_dtype: (ffn, stream, None)
         ),
-        mlp=object(),
+        mlp=SimpleNamespace(
+            router_pooler_packed_weight=Tensor((4608, 8192))
+        ),
     )
     monkeypatch.setattr(
         production,
@@ -182,7 +195,7 @@ def test_k2_uses_boundary_and_shared_router_pooler(monkeypatch):
     )
     result = production.K2BaselineAdapter()(
         layer=layer,
-        stream=Tensor((16, 8192), contiguous=False),
+        stream=Tensor((16, 8192), torch.float32, contiguous=False),
         attention_output=Tensor((16, 1024)),
     )
     assert result.value[1:3] == ("scores", "ids")
@@ -214,9 +227,12 @@ def test_k3_calls_aiter_path_active_collective_and_sglang_unpool(monkeypatch):
     unpool.__module__ = "sglang.srt.rocm_muse_spark.model"
     result = production.K3BaselineAdapter(Distributed())(
         x=Tensor((8, 4096)),
-        scores=Tensor((8, 8), "fp32"),
-        ids=Tensor((8, 8), "int32"),
-        experts=object(),
+        scores=Tensor((8, 8), torch.float32),
+        ids=Tensor((8, 8), torch.int32),
+        experts=SimpleNamespace(
+            num_local_experts=32,
+            gfx1250_a8w4=tuple(Tensor((32, 1)) for _ in range(4)),
+        ),
         local_start=0,
         norm_weight=Tensor((4096,)),
         eps=1e-5,

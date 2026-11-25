@@ -88,6 +88,23 @@ def test_shadow_protocol_overwrites_stale_tags_for_the_next_step():
         assert torch.any(tags == current), name
 
 
+def test_step_tag_uses_device_int32_rollover_semantics():
+    from sgl_amd_mono.muse_spark.gfx1250.config import LAYER_SLOTS
+
+    layer = 9
+    rollover = (2**31 - 1 - layer) // LAYER_SLOTS + 1
+    assert step_tag(rollover - 1, layer) > 0
+    assert step_tag(rollover, layer) < 0
+    buffer = _buffer()
+    seed_missing_rank_mailboxes(
+        buffer,
+        rows=8,
+        step=rollover,
+        layer=layer,
+    )
+    assert torch.any(_region_pairs(buffer, "attn")[:, 1] == step_tag(rollover, layer))
+
+
 @pytest.mark.parametrize("active", [1, 2, 4])
 def test_shadow_protocol_supports_active_one_two_or_four(active):
     from sgl_amd_mono.muse_spark.gfx1250.config import MAX_TOKENS

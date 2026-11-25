@@ -480,6 +480,7 @@ def validate_runtime_workload_parity(
 
 def tensor_descriptor(tensor: Any) -> dict[str, Any]:
     """The tensor fields that must match between Baseline and Mono fixtures."""
+    address = int(tensor.data_ptr()) if callable(getattr(tensor, "data_ptr", None)) else 0
     return {
         "shape": list(tensor.shape),
         "dtype": str(tensor.dtype),
@@ -487,6 +488,7 @@ def tensor_descriptor(tensor: Any) -> dict[str, Any]:
         "contiguous": bool(tensor.is_contiguous()),
         "numel": int(tensor.numel()),
         "element_size": int(tensor.element_size()),
+        "data_ptr": address or None,
     }
 
 
@@ -497,6 +499,8 @@ def validate_tensor(
     shape: Sequence[int],
     dtype: Any | None = None,
     contiguous: bool = True,
+    stride: Sequence[int] | None = None,
+    alignment_bytes: int | None = None,
 ) -> dict[str, Any]:
     got_shape = tuple(int(value) for value in tensor.shape)
     want_shape = tuple(int(value) for value in shape)
@@ -505,7 +509,28 @@ def validate_tensor(
         _require(tensor.dtype == dtype, f"{name} dtype {tensor.dtype}, expected {dtype}")
     if contiguous:
         _require(tensor.is_contiguous(), f"{name} must be contiguous")
-    return tensor_descriptor(tensor)
+    if stride is not None:
+        got_stride = tuple(int(value) for value in tensor.stride())
+        want_stride = tuple(int(value) for value in stride)
+        _require(
+            got_stride == want_stride,
+            f"{name} stride {got_stride}, expected {want_stride}",
+        )
+    descriptor = tensor_descriptor(tensor)
+    if alignment_bytes is not None:
+        _require(
+            alignment_bytes > 0
+            and alignment_bytes & (alignment_bytes - 1) == 0,
+            f"{name} alignment must be a positive power of two",
+        )
+        address = descriptor["data_ptr"]
+        _require(address is not None, f"{name} does not expose a data pointer")
+        _require(
+            address % alignment_bytes == 0,
+            f"{name} address {address:#x} is not {alignment_bytes}-byte aligned",
+        )
+        descriptor["required_alignment_bytes"] = alignment_bytes
+    return descriptor
 
 
 def rank_manifest(

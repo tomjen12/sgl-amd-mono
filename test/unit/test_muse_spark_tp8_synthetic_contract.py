@@ -1,8 +1,10 @@
 import sys
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 KERNEL_TESTS = Path(__file__).resolve().parents[1] / "kernels"
 sys.path.insert(0, str(KERNEL_TESTS))
@@ -23,12 +25,118 @@ from tp8_synthetic_contract import (  # noqa: E402
     validate_rank,
     validate_runtime_workload_parity,
     validate_static_contract,
+    validate_tensor,
     validate_kernel_symbol,
     validate_ep8_expert_coverage,
     validate_workload_manifests,
     virtual_expert_ranges,
     workload_manifest,
 )
+from tp8_mono_fixtures import (  # noqa: E402
+    validate_peer_contract,
+    validate_sharded_pooler,
+)
+
+
+def test_validate_tensor_checks_shape_dtype_stride_and_alignment():
+    tensor = torch.empty((8, 16), dtype=torch.bfloat16)
+    descriptor = validate_tensor(
+        "tensor",
+        tensor,
+        shape=(8, 16),
+        dtype=torch.bfloat16,
+        stride=(16, 1),
+        alignment_bytes=16,
+    )
+    assert descriptor["stride"] == [16, 1]
+    assert descriptor["required_alignment_bytes"] == 16
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"shape": (16, 8)}, "shape"),
+        ({"shape": (8, 16), "dtype": torch.float32}, "dtype"),
+        ({"shape": (8, 16), "stride": (1, 8)}, "stride"),
+    ],
+)
+def test_validate_tensor_fails_closed(kwargs, match):
+    tensor = torch.empty((8, 16), dtype=torch.bfloat16)
+    with pytest.raises(ContractError, match=match):
+        validate_tensor("tensor", tensor, **kwargs)
+
+
+def test_validate_tensor_rejects_bad_kv_layout_and_alignment():
+    bad_layout = torch.empty((128, 8), dtype=torch.bfloat16).T
+    with pytest.raises(ContractError, match="contiguous"):
+        validate_tensor(
+            "kattn.k",
+            bad_layout,
+            shape=(8, 128),
+            dtype=torch.bfloat16,
+        )
+    storage = torch.empty(130, dtype=torch.uint8)
+    misaligned = storage[2:].view(torch.bfloat16).reshape(8, 8)
+    with pytest.raises(ContractError, match="aligned"):
+        validate_tensor(
+            "tensor",
+            misaligned,
+            shape=(8, 8),
+            dtype=torch.bfloat16,
+            alignment_bytes=16,
+        )
+
+
+@pytest.mark.parametrize(
+    "active,world,logical,shadows,match",
+    [
+        (4, 2, 8, 4, "active world size"),
+        (4, 4, 4, 4, "logical peer slots"),
+        (4, 4, 8, 3, "shadow slots"),
+    ],
+)
+def test_mono_peer_contract_fails_closed(
+    active, world, logical, shadows, match
+):
+    peers = SimpleNamespace(
+        logical_npes=logical,
+        shadow_bytes=[object()] * shadows,
+    )
+    with pytest.raises(ContractError, match=match):
+        validate_peer_contract(
+            peers,
+            active_npes=active,
+            actual_world=world,
+        )
+
+
+def test_mono_rejects_replicated_pooler():
+    class FakeTensor:
+        shape = (4096, 8192)
+        dtype = torch.bfloat16
+
+        @staticmethod
+        def stride():
+            return (8192, 1)
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+        @staticmethod
+        def numel():
+            return 4096 * 8192
+
+        @staticmethod
+        def element_size():
+            return 2
+
+        @staticmethod
+        def data_ptr():
+            return 0x1000
+
+    with pytest.raises(ContractError, match="sharded_pooler shape"):
+        validate_sharded_pooler(FakeTensor())
 
 
 def _constants(**changes):

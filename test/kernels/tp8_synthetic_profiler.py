@@ -43,13 +43,13 @@ def capture_dispatch(
     trace_path: Path,
     *,
     before_each: Callable[[], None] | None = None,
+    record: bool = True,
 ) -> list[str]:
-    """Profile exactly one pre-warmed launch and return its GPU kernel names."""
+    """Run two dispatches on every rank, but trace only the reporting rank."""
     if before_each is not None:
         before_each()
     launch()
     torch.cuda.synchronize()
-    trace_path.parent.mkdir(parents=True, exist_ok=True)
     activities = [
         torch.profiler.ProfilerActivity.CPU,
         torch.profiler.ProfilerActivity.CUDA,
@@ -64,6 +64,9 @@ def capture_dispatch(
         with torch.profiler.record_function("tp8_synthetic/measured_dispatch"):
             launch()
         torch.cuda.synchronize()
+    if not record:
+        return []
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
     profile.export_chrome_trace(str(trace_path))
     names: list[str] = []
     for event in profile.events():
@@ -93,14 +96,6 @@ def profile_kernel_iterations(
         # Match sequential runtime steps and prevent a later launch from
         # reusing persistent-collective protocol state that is still live.
         torch.cuda.synchronize()
-    if not record:
-        for _ in range(iterations):
-            if before_each is not None:
-                before_each()
-            launch()
-            torch.cuda.synchronize()
-        return []
-    trace_path.parent.mkdir(parents=True, exist_ok=True)
     activities = [
         torch.profiler.ProfilerActivity.CPU,
         torch.profiler.ProfilerActivity.CUDA,
@@ -120,6 +115,9 @@ def profile_kernel_iterations(
                 # This CPU-side wait is intentionally outside the reported
                 # metric: only allowlisted GPU kernel durations are summed.
                 torch.cuda.synchronize()
+    if not record:
+        return []
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
     profile.export_chrome_trace(str(trace_path))
     events = json.loads(trace_path.read_text()).get("traceEvents", [])
     allowed = set(kernel_names)

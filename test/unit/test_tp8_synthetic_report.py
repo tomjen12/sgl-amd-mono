@@ -86,7 +86,11 @@ def test_reports_and_log_are_written(tmp_path):
     assert json.loads((tmp_path / "gap.json").read_text())["dispatch_valid"]
     rendered = render_performance_log(report, "artifacts/example")
     assert "logical TP8/EP8" in rendered
-    assert "k1 8 2 10.500 1 8.500 -2.000" in rendered
+    assert "baseline avg us" in rendered
+    assert "k1" in rendered
+    assert "10.500" in rendered
+    assert "8.500" in rendered
+    assert "-2.000" in rendered
 
 
 def test_failed_dispatch_invalidates_gap(tmp_path):

@@ -24,12 +24,16 @@ from tp8_p1_host_contract import (  # noqa: E402
     KVContract,
     P1ContractError,
     deterministic_routing_cases,
+    bf16_boundary_dispatch,
     expected_execution,
     layer_variant_matrix,
+    logical_rank_batches,
     repeat_fixture_plan,
     routing_histogram,
     validate_execution,
+    validate_bf16_dispatch,
     validate_launch_contract,
+    validate_logical_rank_observations,
     validate_reference_manifest,
     validate_repeat_observations,
     whole_layer_reference_schema,
@@ -70,6 +74,49 @@ def test_routing_cases_reject_non_gate_widths():
     for rows in (1, 24, 32, 64):
         with pytest.raises(P1ContractError, match="expected one of"):
             deterministic_routing_cases(rows)
+
+
+@pytest.mark.parametrize(
+    ("active_gpus", "expected"),
+    [
+        (1, tuple((rank,) for rank in range(8))),
+        (2, ((0, 1), (2, 3), (4, 5), (6, 7))),
+    ],
+)
+def test_active_one_two_batch_schedule_covers_logical_ranks(active_gpus, expected):
+    assert logical_rank_batches(active_gpus) == expected
+    observations = [
+        {
+            "logical_ranks": ranks,
+            "active_gpus": active_gpus,
+            "runtime_mapping_hash": f"mapping-{index}",
+            "status": "passed",
+        }
+        for index, ranks in enumerate(expected)
+    ]
+    validate_logical_rank_observations(active_gpus, observations)
+
+
+def test_logical_rank_coverage_rejects_missing_reordered_or_unmapped_batch():
+    observations = [
+        {
+            "logical_ranks": ranks,
+            "active_gpus": 2,
+            "runtime_mapping_hash": f"mapping-{index}",
+            "status": "passed",
+        }
+        for index, ranks in enumerate(logical_rank_batches(2))
+    ]
+    for field, bad in (
+        ("logical_ranks", (3, 2)),
+        ("active_gpus", 1),
+        ("runtime_mapping_hash", ""),
+        ("status", "failed"),
+    ):
+        broken = [dict(item) for item in observations]
+        broken[1][field] = bad
+        with pytest.raises(P1ContractError):
+            validate_logical_rank_observations(2, broken)
 
 
 def test_full_swa_v1_v2_width_matrix_is_complete():
@@ -133,6 +180,48 @@ def test_execution_order_covers_transition_and_last_layer_rules():
     assert next(event for event in last if event.stage == "k3").expert_family == "bf16"
     with pytest.raises(P1ContractError, match="last layer"):
         expected_execution(layer=61, variant=_variant(version="v2"))
+
+
+@pytest.mark.parametrize("layer", [0, 61])
+@pytest.mark.parametrize("attention", ["full", "swa"])
+def test_bf16_boundary_dispatch_uses_sglang_experts_not_mxfp4_k3(
+    layer, attention
+):
+    next_k1 = layer == 0
+    observed = bf16_boundary_dispatch(
+        layer=layer, attention=attention, next_k1=next_k1
+    )
+    observed["operator_sequence"] = (
+        "mono_k1",
+        "mono_kattn",
+        "mono_k2",
+        "sglang_tpx_bf16",
+    ) + (("mono_k1_next",) if next_k1 else ())
+    validate_bf16_dispatch(
+        observed,
+        layer=layer,
+        attention=attention,
+        next_k1=next_k1,
+    )
+
+
+def test_bf16_boundary_dispatch_rejects_mxfp4_and_bad_last_next_k1():
+    observed = bf16_boundary_dispatch(
+        layer=0, attention="full", next_k1=True
+    )
+    observed["operator_sequence"] = (
+        "mono_k1",
+        "mono_kattn",
+        "mono_k2",
+        "mono_mxfp4_k3",
+        "mono_k1_next",
+    )
+    with pytest.raises(P1ContractError, match="expert operator"):
+        validate_bf16_dispatch(
+            observed, layer=0, attention="full", next_k1=True
+        )
+    with pytest.raises(P1ContractError, match="last"):
+        bf16_boundary_dispatch(layer=61, attention="swa", next_k1=True)
 
 
 def test_execution_order_rejects_duplicate_current_k1_and_wrong_variant():

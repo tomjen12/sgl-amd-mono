@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import torch
@@ -58,6 +59,15 @@ def _run_baseline_benchmark(
     )
     from tp8_synthetic_report import Sample, write_reports
 
+    control_group = dist.new_group(backend="gloo")
+
+    def control_barrier() -> None:
+        dist.monitored_barrier(
+            group=control_group,
+            timeout=timedelta(seconds=120),
+            wait_all_ranks=True,
+        )
+
     derive_layer = args.stage in ("all", "layer")
     stages = (
         ("k1", "kattn_full", "kattn_window", "k2", "k3")
@@ -100,7 +110,7 @@ def _run_baseline_benchmark(
                 )
             else:
                 raise NotImplementedError(f"Baseline stage {stage!r}")
-            dist.barrier()
+            control_barrier()
             trace = (
                 args.output_dir
                 / "traces"
@@ -113,7 +123,16 @@ def _run_baseline_benchmark(
                 captured["result"] = result
                 return result
 
-            names = capture_dispatch(recorded_launch, trace)
+            names = capture_dispatch(
+                recorded_launch,
+                trace,
+                record=rank == 0,
+            )
+            names_box: list[list[str] | None] = [names if rank == 0 else None]
+            dist.broadcast_object_list(names_box, src=0, group=control_group)
+            names = names_box[0]
+            if names is None:
+                raise ContractError("rank 0 did not publish Baseline kernel names")
             result = captured.get("result")
             if result is None:
                 raise ContractError(
@@ -136,7 +155,7 @@ def _run_baseline_benchmark(
                 active_npes=world,
             )
             all_evidence.append(evidence)
-            dist.barrier()
+            control_barrier()
             timings = (
                 profile_kernel_iterations(
                     prepared.launch,
@@ -146,7 +165,7 @@ def _run_baseline_benchmark(
                     kernel_names=names,
                     warmup=args.warmup,
                     iterations=args.iterations,
-                    before_each=dist.barrier,
+                    before_each=control_barrier,
                     record=rank == 0,
                 )
                 if args.profile == "torch"
@@ -154,7 +173,7 @@ def _run_baseline_benchmark(
                     prepared.launch,
                     warmup=args.warmup,
                     iterations=args.iterations,
-                    before_each=dist.barrier,
+                    before_each=control_barrier,
                 )
             )
             all_samples.extend(
@@ -170,8 +189,8 @@ def _run_baseline_benchmark(
                 )
                 for index, value in enumerate(timings)
             )
-            dist.barrier()
-    if derive_layer:
+            control_barrier()
+    if derive_layer and rank == 0:
         grouped = {
             (sample.width, sample.iteration, sample.stage): sample
             for sample in all_samples
@@ -203,20 +222,15 @@ def _run_baseline_benchmark(
                             total_us=sum(item.total_us for item in items),
                         )
                     )
-    gathered_evidence: list[list[dict] | None] = [None] * world
-    gathered_samples: list[list[Sample] | None] = [None] * world
-    dist.all_gather_object(gathered_evidence, all_evidence)
-    dist.all_gather_object(gathered_samples, all_samples)
+    control_barrier()
     if rank == 0:
-        evidence = [item for group in gathered_evidence if group for item in group]
-        samples = [item for group in gathered_samples if group for item in group]
         _write_json(
             args.output_dir / "baseline_dispatch.json",
-            {"status": "passed", "dispatches": evidence},
+            {"status": "passed", "dispatches": all_evidence},
         )
         write_reports(
             args.output_dir,
-            samples,
+            all_samples,
             metadata={
                 "widths": list(widths),
                 "warmup": args.warmup,
@@ -225,6 +239,7 @@ def _run_baseline_benchmark(
             },
             dispatch_valid=True,
         )
+    dist.destroy_process_group(control_group)
 
 
 def _read_samples(path: Path) -> list:
@@ -293,6 +308,14 @@ def _run_mono_benchmark(
     local_samples: list[Sample] = []
     local_dispatch: list[dict] = []
     peer_group = dist.new_group(backend="gloo")
+
+    def control_barrier() -> None:
+        dist.monitored_barrier(
+            group=peer_group,
+            timeout=timedelta(seconds=120),
+            wait_all_ranks=True,
+        )
+
     try:
         for rows in widths:
             for stage in stages:
@@ -314,16 +337,30 @@ def _run_mono_benchmark(
                 try:
                     def before_each() -> None:
                         prepared.before_each()
-                        dist.barrier()
+                        control_barrier()
 
-                    dist.barrier()
+                    control_barrier()
                     names = capture_dispatch(
                         prepared.launch,
                         args.output_dir
                         / "traces"
                         / f"mono-{stage}-w{rows}-rank{rank}.json",
                         before_each=before_each,
+                        record=rank == 0,
                     )
+                    names_box: list[list[str] | None] = [
+                        names if rank == 0 else None
+                    ]
+                    dist.broadcast_object_list(
+                        names_box,
+                        src=0,
+                        group=peer_group,
+                    )
+                    names = names_box[0]
+                    if names is None:
+                        raise ContractError(
+                            "rank 0 did not publish Mono kernel names"
+                        )
                     if len(names) != 1:
                         raise ContractError(
                             f"Mono {stage} width {rows} rank {rank}: "
@@ -363,7 +400,7 @@ def _run_mono_benchmark(
                             else None,
                         }
                     )
-                    dist.barrier()
+                    control_barrier()
                     timings = (
                         profile_kernel_iterations(
                             prepared.launch,
@@ -400,30 +437,20 @@ def _run_mono_benchmark(
                         )
                         for index, value in enumerate(timings)
                     )
-                    dist.barrier()
+                    control_barrier()
                 finally:
                     prepared.close()
     finally:
-        dist.destroy_process_group(peer_group)
-    gathered_samples: list[list[Sample] | None] = [None] * world
-    gathered_dispatch: list[list[dict] | None] = [None] * world
-    dist.all_gather_object(gathered_samples, local_samples)
-    dist.all_gather_object(gathered_dispatch, local_dispatch)
+        pass
+    control_barrier()
     if rank == 0:
-        mono_samples = [
-            item for group in gathered_samples if group for item in group
-        ]
+        mono_samples = local_samples
         baseline_samples = _read_samples(args.output_dir / "raw.csv")
         _write_json(
             args.output_dir / "mono_dispatch.json",
             {
                 "status": "passed",
-                "dispatches": [
-                    item
-                    for group in gathered_dispatch
-                    if group
-                    for item in group
-                ],
+                "dispatches": local_dispatch,
             },
         )
         baseline_dispatch = args.output_dir / "baseline_dispatch.json"
@@ -442,9 +469,7 @@ def _run_mono_benchmark(
             ]
             mono_workloads = [
                 item["workload"]
-                for group in gathered_dispatch
-                if group
-                for item in group
+                for item in local_dispatch
                 if item.get("workload") is not None
             ]
             parity = validate_runtime_workload_parity(
@@ -477,6 +502,7 @@ def _run_mono_benchmark(
         (repository_root / "TP8_4GPU_SYNTHETIC_PERFORMANCE.log").write_text(
             performance_log + "\n"
         )
+    dist.destroy_process_group(peer_group)
 
 
 def _run_numerical_parity(
@@ -539,6 +565,9 @@ def _run_numerical_parity(
                         rank,
                         torch.device("cuda"),
                         active_npes=world,
+                        controlled_package=getattr(
+                            args, "_controlled_routing_package", None
+                        ),
                     )
                 )
                 if baseline.fixture is None:
@@ -596,51 +625,70 @@ def _run_numerical_parity(
                     mono.launch()
                     torch.cuda.synchronize()
                     mono_outputs = mono.outputs()
-                    if stage in ("kattn_full", "kattn_window"):
-                        # Production Baseline uses FP8 Q/P and fuses
-                        # reduce+norm+gate; PR #172 uses BF16 P and moves
-                        # norm+gate into K2.  Validate both against their
-                        # independent PyTorch precision-family reference.
-                        baseline_reference = kattn_post_norm_gate(
-                            kattn_reference(
+                    comparison_error = None
+                    try:
+                        if stage in ("kattn_full", "kattn_window"):
+                            # Production Baseline uses FP8 Q/P and fuses
+                            # reduce+norm+gate; PR #172 uses BF16 P and moves
+                            # norm+gate into K2.  Validate both against their
+                            # independent PyTorch precision-family reference.
+                            baseline_reference = kattn_post_norm_gate(
+                                kattn_reference(
+                                    baseline.fixture,
+                                    fp8_qp=stage == "kattn_full",
+                                ),
+                                baseline.fixture.gate,
+                            )
+                            mono_reference = kattn_reference(
                                 baseline.fixture,
-                                fp8_qp=stage == "kattn_full",
-                            ),
-                            baseline.fixture.gate,
-                        )
-                        mono_reference = kattn_reference(
-                            baseline.fixture,
-                            fp8_qp=False,
-                        )
-                        baseline_check = compare_outputs(
-                            {"baseline_output": baseline_reference},
-                            {
-                                "baseline_output": baseline_outputs[
-                                    "output"
-                                ]
-                            },
-                        )
-                        mono_check = compare_outputs(
-                            {"mono_output": mono_reference},
-                            {"mono_output": mono_outputs["output"]},
-                        )
-                        comparison = {
-                            "status": "passed",
-                            "comparison_kind": (
-                                "dual-independent-pytorch-reference"
-                            ),
-                            "checks": [
-                                *baseline_check["checks"],
-                                *mono_check["checks"],
-                            ],
-                        }
-                    else:
-                        comparison = compare_outputs(
-                            baseline_outputs,
-                            mono_outputs,
+                                fp8_qp=False,
+                            )
+                            baseline_check = compare_outputs(
+                                {"baseline_output": baseline_reference},
+                                {
+                                    "baseline_output": baseline_outputs[
+                                        "output"
+                                    ]
+                                },
+                            )
+                            mono_check = compare_outputs(
+                                {"mono_output": mono_reference},
+                                {"mono_output": mono_outputs["output"]},
+                            )
+                            comparison = {
+                                "status": "passed",
+                                "comparison_kind": (
+                                    "dual-independent-pytorch-reference"
+                                ),
+                                "checks": [
+                                    *baseline_check["checks"],
+                                    *mono_check["checks"],
+                                ],
+                            }
+                        else:
+                            comparison = compare_outputs(
+                                baseline_outputs,
+                                mono_outputs,
+                            )
+                    except Exception as exc:
+                        comparison_error = (
+                            f"rank {rank} {stage} width {rows}: "
+                            f"{type(exc).__name__}: {exc}"
                         )
                 finally:
                     mono.close()
+                comparison_errors: list[str | None] = [None] * world
+                dist.all_gather_object(
+                    comparison_errors,
+                    comparison_error,
+                    group=peer_group,
+                )
+                failures = [item for item in comparison_errors if item]
+                if failures:
+                    raise ContractError(
+                        "distributed numerical parity failed: "
+                        + " | ".join(failures)
+                    )
                 comparison.update(
                     stage=stage,
                     width=rows,
@@ -673,18 +721,470 @@ def _run_numerical_parity(
         )
 
 
+def _run_routing_stress(
+    args: argparse.Namespace,
+    widths: tuple[int, ...],
+    rank: int,
+    world: int,
+) -> None:
+    """Strict independent-PyTorch-vs-Mono K3 check for one isolated case."""
+    from tp8_mono_fixtures import prepare_mono
+    from tp8_numerical_parity import compare_outputs
+    from tp8_logical_case import (
+        build_k3_case,
+        k3_local_reference,
+        k3_reduce_unpool_reference,
+    )
+    from tp8_p1_host_contract import deterministic_routing_cases, routing_histogram
+
+    if widths != (8,):
+        raise ContractError(f"Phase C routing stress is Width 8 only, got {widths}")
+    requested = os.environ.get("TP8_ROUTING_STRESS_CASE")
+    cases = {
+        routing.name: routing for routing in deterministic_routing_cases(8)
+    }
+    if requested not in cases:
+        raise ContractError(
+            "TP8_ROUTING_STRESS_CASE must select exactly one of "
+            f"{tuple(cases)}; got {requested!r}"
+        )
+    routing = cases[requested]
+    peer_group = dist.new_group(backend="gloo")
+    local_results = []
+    try:
+        case = build_k3_case(
+            8, rank, world, torch.device("cuda")
+        )
+        case.ids.copy_(
+            torch.tensor(routing.ids, dtype=case.ids.dtype, device=case.ids.device)
+        )
+        case.scores.copy_(
+            torch.tensor(
+                routing.scores,
+                dtype=case.scores.dtype,
+                device=case.scores.device,
+            )
+        )
+        local_reference = k3_local_reference(case).cpu()
+        gathered_partials: list[torch.Tensor | None] = [None] * world
+        dist.all_gather_object(
+            gathered_partials, local_reference, group=peer_group
+        )
+        if any(item is None for item in gathered_partials):
+            raise ContractError(
+                f"{routing.name}: incomplete PyTorch reference gather"
+            )
+        expected = k3_reduce_unpool_reference(
+            case,
+            tuple(
+                item
+                for item in gathered_partials
+                if item is not None
+            ),
+        )
+        mono = prepare_mono(
+            "k3",
+            8,
+            rank,
+            peer_group=peer_group,
+            active_npes=world,
+            logical_case=case,
+        )
+        try:
+            mono.before_each()
+            dist.barrier(group=peer_group)
+            mono.launch()
+            torch.cuda.synchronize()
+            comparison = compare_outputs(expected, mono.outputs())
+        finally:
+            mono.close()
+        comparison.update(
+            routing_case=routing.name,
+            rank=rank,
+            width=8,
+            histogram=routing_histogram(routing),
+            expected_zero_local_rank=routing.expected_zero_local_rank,
+            tied_scores=routing.tied_scores,
+            active_npes=world,
+            logical_npes=CONTRACT.logical_tp,
+            reference_kind="independent-decoded-weight-pytorch",
+            baseline_oracle_used=False,
+        )
+        local_results.append(comparison)
+        dist.barrier(group=peer_group)
+        gathered: list[list[dict] | None] = [None] * world
+        dist.all_gather_object(gathered, local_results, group=peer_group)
+        results = [item for group in gathered if group for item in group]
+        if rank == 0:
+            _write_json(
+                args.output_dir / "routing_stress.json",
+                {
+                    "status": "passed",
+                    "comparison": "strict-independent-pytorch-vs-mono",
+                    "reference": {
+                        "decoded_checkpoint_weights": True,
+                        "mono_split_dependency": False,
+                        "baseline_dependency": False,
+                        "semantics": [
+                            "block32_mxfp8_input",
+                            "decoded_mxfp4_up_gate_down",
+                            "per_expert_post_norm",
+                            "score_weighted_slot_finalize",
+                            "rank_order_bf16_tp_reduce",
+                            "bf16_unpool",
+                            "post_norm_residual_pre_norm",
+                        ],
+                    },
+                    "routing_case": routing.name,
+                    "width": 8,
+                    "active_npes": world,
+                    "logical_npes": CONTRACT.logical_tp,
+                    "results": results,
+                },
+            )
+    finally:
+        dist.destroy_process_group(peer_group)
+
+
+def _run_logical_rank_batch(
+    args: argparse.Namespace,
+    widths: tuple[int, ...],
+    rank: int,
+    world: int,
+) -> None:
+    """Cover one active1/2 batch of logical EP ownership ranks."""
+    from tp8_logical_case import (
+        build_k3_case,
+        k3_local_reference,
+        k3_reduce_unpool_reference,
+    )
+    from tp8_mono_fixtures import prepare_mono
+    from tp8_numerical_parity import compare_outputs
+
+    if widths != (8,) or world not in (1, 2):
+        raise ContractError(
+            f"logical-rank batch requires Width 8 active1/2, got {widths} active{world}"
+        )
+    try:
+        logical_ranks = tuple(
+            int(value)
+            for value in os.environ["TP8_LOGICAL_RANKS"].split(",")
+        )
+    except (KeyError, ValueError) as exc:
+        raise ContractError("invalid TP8_LOGICAL_RANKS batch") from exc
+    if (
+        len(logical_ranks) != world
+        or len(set(logical_ranks)) != world
+        or any(not 0 <= value < CONTRACT.logical_ep for value in logical_ranks)
+    ):
+        raise ContractError(
+            f"logical-rank batch {logical_ranks}, expected {world} unique ranks 0..7"
+        )
+    peer_group = dist.new_group(backend="gloo")
+    try:
+        logical_rank = logical_ranks[rank]
+        case = build_k3_case(
+            8,
+            rank,
+            world,
+            torch.device("cuda"),
+            logical_rank=logical_rank,
+        )
+        if (
+            case.dec13.shape[0] != CONTRACT.local_experts
+            or case.local_start != logical_rank * CONTRACT.local_experts
+        ):
+            raise ContractError("logical-rank fixture lost TP8 32-expert ownership")
+        local_reference = k3_local_reference(case).cpu()
+        gathered_partials: list[torch.Tensor | None] = [None] * world
+        dist.all_gather_object(
+            gathered_partials, local_reference, group=peer_group
+        )
+        expected = k3_reduce_unpool_reference(
+            case,
+            tuple(item for item in gathered_partials if item is not None),
+        )
+        mono = prepare_mono(
+            "k3",
+            8,
+            rank,
+            peer_group=peer_group,
+            active_npes=world,
+            logical_case=case,
+        )
+        try:
+            mono.before_each()
+            dist.barrier(group=peer_group)
+            mono.launch()
+            torch.cuda.synchronize()
+            comparison = compare_outputs(expected, mono.outputs())
+        finally:
+            mono.close()
+        comparison.update(
+            physical_rank=rank,
+            logical_rank=logical_rank,
+            local_start=case.local_start,
+            local_experts=CONTRACT.local_experts,
+            width=8,
+            logical_npes=CONTRACT.logical_tp,
+            active_npes=world,
+            specialization="W8",
+        )
+        gathered_results: list[dict | None] = [None] * world
+        dist.all_gather_object(
+            gathered_results, comparison, group=peer_group
+        )
+        if rank == 0:
+            mapping = [
+                {
+                    "physical_rank": physical,
+                    "logical_rank": logical,
+                    "expert_start": logical * CONTRACT.local_experts,
+                    "expert_end": (logical + 1) * CONTRACT.local_experts,
+                }
+                for physical, logical in enumerate(logical_ranks)
+            ]
+            mapping_hash = hashlib.sha256(
+                json.dumps(
+                    mapping, separators=(",", ":"), sort_keys=True
+                ).encode()
+            ).hexdigest()
+            _write_json(
+                args.output_dir / "logical_rank_batch.json",
+                {
+                    "status": "passed",
+                    "width": 8,
+                    "specialization": "W8",
+                    "logical_tp": CONTRACT.logical_tp,
+                    "logical_ep": CONTRACT.logical_ep,
+                    "active_gpus": world,
+                    "logical_ranks": logical_ranks,
+                    "local_experts_per_rank": CONTRACT.local_experts,
+                    "physical_communication_slots": tuple(range(world)),
+                    "coverage_kind": "logical-ep-ownership-batch",
+                    "mapping": mapping,
+                    "runtime_mapping_hash": mapping_hash,
+                    "results": [
+                        item for item in gathered_results if item is not None
+                    ],
+                },
+            )
+    finally:
+        dist.destroy_process_group(peer_group)
+
+
+def _run_whole_layer_reference(
+    args: argparse.Namespace,
+    widths: tuple[int, ...],
+    rank: int,
+    world: int,
+) -> None:
+    """One isolated Full/SWA V1/V2 Mono layer against independent PyTorch."""
+    from tp8_mono_fixtures import prepare_mono
+    from tp8_numerical_parity import compare_outputs
+    from tp8_whole_layer_reference import whole_layer_reference
+
+    case = os.environ.get("TP8_WHOLE_LAYER_REFERENCE_CASE")
+    allowed = {
+        "layer_v1_full": ("layer_v1", False, False),
+        "layer_v1_swa": ("layer_v1", True, False),
+        "layer_v2_full": ("layer_v2", False, True),
+        "layer_v2_swa": ("layer_v2", True, True),
+    }
+    if widths != (8,) or world != 4 or case not in allowed:
+        raise ContractError(
+            f"whole-layer reference requires Width8 active4 and one of {tuple(allowed)}"
+        )
+    stage, window, next_k1 = allowed[case]
+    peer_group = dist.new_group(backend="gloo")
+    prepared = prepare_mono(
+        stage,
+        8,
+        rank,
+        window=window,
+        peer_group=peer_group,
+        active_npes=world,
+    )
+    try:
+        layer = prepared.protocol["layer"]
+        buffers = prepared.protocol["buffers"]
+        expected = whole_layer_reference(
+            layer=layer,
+            buffers=buffers,
+            rank=rank,
+            world=world,
+            peer_group=peer_group,
+            window=2047 if window else 0,
+            next_k1=next_k1,
+        )
+        prepared.before_each()
+        dist.barrier(group=peer_group)
+        prepared.launch()
+        torch.cuda.synchronize()
+        actual = prepared.outputs()
+        checks = []
+        failures = []
+        for name in expected:
+            try:
+                result = compare_outputs(
+                    {name: expected[name]}, {name: actual[name]}
+                )
+                checks.extend(result["checks"])
+            except Exception as exc:
+                failures.append(f"{name}: {exc}")
+        comparison = {
+            "status": "failed" if failures else "passed",
+            "checks": checks,
+            "failures": failures,
+            "case": case,
+            "rank": rank,
+            "width": 8,
+            "active_npes": world,
+            "logical_npes": CONTRACT.logical_tp,
+            "reference_kind": "independent-whole-layer-pytorch",
+            "dependencies": ["logical_inputs", "decoded_checkpoint_weights"],
+            "forbidden_dependencies_used": [],
+        }
+        gathered: list[dict | None] = [None] * world
+        dist.all_gather_object(gathered, comparison, group=peer_group)
+        if rank == 0:
+            _write_json(
+                args.output_dir / "whole_layer_reference.json",
+                {
+                    "status": "failed" if failures else "passed",
+                    "case": case,
+                    "width": 8,
+                    "active_npes": world,
+                    "logical_npes": CONTRACT.logical_tp,
+                    "reference": {
+                        "producer_kind": "independent_reference",
+                        "mono_split_dependency": False,
+                        "baseline_dependency": False,
+                        "decoded_checkpoint_weights": True,
+                        "attention": "full" if not window else "swa",
+                        "layer_version": "v2" if next_k1 else "v1",
+                    },
+                    "results": [item for item in gathered if item is not None],
+                },
+            )
+        if failures:
+            raise ContractError(
+                f"{case} independent whole-layer mismatches: "
+                + " | ".join(failures)
+            )
+    finally:
+        prepared.close()
+        dist.destroy_process_group(peer_group)
+
+
+def _run_graph_tests(
+    args: argparse.Namespace,
+    widths: tuple[int, ...],
+    rank: int,
+    world: int,
+) -> None:
+    from tp8_graph_tests import STAGES, run_graph_case
+
+    if widths != (8,):
+        raise ContractError(f"Phase B graph gate is Width 8 only, got {widths}")
+    stages = (
+        STAGES
+        if args.stage == "all"
+        else ("kattn_full", "kattn_window")
+        if args.stage == "kattn"
+        else (
+            "layer_v1_full",
+            "layer_v1_swa",
+            "layer_v2_full",
+            "layer_v2_swa",
+        )
+        if args.stage == "layer"
+        else (args.stage,)
+    )
+    implementations = (
+        ("baseline", "mono") if args.impl == "both" else (args.impl,)
+    )
+    peer_group = dist.new_group(backend="gloo")
+    try:
+        local_results = []
+        for stage in stages:
+            for implementation in implementations:
+                try:
+                    result = run_graph_case(
+                        implementation=implementation,
+                        stage=stage,
+                        rank=rank,
+                        world=world,
+                        peer_group=peer_group,
+                        replays=args.iterations,
+                    )
+                except Exception as exc:
+                    result = {
+                        "status": "failed",
+                        "implementation": implementation,
+                        "stage": stage,
+                        "width": 8,
+                        "rank": rank,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                local_results.append(result)
+                dist.barrier(group=peer_group)
+        gathered: list[list[dict] | None] = [None] * world
+        dist.all_gather_object(gathered, local_results, group=peer_group)
+        results = [item for group in gathered if group for item in group]
+        failures = [item for item in results if item["status"] != "passed"]
+        if rank == 0:
+            _write_json(
+                args.output_dir / "graph_correctness.json",
+                {
+                    "status": "failed" if failures else "passed",
+                    "width": 8,
+                    "active_npes": world,
+                    "logical_npes": CONTRACT.logical_tp,
+                    "resident_cu": 96,
+                    "final_profile": False,
+                    "results": results,
+                },
+            )
+        dist.barrier(group=peer_group)
+        if failures:
+            raise ContractError(
+                "graph gate failures: "
+                + " | ".join(
+                    f"rank {item['rank']} {item['implementation']} "
+                    f"{item['stage']}: {item['error']}"
+                    for item in failures
+                )
+            )
+    finally:
+        dist.destroy_process_group(peer_group)
+
+
 def _args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Muse Spark TP8-local/four-active-rank synthetic harness"
     )
     parser.add_argument(
         "--mode",
-        choices=("contract", "check", "correctness", "parity", "benchmark"),
+        choices=("contract", "check", "correctness", "parity", "graph", "benchmark"),
         default="check",
     )
     parser.add_argument(
         "--stage",
-        choices=("k1", "kattn", "k2", "k3", "layer", "all"),
+        choices=(
+            "k1",
+            "kattn",
+            "kattn_full",
+            "kattn_window",
+            "k2",
+            "k3",
+            "layer",
+            "layer_v1_full",
+            "layer_v1_swa",
+            "layer_v2_full",
+            "layer_v2_swa",
+            "all",
+        ),
         default="all",
     )
     parser.add_argument("--widths", default="8,16")
@@ -697,6 +1197,8 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--active-gpus", type=int, choices=(1, 2, 4), default=4)
+    parser.add_argument("--routing-package", type=Path)
+    parser.add_argument("--require-routing-equivalent", action="store_true")
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
 
@@ -1011,6 +1513,54 @@ def _validate_stage_results(stage: str, rows: int, results: list[dict]) -> None:
 def main() -> int:
     args = _args()
     widths = parse_widths(args.widths)
+    args._controlled_routing_package = None
+    controlled = args.routing_package is not None or args.require_routing_equivalent
+    if controlled and args.stage != "k3":
+        raise ContractError(
+            "--routing-package and --require-routing-equivalent are legal only for --stage=k3"
+        )
+    if args.require_routing_equivalent and args.routing_package is None:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(
+            args.output_dir / "controlled_routing.json",
+            {
+                "status": "blocked",
+                "reason": "GB300 controlled-routing package was not supplied",
+                "local_fallback_used": False,
+            },
+        )
+        raise ContractError(
+            "--require-routing-equivalent needs a GB300 --routing-package; "
+            "local fixture fallback is forbidden"
+        )
+    if args.routing_package is not None:
+        from tp8_controlled_routing import load_package
+
+        package = load_package(args.routing_package)
+        if widths != (package.width,):
+            raise ContractError(
+                f"routing package width {package.width}, requested widths={widths}"
+            )
+        args._controlled_routing_package = package
+        if args.require_routing_equivalent:
+            args.output_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(
+                args.output_dir / "controlled_routing.json",
+                {
+                    "status": "blocked",
+                    "reason": (
+                        "active-four synthetic K3 does not expose a complete "
+                        "production-runtime TP8 expert ownership mapping"
+                    ),
+                    "canonical_hashes": dict(package.hashes),
+                    "local_fallback_used": False,
+                    "gpu_correctness_claimed": False,
+                },
+            )
+            raise ContractError(
+                "controlled routing equivalence is blocked until the complete "
+                "MI455 production-runtime TP8 ownership mapping is captured"
+            )
     deferred = tuple(width for width in widths if width not in (8, 16))
     if deferred:
         raise ContractError(
@@ -1029,7 +1579,7 @@ def main() -> int:
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
-    sglang_parallel = args.mode in ("parity", "benchmark")
+    sglang_parallel = args.mode in ("parity", "graph", "benchmark")
     if sglang_parallel:
         from sglang.srt.distributed.parallel_state import (
             init_distributed_environment,
@@ -1087,6 +1637,25 @@ def main() -> int:
 
         if rank == 0:
             args.output_dir.mkdir(parents=True, exist_ok=True)
+            if args._controlled_routing_package is not None:
+                _write_json(
+                    args.output_dir / "controlled_routing.json",
+                    {
+                        "status": "diagnostic-package-loaded",
+                        "producer": "gb300",
+                        "width": args._controlled_routing_package.width,
+                        "canonical_hashes": dict(
+                            args._controlled_routing_package.hashes
+                        ),
+                        "routing_equivalent": False,
+                        "reason": (
+                            "complete production-runtime TP8 ownership mapping "
+                            "has not been captured"
+                        ),
+                        "local_fallback_used": False,
+                        "gpu_correctness_claimed": False,
+                    },
+                )
             _write_json(
                 args.output_dir / "shape_contract.json",
                 {
@@ -1195,11 +1764,22 @@ def main() -> int:
                     flush=True,
                 )
         elif args.mode == "parity":
-            _run_numerical_parity(args, widths, rank, world)
+            stress_case = os.environ.get("TP8_ROUTING_STRESS_CASE")
+            logical_batch = os.environ.get("TP8_LOGICAL_RANKS")
+            whole_layer = os.environ.get("TP8_WHOLE_LAYER_REFERENCE_CASE")
+            if whole_layer:
+                _run_whole_layer_reference(args, widths, rank, world)
+            elif logical_batch:
+                _run_logical_rank_batch(args, widths, rank, world)
+            elif stress_case:
+                _run_routing_stress(args, widths, rank, world)
+            else:
+                _run_numerical_parity(args, widths, rank, world)
+        elif args.mode == "graph":
+            _run_graph_tests(args, widths, rank, world)
         elif args.mode == "benchmark":
             if args.impl in ("baseline", "both"):
                 _run_baseline_benchmark(args, widths, rank, world)
-            dist.barrier()
             if args.impl in ("mono", "both"):
                 _run_mono_benchmark(args, widths, rank, world)
         if rank == 0:

@@ -27,7 +27,9 @@ def step_tag(step: int, layer: int) -> int:
 
     if step < 0 or layer < 0:
         raise ContractError(f"invalid mailbox step/layer {step}/{layer}")
-    return step * LAYER_SLOTS + layer + 1
+    # Device tags are int32 and equality remains valid across signed rollover.
+    value = (step * LAYER_SLOTS + layer + 1) & 0xFFFFFFFF
+    return value - (1 << 32) if value >= 1 << 31 else value
 
 
 def _pairs(

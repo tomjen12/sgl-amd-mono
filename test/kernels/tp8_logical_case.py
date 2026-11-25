@@ -60,12 +60,141 @@ class LogicalK3Case:
     seed: int
 
 
+def _mx8_dequant_reference(value: torch.Tensor) -> torch.Tensor:
+    """Independent block-32 MXFP8 quantize/dequantize used by K3's A8W4 path."""
+    shape = value.shape
+    blocks = value.float().reshape(*shape[:-1], -1, 32)
+    amax = blocks.abs().amax(-1, keepdim=True)
+    # Exact fp32 bit pattern used by the production quantizer for 1 / 448.
+    inv448 = torch.tensor(
+        [0x3B124925], dtype=torch.int32, device=value.device
+    ).view(torch.float32)
+    scaled_amax = (amax * inv448).view(torch.int32)
+    exponent = ((scaled_amax >> 23) & 0xFF) + (
+        (scaled_amax & 0x7FFFFF) != 0
+    ).to(torch.int32)
+    exponent = exponent.clamp(0, 254)
+    quantized = (
+        blocks
+        * torch.ldexp(torch.ones_like(amax), 127 - exponent)
+    ).to(torch.float8_e4m3fn)
+    return (
+        quantized.float()
+        * torch.ldexp(torch.ones_like(amax), exponent - 127)
+    ).reshape(shape)
+
+
+def _bf16_round(value: torch.Tensor) -> torch.Tensor:
+    return value.to(torch.bfloat16).float()
+
+
+def k3_local_reference(case: LogicalK3Case) -> torch.Tensor:
+    """Decoded-expert K3 partial through per-expert finalize, before TP reduce.
+
+    This path consumes only logical fixture tensors and decoded checkpoint
+    weights.  It does not call Baseline operators, Mono kernels, or split-stage
+    outputs.
+    """
+    rows, top_k = case.ids.shape
+    intermediate = case.dec13.shape[1] // 2
+    local_experts = case.dec13.shape[0]
+    x_quantized = _mx8_dequant_reference(case.xin.float())
+    partial = torch.zeros(
+        rows,
+        case.dec2.shape[1],
+        dtype=torch.float32,
+        device=case.xin.device,
+    )
+    post_eps = 1e-5
+    for token in range(rows):
+        for slot in range(top_k):
+            local = int(case.ids[token, slot].item()) - case.local_start
+            if not 0 <= local < local_experts:
+                continue
+            gate_up = x_quantized[token] @ case.dec13[local].T
+            gate, up = gate_up[:intermediate], gate_up[intermediate:]
+            activated = _mx8_dequant_reference(
+                gate * torch.sigmoid(gate) * up
+            )
+            expert = _bf16_round(activated @ case.dec2[local].T)
+            normalized = _bf16_round(
+                expert * case.weights["pen_w"].float()
+            )
+            scale = case.scores[token, slot].float() * torch.rsqrt(
+                normalized.pow(2).mean() + post_eps
+            )
+            partial[token] += scale * normalized
+    return _bf16_round(partial).to(torch.bfloat16)
+
+
+def k3_reduce_unpool_reference(
+    case: LogicalK3Case,
+    rank_partials: tuple[torch.Tensor, ...],
+) -> dict[str, torch.Tensor]:
+    """Rank-order TP reduction, sharded unpool, and K3 residual boundary."""
+    if len(rank_partials) != case.active_npes:
+        raise ValueError(
+            f"K3 reference got {len(rank_partials)} rank partials, "
+            f"expected {case.active_npes}"
+        )
+    rows = case.xin.shape[0]
+    reduced = torch.zeros(
+        rows,
+        case.dec2.shape[1],
+        dtype=torch.float32,
+        device=case.xin.device,
+    )
+    for rank, partial in enumerate(rank_partials):
+        if tuple(partial.shape) != tuple(reduced.shape):
+            raise ValueError(
+                f"K3 rank {rank} partial shape {tuple(partial.shape)}, "
+                f"expected {tuple(reduced.shape)}"
+            )
+        reduced += partial.to(
+            device=case.xin.device, dtype=torch.bfloat16
+        ).float()
+    weights = case.weights
+    post_eps = 1e-5
+    rms_eps = 1e-5
+    branch = _bf16_round(
+        _bf16_round(reduced) @ weights["w_unpool"].float().T
+    )
+    post_input = _bf16_round(branch * weights["pfw"].float())
+    normalized = _bf16_round(
+        post_input
+        * torch.rsqrt(
+            post_input.pow(2).mean(-1, keepdim=True) + post_eps
+        )
+    )
+    stream = (
+        weights["alpha"] * case.stream
+        + weights["beta"] * normalized
+    )
+    attention_input = (
+        stream
+        * torch.rsqrt(
+            stream.pow(2).mean(-1, keepdim=True) + rms_eps
+        )
+        * weights["npw"].float()
+    ).to(torch.bfloat16)
+    return {
+        "attention_input": attention_input,
+        "stream": stream,
+    }
+
+
 def kattn_reference(
     case: LogicalKAttnCase,
     *,
     fp8_qp: bool,
 ) -> torch.Tensor:
-    """PyTorch reference for the production FP8-Q/P or Mono BF16-P family."""
+    """Vectorized PyTorch reference over the pages addressed by each request.
+
+    The runtime fixture retains its production-equivalent 8K KV allocation.
+    Gathering through the block table avoids scanning unrelated cache pages,
+    while batching query positions, KV heads, and grouped-query heads avoids
+    thousands of tiny GPU launches.
+    """
     from sgl_amd_mono.muse_spark.gfx1250.config import SOFTMAX_SCALE
 
     rows = case.q.shape[0]
@@ -89,105 +218,172 @@ def kattn_reference(
             -1, CONTRACT.local_kv_heads, CONTRACT.head_dim
         )[slots].float()
         key_index = torch.arange(keys, device=case.q.device)
-        for kv_head in range(CONTRACT.local_kv_heads):
-            for query_position in range(CONTRACT.q_len):
-                token = request * CONTRACT.q_len + query_position
-                query_heads = case.q[token].reshape(
-                    CONTRACT.local_q_heads, CONTRACT.head_dim
-                )[kv_head * 8 : (kv_head + 1) * 8].float()
-                if fp8_qp:
-                    q_scale = (
-                        query_heads.abs().amax(-1, keepdim=True).clamp_min(1e-20)
-                        / 448.0
+        query_heads = (
+            case.q[
+                request * CONTRACT.q_len : (request + 1) * CONTRACT.q_len
+            ]
+            .reshape(
+                CONTRACT.q_len,
+                CONTRACT.local_kv_heads,
+                8,
+                CONTRACT.head_dim,
+            )
+            .float()
+        )
+        if fp8_qp:
+            q_scale = (
+                query_heads.abs().amax(-1, keepdim=True).clamp_min(1e-20)
+                / 448.0
+            )
+            query_heads = (
+                (query_heads / q_scale).to(torch.float8_e4m3fn).float()
+            )
+        if fp8_qp:
+            # Keep the production-reference accumulation boundary at one
+            # grouped-query matmul per query position/KV head. A single large
+            # batched matmul changes enough FP32 low bits to cross occasional
+            # FP8 probability rounding boundaries.
+            scores = SOFTMAX_SCALE * torch.stack(
+                [
+                    torch.stack(
+                        [
+                            (
+                                query_heads[query_position, kv_head]
+                                @ key[:, kv_head].T
+                            )
+                            * q_scale[query_position, kv_head]
+                            for kv_head in range(CONTRACT.local_kv_heads)
+                        ]
                     )
-                    query_heads = (
-                        (query_heads / q_scale)
-                        .to(torch.float8_e4m3fn)
-                        .float()
-                        * q_scale
-                    )
-                scores = SOFTMAX_SCALE * (
-                    query_heads @ key[:, kv_head].T
+                    for query_position in range(CONTRACT.q_len)
+                ]
+            )
+        else:
+            scores = SOFTMAX_SCALE * torch.matmul(
+                query_heads.permute(1, 0, 2, 3),
+                key.permute(1, 2, 0)[:, None],
+            ).permute(1, 0, 2, 3)
+        query_index = torch.arange(
+            CONTRACT.q_len, device=case.q.device
+        )[:, None]
+        allowed = key_index[None, :] < context + query_index + 1
+        if case.window:
+            allowed &= (
+                context + query_index - key_index[None, :]
+            ) < case.window
+        scores = torch.where(
+            allowed[:, None, None, :],
+            scores,
+            torch.full_like(scores, float("-inf")),
+        )
+        if fp8_qp:
+            # Production full-attention v2 forms 32 split-KV partials. Each
+            # split quantizes its unnormalized probabilities before P.V.
+            split_count = 32
+            split_keys = math.ceil(math.ceil(keys / 64) / split_count) * 64
+            padded_keys = split_count * split_keys
+            padded_scores = torch.full(
+                (*scores.shape[:-1], padded_keys),
+                float("-inf"),
+                device=scores.device,
+            )
+            padded_scores[..., :keys] = scores
+            tiles_per_split = split_keys // 64
+            split_scores = padded_scores.reshape(
+                *scores.shape[:-1], split_count, tiles_per_split, 64
+            )
+            padded_value = torch.zeros(
+                padded_keys,
+                CONTRACT.local_kv_heads,
+                CONTRACT.head_dim,
+                device=value.device,
+            )
+            padded_value[:keys] = value
+            split_value = padded_value.reshape(
+                split_count,
+                tiles_per_split,
+                64,
+                CONTRACT.local_kv_heads,
+                CONTRACT.head_dim,
+            )
+            state_shape = (*scores.shape[:-1], split_count)
+            maxima_tensor = torch.full(
+                state_shape, float("-inf"), device=scores.device
+            )
+            denom_tensor = torch.zeros(state_shape, device=scores.device)
+            partials_tensor = torch.zeros(
+                (*state_shape, CONTRACT.head_dim), device=scores.device
+            )
+            # _vv2_tile performs an online softmax update for each 64-key tile.
+            # P is quantized against that tile's running maximum, then the
+            # prior partial/denominator are rescaled if the maximum increases.
+            # Quantizing once against the final split maximum is not equivalent
+            # in FP8, even though it is equivalent in exact arithmetic.
+            split_scores_log2 = split_scores * math.log2(math.e)
+            for tile in range(tiles_per_split):
+                tile_scores = split_scores_log2[..., tile, :]
+                next_max = torch.maximum(
+                    maxima_tensor, tile_scores.amax(-1)
                 )
-                allowed = key_index < context + query_position + 1
-                if case.window:
-                    allowed &= (
-                        context + query_position - key_index
-                    ) < case.window
-                scores = torch.where(
-                    allowed[None, :],
-                    scores,
-                    torch.full_like(scores, float("-inf")),
+                valid = torch.isfinite(next_max)
+                safe_next_max = torch.where(
+                    valid, next_max, torch.zeros_like(next_max)
                 )
-                if fp8_qp:
-                    # Production full-attention v2 forms 32 split-KV partials.
-                    # Each split quantizes its unnormalized exp probabilities
-                    # to FP8 before P.V, then the deferred reducer merges the
-                    # local maxima/denominators in FP32.
-                    tiles = math.ceil(keys / 64)
-                    split_count = 32
-                    tiles_per_split = math.ceil(tiles / split_count)
-                    split_keys = tiles_per_split * 64
-                    padded_keys = split_count * split_keys
-                    padded_scores = torch.full(
-                        (query_heads.shape[0], padded_keys),
-                        float("-inf"),
-                        device=scores.device,
-                    )
-                    padded_scores[:, :keys] = scores
-                    split_scores = padded_scores.reshape(
-                        query_heads.shape[0], split_count, split_keys
-                    )
-                    maxima_tensor = split_scores.amax(-1)
-                    valid = torch.isfinite(maxima_tensor)
-                    safe_max = torch.where(
-                        valid,
-                        maxima_tensor,
-                        torch.zeros_like(maxima_tensor),
-                    )
-                    probability = torch.where(
-                        valid[:, :, None],
-                        torch.exp(split_scores - safe_max[:, :, None]),
-                        torch.zeros_like(split_scores),
-                    )
-                    denom_tensor = probability.sum(-1)
-                    padded_value = torch.zeros(
-                        padded_keys,
-                        CONTRACT.head_dim,
-                        device=value.device,
-                    )
-                    padded_value[:keys] = value[:, kv_head]
-                    split_value = padded_value.reshape(
-                        split_count, split_keys, CONTRACT.head_dim
-                    )
-                    partials_tensor = torch.einsum(
-                        "hsk,skd->hsd",
-                        probability.to(torch.float8_e4m3fn).float(),
-                        split_value,
-                    )
-                    global_max = maxima_tensor.amax(1)
-                    merge_weight = torch.where(
-                        denom_tensor > 0,
-                        torch.exp(maxima_tensor - global_max[:, None]),
-                        torch.zeros_like(denom_tensor),
-                    )
-                    attended = (
-                        partials_tensor * merge_weight[:, :, None]
-                    ).sum(1) / (
-                        denom_tensor * merge_weight
-                    ).sum(1)[:, None]
-                else:
-                    probability = (
-                        torch.softmax(scores, dim=-1)
-                        .to(torch.bfloat16)
-                        .float()
-                    )
-                    attended = probability @ value[:, kv_head]
-                start = kv_head * 8 * CONTRACT.head_dim
-                output[
-                    token,
-                    start : start + 8 * CONTRACT.head_dim,
-                ] = attended.reshape(-1)
+                probability = torch.where(
+                    valid[..., None],
+                    torch.exp2(
+                        tile_scores + 8.0 - safe_next_max[..., None]
+                    ),
+                    torch.zeros_like(tile_scores),
+                )
+                rescale = torch.where(
+                    torch.isfinite(maxima_tensor),
+                    torch.exp2(maxima_tensor - safe_next_max),
+                    torch.zeros_like(maxima_tensor),
+                )
+                denom_tensor = (
+                    denom_tensor * rescale + probability.sum(-1)
+                )
+                tile_partial = torch.einsum(
+                    "qhgsk,skhd->qhgsd",
+                    probability.to(torch.float8_e4m3fn).float(),
+                    split_value[:, tile],
+                )
+                partials_tensor = (
+                    partials_tensor * rescale[..., None] + tile_partial
+                )
+                maxima_tensor = safe_next_max
+            global_max = maxima_tensor.amax(-1)
+            merge_weight = torch.where(
+                denom_tensor > 0,
+                torch.exp2(maxima_tensor - global_max[..., None]),
+                torch.zeros_like(denom_tensor),
+            )
+            attended = (
+                partials_tensor * merge_weight[..., None]
+            ).sum(-2) / (
+                denom_tensor * merge_weight
+            ).sum(-1)[..., None]
+        else:
+            probability = (
+                torch.softmax(scores, dim=-1).to(torch.bfloat16).float()
+            )
+            attended = torch.bmm(
+                probability.permute(1, 0, 2, 3).reshape(
+                    CONTRACT.local_kv_heads,
+                    CONTRACT.q_len * 8,
+                    keys,
+                ),
+                value.permute(1, 0, 2),
+            ).reshape(
+                CONTRACT.local_kv_heads,
+                CONTRACT.q_len,
+                8,
+                CONTRACT.head_dim,
+            ).permute(1, 0, 2, 3)
+        output[
+            request * CONTRACT.q_len : (request + 1) * CONTRACT.q_len
+        ] = attended.reshape(CONTRACT.q_len, CONTRACT.local_q_width)
     return output.to(torch.bfloat16)
 
 
@@ -489,12 +685,17 @@ def build_k3_case(
     rank: int,
     active_npes: int,
     device: torch.device,
+    logical_rank: int | None = None,
 ) -> LogicalK3Case:
     """Build one TP8-local K3 problem, independently packable by both paths."""
     if rows not in (8, 16):
         raise ValueError(f"K3 logical fixture width {rows}, expected 8 or 16")
     if active_npes not in (1, 2, 4) or not 0 <= rank < active_npes:
         raise ValueError(f"K3 active topology rank={rank} world={active_npes}")
+    if logical_rank is None:
+        logical_rank = rank
+    if not 0 <= logical_rank < CONTRACT.logical_ep:
+        raise ValueError(f"K3 logical expert rank {logical_rank}, expected 0..7")
 
     import test_muse_spark_k3_gfx1250 as k3_test
     from sgl_amd_mono.muse_spark.gfx1250.config import (
@@ -508,7 +709,7 @@ def build_k3_case(
     torch.manual_seed(seed)
     bf16 = torch.bfloat16
     local_experts = CONTRACT.local_experts
-    local_start = rank * local_experts
+    local_start = logical_rank * local_experts
 
     raw_w13, raw_s13, dec13 = k3_test._fp4_weight(
         local_experts, 2 * INTER, MOE_HIDDEN, device, generator

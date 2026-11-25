@@ -312,6 +312,38 @@ def write_reports(
 
 def render_performance_log(report: dict, artifact_path: str) -> str:
     metadata = report["metadata"]
+    stage_order = {
+        stage: index
+        for index, stage in enumerate(
+            (
+                "k1",
+                "kattn_full",
+                "kattn_window",
+                "k2",
+                "kattn_k2_full",
+                "kattn_k2_window",
+                "k3",
+                "layer_v1_full",
+                "layer_v1_swa",
+                "layer_v2_full",
+                "layer_v2_swa",
+            )
+        )
+    }
+    rows = sorted(
+        report["critical_gap"],
+        key=lambda row: (
+            row["width"],
+            stage_order.get(row["stage"], len(stage_order)),
+            row["stage"],
+        ),
+    )
+    header = (
+        f"{'stage':<20} {'width':>5} | "
+        f"{'baseline avg us':>15} {'launches':>8} | "
+        f"{'mono avg us':>12} {'launches':>8} | "
+        f"{'gap us':>11} {'speedup':>8} {'status':>7}"
+    )
     lines = [
         "TP8 Synthetic Baseline vs Mono (4 active GPUs, logical TP8/EP8)",
         f"Updated: {report['created_at']}",
@@ -329,21 +361,28 @@ def render_performance_log(report: dict, artifact_path: str) -> str:
         "",
         "GAP SUMMARY (rank 0 latency)",
         "============================",
-        "stage width baseline_launches baseline_mean_us "
-        "mono_launches mono_mean_us gap_us speedup status",
+        "Average is the sum of matching GPU kernel durations per iteration,",
+        "averaged over all profiled iterations. CPU time and bubbles are excluded.",
+        "",
+        header,
+        "-" * len(header),
     ]
-    for row in report["critical_gap"]:
+    for row in rows:
         if row["status"] != "PASS":
             lines.append(
-                f"{row['stage']} {row['width']} - - - - - - INVALID"
+                f"{row['stage']:<20} {row['width']:>5} | "
+                f"{'-':>15} {'-':>8} | {'-':>12} {'-':>8} | "
+                f"{'-':>11} {'-':>8} {'INVALID':>7}"
             )
             continue
         lines.append(
-            f"{row['stage']} {row['width']} "
-            f"{row['baseline_launch_count']} "
-            f"{row['baseline_mean_us']:.3f} {row['mono_launch_count']} "
-            f"{row['mono_mean_us']:.3f} {row['gap_us']:+.3f} "
-            f"{row['speedup']:.3f}x PASS"
+            f"{row['stage']:<20} {row['width']:>5} | "
+            f"{row['baseline_mean_us']:>15.3f} "
+            f"{row['baseline_launch_count']:>8} | "
+            f"{row['mono_mean_us']:>12.3f} "
+            f"{row['mono_launch_count']:>8} | "
+            f"{row['gap_us']:>+11.3f} "
+            f"{row['speedup']:>7.3f}x {'PASS':>7}"
         )
     lines.extend(("", f"ARTIFACTS: {artifact_path}", ""))
     return "\n".join(lines)

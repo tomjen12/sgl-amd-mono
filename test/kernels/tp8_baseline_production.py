@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
+import torch
+
 from tp8_synthetic_contract import CONTRACT, ContractError, validate_tensor
 
 
@@ -131,7 +133,12 @@ def _tensor(
 ) -> None:
     try:
         descriptor = validate_tensor(
-            name, value, shape=shape, dtype=dtype, contiguous=contiguous
+            name,
+            value,
+            shape=shape,
+            dtype=dtype,
+            contiguous=contiguous,
+            alignment_bytes=16,
         )
         descriptor["layout"] = (
             "contiguous_row_major"
@@ -168,7 +175,7 @@ class K1BaselineAdapter:
 
     def __call__(self, **kw: Any) -> BaselineResult:
         x, weight = kw["x"], kw["weight"]
-        rows, bf16 = int(x.shape[0]), x.dtype
+        rows, bf16 = int(x.shape[0]), torch.bfloat16
         if rows not in (8, 16):
             raise BaselineContractError(f"k1 width {rows}, expected 8 or 16")
         evidence: dict[str, dict[str, Any]] = {}
@@ -180,8 +187,12 @@ class K1BaselineAdapter:
             (CONTRACT.local_qkvg_rows, CONTRACT.global_hidden),
             dtype=bf16,
         )
-        _tensor(evidence, "k1.positions", kw["positions"], (rows,))
-        _tensor(evidence, "k1.locations", kw["locations"], (rows,))
+        _tensor(
+            evidence, "k1.positions", kw["positions"], (rows,), dtype=torch.int64
+        )
+        _tensor(
+            evidence, "k1.locations", kw["locations"], (rows,), dtype=torch.int64
+        )
         cache_shape = tuple(int(v) for v in kw["cache_k"].shape)
         if cache_shape[1:] != (
             CONTRACT.local_kv_heads,
@@ -212,7 +223,7 @@ class KAttnBaselineAdapter:
         gate: Any,
         save_kv_cache: bool = False,
     ) -> BaselineResult:
-        rows, bf16 = int(q.shape[0]), q.dtype
+        rows, bf16 = int(q.shape[0]), torch.bfloat16
         if rows not in (8, 16):
             raise BaselineContractError(f"kattn width {rows}, expected 8 or 16")
         evidence: dict[str, dict[str, Any]] = {}
@@ -275,7 +286,7 @@ class K2BaselineAdapter:
     def __call__(
         self, *, layer: Any, stream: Any, attention_output: Any
     ) -> BaselineResult:
-        rows, bf16 = int(attention_output.shape[0]), attention_output.dtype
+        rows, bf16 = int(attention_output.shape[0]), torch.bfloat16
         if rows not in (8, 16):
             raise BaselineContractError(f"k2 width {rows}, expected 8 or 16")
         evidence: dict[str, dict[str, Any]] = {}
@@ -291,7 +302,19 @@ class K2BaselineAdapter:
             "k2.stream",
             stream,
             (rows, CONTRACT.global_hidden),
+            dtype=torch.float32,
             contiguous=False,
+        )
+        packed = getattr(layer.mlp, "router_pooler_packed_weight", None)
+        _tensor(
+            evidence,
+            "k2.router_pooler_packed_weight",
+            packed,
+            (
+                CONTRACT.moe_hidden + 2 * CONTRACT.global_experts,
+                CONTRACT.global_hidden,
+            ),
+            dtype=bf16,
         )
         projected = layer.self_attn.o_proj(attention_output)
         projected = projected[0] if isinstance(projected, tuple) else projected
@@ -392,7 +415,7 @@ class K3BaselineAdapter:
         unpool_kwargs: Mapping[str, Any] | None = None,
         quantized: Any = None,
     ) -> BaselineResult:
-        rows, bf16 = int(x.shape[0]), x.dtype
+        rows, bf16 = int(x.shape[0]), torch.bfloat16
         if rows not in (8, 16):
             raise BaselineContractError(f"k3 width {rows}, expected 8 or 16")
         evidence: dict[str, dict[str, Any]] = {}
@@ -403,8 +426,41 @@ class K3BaselineAdapter:
             (rows, CONTRACT.moe_hidden),
             dtype=bf16,
         )
-        _tensor(evidence, "k3.ids", ids, (rows, CONTRACT.top_k))
-        _tensor(evidence, "k3.scores", scores, (rows, CONTRACT.top_k))
+        _tensor(
+            evidence,
+            "k3.ids",
+            ids,
+            (rows, CONTRACT.top_k),
+            dtype=torch.int32,
+        )
+        _tensor(
+            evidence,
+            "k3.scores",
+            scores,
+            (rows, CONTRACT.top_k),
+            dtype=torch.float32,
+        )
+        if getattr(experts, "num_local_experts", None) != CONTRACT.local_experts:
+            raise BaselineContractError(
+                f"k3 local experts {getattr(experts, 'num_local_experts', None)}, "
+                f"expected {CONTRACT.local_experts}"
+            )
+        packed_experts = getattr(experts, "gfx1250_a8w4", ())
+        if len(packed_experts) < 4:
+            raise BaselineContractError("k3 packed expert weights are missing")
+        for name, value in zip(("w13", "w2", "s13", "s2"), packed_experts[:4]):
+            if int(value.shape[0]) != CONTRACT.local_experts:
+                raise BaselineContractError(
+                    f"k3.{name} local experts {value.shape[0]}, "
+                    f"expected {CONTRACT.local_experts}"
+                )
+            _tensor(
+                evidence,
+                f"k3.{name}",
+                value,
+                tuple(int(item) for item in value.shape),
+                dtype=value.dtype,
+            )
         run = _import_attr(
             "sglang.srt.rocm_muse_spark.mxfp4_moe", "run_gfx1250_a8w4"
         )

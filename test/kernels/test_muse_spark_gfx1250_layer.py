@@ -171,10 +171,17 @@ class Layer:
         }
         # random MXFP4 experts, shuffled into aiter's gfx1250 layout as SGLang does at load
         sys.path.insert(0, os.path.dirname(__file__))
-        from test_muse_spark_k3_gfx1250 import gfx1250_experts
+        from test_muse_spark_k3_gfx1250 import (
+            _fp4_weight as decoded_fp4_weight,
+            gfx1250_experts,
+        )
 
-        w13, s13 = _fp4_weight(LOCAL_EXPERTS, 2 * INTER, MOE_HIDDEN, dev, gen)
-        w2, s2 = _fp4_weight(LOCAL_EXPERTS, MOE_HIDDEN, INTER, dev, gen)
+        w13, s13, self.dec13 = decoded_fp4_weight(
+            LOCAL_EXPERTS, 2 * INTER, MOE_HIDDEN, dev, gen
+        )
+        w2, s2, self.dec2 = decoded_fp4_weight(
+            LOCAL_EXPERTS, MOE_HIDDEN, INTER, dev, gen
+        )
         self.w13, self.w2, self.s13, self.s2 = gfx1250_experts(w13, s13, w2, s2, 0)
         self.w3k = {
             "pen_w": (1.0 + 0.1 * torch.randn(MOE_HIDDEN, device=dev)).to(bf),

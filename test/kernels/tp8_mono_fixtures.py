@@ -11,6 +11,7 @@ import torch
 from tp8_layer_contract import deterministic_router_bias
 from tp8_synthetic_contract import (
     CONTRACT,
+    ContractError,
     deterministic_ep8_routing,
     validate_tensor,
 )
@@ -25,6 +26,36 @@ class PreparedMono:
     tensors: dict[str, dict]
     launch_count: int = 1
     outputs: Callable[[], dict[str, torch.Tensor]] | None = None
+    protocol: dict[str, Any] | None = None
+
+
+def validate_peer_contract(peers: Any, *, active_npes: int, actual_world: int) -> None:
+    if actual_world != active_npes:
+        raise ContractError(
+            f"active world size {actual_world}, expected {active_npes}"
+        )
+    if peers.logical_npes != CONTRACT.logical_tp:
+        raise ContractError(
+            f"logical peer slots {peers.logical_npes}, expected {CONTRACT.logical_tp}"
+        )
+    expected_shadows = CONTRACT.logical_tp - active_npes
+    if len(peers.shadow_bytes) != expected_shadows:
+        raise ContractError(
+            f"shadow slots {len(peers.shadow_bytes)}, expected {expected_shadows}"
+        )
+
+
+def validate_sharded_pooler(value: torch.Tensor) -> dict[str, Any]:
+    return validate_tensor(
+        "k2.sharded_pooler",
+        value,
+        shape=(
+            CONTRACT.moe_hidden // CONTRACT.logical_tp,
+            CONTRACT.global_hidden,
+        ),
+        dtype=torch.bfloat16,
+        alignment_bytes=16,
+    )
 
 
 def prepare_mono(
@@ -36,6 +67,9 @@ def prepare_mono(
     peer_group=None,
     active_npes: int = CONTRACT.active_npes,
     logical_case: Any | None = None,
+    seed_missing_ranks: bool = True,
+    guard_stop: bool = True,
+    deadline_s: float = 60.0,
 ) -> PreparedMono:
     import test_muse_spark_gfx1250_layer as blueprint
     import test_muse_spark_tp8_layer_gfx1250 as layer_test
@@ -55,6 +89,14 @@ def prepare_mono(
         torch.tensor(deterministic_router_bias(), device=device)
     )
     kernels = layer_test._kernels(rows, 8)
+    if not guard_stop:
+        if stage != "k2":
+            raise ValueError("test-only guard_stop=False is supported only for K2")
+        from sgl_amd_mono.muse_spark.gfx1250.build_k2 import K2Build, build_k2
+
+        kernels["k2"] = build_k2(
+            K2Build(tokens=rows, npes=CONTRACT.logical_tp, pshard=True, stop=False)
+        )
     buffers = layer_test._buffers(
         blueprint, rows, 8, rank, device, group=peer_group
     )
@@ -68,22 +110,164 @@ def prepare_mono(
         layer.v_cache = logical_case.cache_v
         layer.k_cache.zero_()
         layer.v_cache.zero_()
-    epoch = blueprint._epoch(device, deadline_s=60.0)
-    stream = torch.cuda.current_stream()
+    epoch = blueprint._epoch(device, deadline_s=deadline_s)
+    def launch_stream() -> torch.cuda.Stream:
+        return torch.cuda.current_stream(device)
     tensors = {
         "layer.x": validate_tensor(
             "layer.x",
             layer.x0,
             shape=(rows, CONTRACT.global_hidden),
             dtype=torch.bfloat16,
+            stride=(CONTRACT.global_hidden, 1),
+            alignment_bytes=16,
         ),
         "peer.addresses": validate_tensor(
             "peer.addresses",
             buffers.peers.addresses,
             shape=(CONTRACT.logical_tp,),
             dtype=torch.int64,
+            stride=(1,),
+            alignment_bytes=16,
         ),
     }
+
+    def checked(
+        name: str,
+        value: torch.Tensor,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        *,
+        contiguous: bool = True,
+    ) -> None:
+        tensors[name] = validate_tensor(
+            name,
+            value,
+            shape=shape,
+            dtype=dtype,
+            contiguous=contiguous,
+            alignment_bytes=16,
+        )
+
+    def validate_launch_tensors() -> None:
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            raise ContractError("Mono launch requires an initialized process group")
+        actual_world = dist.get_world_size(peer_group)
+        validate_peer_contract(
+            buffers.peers,
+            active_npes=active_npes,
+            actual_world=actual_world,
+        )
+        checked(
+            "layer.x",
+            layer.x0,
+            (rows, CONTRACT.global_hidden),
+            torch.bfloat16,
+        )
+        checked(
+            "peer.addresses",
+            buffers.peers.addresses,
+            (CONTRACT.logical_tp,),
+            torch.int64,
+        )
+        if stage == "k1":
+            checked(
+                "k1.weight",
+                layer.w_qkvg,
+                (CONTRACT.local_qkvg_rows, CONTRACT.global_hidden),
+                torch.bfloat16,
+            )
+            checked("k1.positions", layer.positions, (rows,), torch.int64)
+            checked("k1.locations", layer.slots, (rows,), torch.int64)
+        if stage in ("kattn_full", "kattn_window", "layer_v1", "layer_v2"):
+            checked(
+                "kattn.q",
+                buffers.q[:rows],
+                (rows, CONTRACT.local_q_width),
+                torch.bfloat16,
+            )
+            checked(
+                "kattn.k",
+                buffers.k[:rows],
+                (rows, CONTRACT.local_kv_width),
+                torch.bfloat16,
+            )
+            checked(
+                "kattn.v",
+                buffers.v[:rows],
+                (rows, CONTRACT.local_kv_width),
+                torch.bfloat16,
+            )
+            checked(
+                "kattn.gate",
+                buffers.g[:rows],
+                (rows, CONTRACT.local_q_width),
+                torch.bfloat16,
+            )
+        if stage in ("k2", "layer_v1", "layer_v2"):
+            pooler = getattr(buffers, "pool_w", None)
+            if pooler is None:
+                layer_test._k2_args(blueprint, layer, buffers, rank)
+                pooler = buffers.pool_w
+            tensors["k2.sharded_pooler"] = validate_sharded_pooler(pooler)
+            checked(
+                "k2.residual",
+                buffers.res[:rows],
+                (rows, CONTRACT.global_hidden),
+                torch.float32,
+            )
+            checked(
+                "k2.w_o",
+                layer.w2k["w_o"],
+                (CONTRACT.global_hidden, CONTRACT.local_q_width),
+                torch.bfloat16,
+            )
+            checked(
+                "k2.router",
+                layer.w2k["w_router"],
+                (CONTRACT.global_hidden, CONTRACT.global_experts),
+                torch.float32,
+            )
+            checked(
+                "k2.pooler",
+                layer.w2k["w_pool"],
+                (CONTRACT.moe_hidden, CONTRACT.global_hidden),
+                torch.bfloat16,
+            )
+        if stage in ("k3", "layer_v1", "layer_v2"):
+            checked(
+                "k3.x",
+                buffers.xin[:rows],
+                (rows, CONTRACT.moe_hidden),
+                torch.bfloat16,
+            )
+            checked(
+                "k3.ids",
+                buffers.ids[:rows],
+                (rows, CONTRACT.top_k),
+                torch.int32,
+            )
+            checked(
+                "k3.scores",
+                buffers.scores[:rows],
+                (rows, CONTRACT.top_k),
+                torch.float32,
+            )
+            for name in ("w13", "w2", "s13", "s2"):
+                value = getattr(layer, name)
+                if int(value.shape[0]) != CONTRACT.local_experts:
+                    raise ContractError(
+                        f"k3.{name} local experts {value.shape[0]}, "
+                        f"expected {CONTRACT.local_experts}"
+                    )
+                checked(
+                    f"k3.{name}",
+                    value,
+                    tuple(int(item) for item in value.shape),
+                    value.dtype,
+                )
 
     def before_each() -> None:
         epoch[0] += 1
@@ -91,9 +275,12 @@ def prepare_mono(
             buffers.res[:rows].copy_(logical_case.stream)
         if stage == "k3" and logical_case is not None:
             buffers.res[:rows].copy_(logical_case.stream)
-        if stage in ("k2", "k3", "layer_v1", "layer_v2"):
+        if seed_missing_ranks and stage in ("k2", "k3", "layer_v1", "layer_v2"):
             from tp8_shadow_protocol import seed_missing_rank_mailboxes
 
+            # Publish only the absent logical ranks' current tagged payloads.
+            # Active-rank mailboxes, shadow destinations, and scratch retain
+            # prior bytes exactly as they do in the production Runner.
             seed_missing_rank_mailboxes(
                 buffers.peers.bytes,
                 rows=rows,
@@ -106,6 +293,9 @@ def prepare_mono(
                     else None
                 ),
             )
+            # Other ranks read this rank's peer storage after the host control
+            # barrier, so make these narrow publications visible first.
+            torch.cuda.synchronize()
 
     def run_k1() -> None:
         blueprint._k1(
@@ -119,7 +309,7 @@ def prepare_mono(
             epoch,
             layer_test.LAYER,
             0,
-            stream,
+            launch_stream(),
         )
 
     buffers.res.copy_(layer.res0)
@@ -172,7 +362,7 @@ def prepare_mono(
                 *blueprint._attn_args(layer, buffers),
                 epoch.data_ptr(),
                 layer_test.LAYER,
-                stream=stream,
+                stream=launch_stream(),
             )
 
         launch = kattn
@@ -212,7 +402,7 @@ def prepare_mono(
                 rank,
                 epoch.data_ptr(),
                 layer_test.LAYER,
-                stream=stream,
+                stream=launch_stream(),
             )
 
         launch = k2
@@ -250,7 +440,9 @@ def prepare_mono(
             buffers.res[:rows].copy_(logical_case.stream)
 
         def k3() -> None:
-            args = layer_test._k3_args(blueprint, layer, buffers, rank)
+            args = list(layer_test._k3_args(blueprint, layer, buffers, rank))
+            if logical_case is not None:
+                args[0] = logical_case.local_start
             kernels["k3"](
                 buffers.xin.data_ptr(),
                 buffers.ids.data_ptr(),
@@ -266,7 +458,7 @@ def prepare_mono(
                 epoch.data_ptr(),
                 layer_test.LAYER,
                 0,
-                stream=stream,
+                stream=launch_stream(),
             )
 
         launch = k3
@@ -286,19 +478,56 @@ def prepare_mono(
                 epoch,
                 rank,
                 next_k1,
-                stream,
+                launch_stream(),
             )
 
         launch = layer_launch
+        outputs = lambda: {
+            "residual": buffers.res[:rows].clone(),
+            "ids": buffers.ids[:rows].clone(),
+            "scores": buffers.scores[:rows].clone(),
+            "expert_input": buffers.xin[:rows].clone(),
+            "attention_input": buffers.attn_in[:rows].clone(),
+            "cache_k": layer.k_cache[layer.slots].clone(),
+            "cache_v": layer.v_cache[layer.slots].clone(),
+            **(
+                {
+                    "next_q": buffers.q[:rows].clone(),
+                    "next_k": buffers.k[:rows].clone(),
+                    "next_v": buffers.v[:rows].clone(),
+                    "next_gate": buffers.g[:rows].clone(),
+                    "next_cache_k": layer.k_cache1[
+                        layer.swa_map[layer.slots]
+                    ].clone(),
+                    "next_cache_v": layer.v_cache1[
+                        layer.swa_map[layer.slots]
+                    ].clone(),
+                }
+                if next_k1
+                else {}
+            ),
+        }
     else:
         buffers.close()
         raise ValueError(f"unknown Mono stage {stage!r}")
 
+    raw_launch = launch
+
+    def validated_launch() -> None:
+        validate_launch_tensors()
+        raw_launch()
+
     return PreparedMono(
         stage=stage,
-        launch=launch,
+        launch=validated_launch,
         before_each=before_each,
         close=buffers.close,
         tensors=tensors,
         outputs=outputs,
+        protocol={
+            "epoch": epoch,
+            "buffers": buffers,
+            "layer": layer,
+            "validate": validate_launch_tensors,
+        },
     )
