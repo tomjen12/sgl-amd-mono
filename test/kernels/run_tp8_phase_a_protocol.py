@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Bounded four-GPU Phase-A mailbox protocol gate for logical TP8, width 8."""
+"""Bounded four-GPU mailbox protocol gate for logical TP8, Width 8/16."""
 
 from __future__ import annotations
 
+import argparse
 import json
 import time
 from datetime import timedelta
@@ -64,16 +65,18 @@ def _assert_clean_guard(protocol: dict) -> None:
         raise AssertionError(f"guard errors after protocol launch: {errors}")
 
 
-def _exercise_stage(stage: str, rank: int, world: int, group) -> dict:
+def _exercise_stage(
+    stage: str, width: int, rank: int, world: int, group
+) -> dict:
     device = torch.device("cuda", rank)
     case = (
-        build_k2_case(8, rank, world, device)
+        build_k2_case(width, rank, world, device)
         if stage == "k2"
-        else build_k3_case(8, rank, world, device)
+        else build_k3_case(width, rank, world, device)
     )
     prepared = prepare_mono(
         stage,
-        8,
+        width,
         rank,
         peer_group=group,
         active_npes=world,
@@ -142,14 +145,16 @@ def _exercise_stage(stage: str, rank: int, world: int, group) -> dict:
         prepared.close()
 
 
-def _exercise_missing_rank_timeout(rank: int, world: int, group) -> dict:
+def _exercise_missing_rank_timeout(
+    width: int, rank: int, world: int, group
+) -> dict:
     from sgl_amd_mono.common import guard
 
     device = torch.device("cuda", rank)
-    case = build_k2_case(8, rank, world, device)
+    case = build_k2_case(width, rank, world, device)
     prepared = prepare_mono(
         "k2",
-        8,
+        width,
         rank,
         peer_group=group,
         active_npes=world,
@@ -186,38 +191,46 @@ def _exercise_missing_rank_timeout(rank: int, world: int, group) -> dict:
         prepared.close()
 
 
-def main() -> None:
-    dist.init_process_group("gloo")
-    rank, world = dist.get_rank(), dist.get_world_size()
+def run_protocol(width: int, rank: int, world: int) -> dict | None:
     if world != 4:
         raise RuntimeError(f"Phase-A protocol gate requires 4 ranks, got {world}")
-    torch.cuda.set_device(rank)
     group = dist.new_group(backend="gloo")
     try:
         results = [
-            _exercise_stage("k2", rank, world, group),
-            _exercise_stage("k3", rank, world, group),
-            _exercise_missing_rank_timeout(rank, world, group),
+            _exercise_stage("k2", width, rank, world, group),
+            _exercise_stage("k3", width, rank, world, group),
+            _exercise_missing_rank_timeout(width, rank, world, group),
         ]
         gathered: list[list[dict] | None] = [None] * world
         dist.all_gather_object(gathered, results, group=group)
-        if rank == 0:
-            print(
-                json.dumps(
-                    {
-                        "status": "passed",
-                        "width": 8,
-                        "logical_tp_ep": 8,
-                        "active_ranks": 4,
-                        "resident_cu": 96,
-                        "ranks": gathered,
-                    },
-                    sort_keys=True,
-                ),
-                flush=True,
-            )
+        return (
+            {
+                "status": "passed",
+                "width": width,
+                "logical_tp_ep": 8,
+                "active_ranks": 4,
+                "resident_cu": 96,
+                "ranks": gathered,
+            }
+            if rank == 0
+            else None
+        )
     finally:
         dist.destroy_process_group(group)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--width", type=int, choices=(8, 16), default=8)
+    args = parser.parse_args()
+    dist.init_process_group("gloo")
+    rank, world = dist.get_rank(), dist.get_world_size()
+    torch.cuda.set_device(rank)
+    try:
+        result = run_protocol(args.width, rank, world)
+        if result is not None:
+            print(json.dumps(result, sort_keys=True), flush=True)
+    finally:
         dist.destroy_process_group()
 
 

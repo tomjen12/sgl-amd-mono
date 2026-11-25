@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Isolated, bounded Width-8 Phase C routing-stress driver.
+"""Isolated, bounded Width-8/16 Phase C routing-stress driver.
 
 Each case gets a fresh torchrun/container.  The known Baseline hot-expert fault
 is not exercised here: this driver gates Mono against the decoded-weight
@@ -96,11 +96,12 @@ def run_case_sequence(
 
 def _args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Bounded isolated Width-8 Mono routing stress"
+        description="Bounded isolated Width-8/16 Mono routing stress"
     )
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--devices", default="0,1,2,3")
+    parser.add_argument("--width", type=int, choices=(8, 16), default=8)
     parser.add_argument("--timeout-seconds", type=int, default=600)
     return parser.parse_args()
 
@@ -128,7 +129,7 @@ def main() -> int:
             "--stage",
             "k3",
             "--widths",
-            "8",
+            str(args.width),
             "--impl",
             "mono",
             "--profile",
@@ -168,7 +169,7 @@ def main() -> int:
         "schema": "tp8-phase-c-routing-stress",
         "version": 1,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "width": 8,
+        "width": args.width,
         "active_gpus": 4,
         "logical_tp": 8,
         "logical_ep": 8,

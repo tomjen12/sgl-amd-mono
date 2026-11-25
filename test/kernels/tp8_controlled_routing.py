@@ -144,6 +144,10 @@ def validate_package(document: Mapping[str, Any]) -> ControlledRoutingPackage:
 
 
 def load_package(path: Path) -> ControlledRoutingPackage:
+    if path.is_dir():
+        raise ControlledRoutingError(
+            "directory reference packages require load_reference_package(path, width=...)"
+        )
     _require(path.is_file(), f"routing package is unavailable: {path}")
     try:
         document = json.loads(path.read_text())
@@ -151,6 +155,84 @@ def load_package(path: Path) -> ControlledRoutingPackage:
         raise ControlledRoutingError(f"cannot read routing package {path}: {exc}") from exc
     _require(isinstance(document, Mapping), "routing package root must be an object")
     return validate_package(document)
+
+
+def _raw_hash_int32(values: Sequence[int]) -> str:
+    digest = hashlib.sha256()
+    for value in values:
+        digest.update(struct.pack("<i", int(value)))
+    return digest.hexdigest()
+
+
+def _raw_hash_float32(values: Sequence[float]) -> str:
+    digest = hashlib.sha256()
+    for value in values:
+        digest.update(struct.pack("<f", float(value)))
+    return digest.hexdigest()
+
+
+def _load_bfloat16(path: Path, shape: Sequence[int]) -> tuple[tuple[float, ...], ...]:
+    width, hidden = (int(value) for value in shape)
+    payload = path.read_bytes()
+    _require(len(payload) == width * hidden * 2, "logical xin byte size mismatch")
+    words = struct.unpack(f"<{width * hidden}H", payload)
+    values = tuple(
+        struct.unpack("<f", struct.pack("<I", int(word) << 16))[0]
+        for word in words
+    )
+    return tuple(
+        values[row * hidden : (row + 1) * hidden] for row in range(width)
+    )
+
+
+def load_reference_package(path: Path, *, width: int) -> ControlledRoutingPackage:
+    """Load the immutable GB300 directory package without regenerating routing."""
+    _require(path.is_dir(), f"reference package directory is unavailable: {path}")
+    manifest_path = path / "manifest.json"
+    _require(manifest_path.is_file(), f"missing reference manifest: {manifest_path}")
+    document = json.loads(manifest_path.read_text())
+    _require(document.get("contract_version") == VERSION, "contract version mismatch")
+    _require(document.get("producer") == "gb300", "package producer must be gb300")
+    _require(document.get("immutable_logical_workload") is True, "package is mutable")
+    _require(document.get("validation_errors") == [], "package validation errors")
+    cases = {
+        int(item["width"]): item for item in document.get("cases", ())
+    }
+    _require(set(cases) == set(WIDTHS), "reference package widths mismatch")
+    _require(width in cases, f"reference package has no Width {width}")
+    case = cases[width]
+    _require(case.get("rotation") == 0, "package rotation must be zero")
+    _require(case.get("top_k") == TOP_K, "package Top-K mismatch")
+    _require(case.get("global_experts") == GLOBAL_EXPERTS, "expert count mismatch")
+    _require(case.get("validation_errors") == [], "case validation errors")
+    ids = tuple(
+        tuple(int(value) for value in row)
+        for row in case["global_ids"]["values"]
+    )
+    scores = tuple(
+        tuple(float(value) for value in row)
+        for row in case["scores"]["values"]
+    )
+    _require(ids == canonical_global_ids(width), "global IDs are not canonical")
+    _require(len(scores) == width, "score row count mismatch")
+    xin_metadata = case["logical_xin"]
+    _require(xin_metadata["dtype"] == "bfloat16", "logical xin must be bfloat16")
+    xin_path = path / xin_metadata["artifact"]
+    _require(xin_path.is_file(), f"missing logical xin: {xin_path}")
+    xin = _load_bfloat16(xin_path, xin_metadata["shape"])
+    hashes = {
+        "token_order_hash": _raw_hash_int32(tuple(range(width))),
+        "logical_xin_hash": hashlib.sha256(xin_path.read_bytes()).hexdigest(),
+        "global_ids_hash": _raw_hash_int32(
+            tuple(value for row in ids for value in row)
+        ),
+        "scores_hash": _raw_hash_float32(
+            tuple(value for row in scores for value in row)
+        ),
+    }
+    for name, value in hashes.items():
+        _require(case.get(name) == value, f"{name} mismatch")
+    return ControlledRoutingPackage(width, xin, ids, scores, hashes)
 
 
 def build_package(

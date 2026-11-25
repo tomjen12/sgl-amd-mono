@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Width-8 CUDA Graph capture/replay tests for the TP8 synthetic harness."""
+"""Width-8/16 CUDA Graph capture/replay tests for the TP8 synthetic harness."""
 
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ STAGES = (
 class GraphFixture:
     implementation: str
     stage: str
+    width: int
     launch: Callable[[], None]
     before_step: Callable[[int], None]
     outputs: Callable[[], dict[str, torch.Tensor]]
@@ -169,6 +170,7 @@ def _make_updater(stage: str, fixture: Any) -> tuple[Callable[[int], None], dict
 def _reference_validator(
     implementation: str,
     stage: str,
+    width: int,
     fixture: Any,
 ) -> Callable[[dict[str, torch.Tensor]], dict[str, Any]] | None:
     if stage == "k1":
@@ -191,8 +193,12 @@ def _reference_validator(
             _close(outputs["k"], k, 1 / 64, "k")
             _close(outputs["v"], v, 1 / 128, "v")
             _close(outputs["gate"], gate, 1 / 128, "gate")
-            _one_ulp_fp8(outputs["cache_k"].reshape(8, -1), _fp8(k), "K cache")
-            _one_ulp_fp8(outputs["cache_v"].reshape(8, -1), _fp8(v), "V cache")
+            _one_ulp_fp8(
+                outputs["cache_k"].reshape(width, -1), _fp8(k), "K cache"
+            )
+            _one_ulp_fp8(
+                outputs["cache_v"].reshape(width, -1), _fp8(v), "V cache"
+            )
             return {"status": "passed", "kind": "strict-pytorch-k1"}
 
         return validate_k1
@@ -218,25 +224,33 @@ def _reference_validator(
 
 def _prepare_baseline_stage(
     stage: str,
+    width: int,
     rank: int,
     world: int,
+    controlled_package=None,
 ) -> GraphFixture:
     from tp8_baseline_fixtures import prepare_k1, prepare_k2, prepare_k3, prepare_kattn
 
     device = torch.device("cuda", rank)
     prepared = (
-        prepare_k1(8, rank, device)
+        prepare_k1(width, rank, device)
         if stage == "k1"
         else prepare_kattn(
-            8,
+            width,
             rank,
             device,
             window=2047 if stage == "kattn_window" else 0,
         )
         if stage in ("kattn_full", "kattn_window")
-        else prepare_k2(8, rank, device, active_npes=world)
+        else prepare_k2(width, rank, device, active_npes=world)
         if stage == "k2"
-        else prepare_k3(8, rank, device, active_npes=world)
+        else prepare_k3(
+            width,
+            rank,
+            device,
+            active_npes=world,
+            controlled_package=controlled_package,
+        )
     )
     if prepared.fixture is None:
         raise ContractError(f"{stage} Baseline fixture is missing")
@@ -260,6 +274,7 @@ def _prepare_baseline_stage(
     return GraphFixture(
         implementation="baseline",
         stage=stage,
+        width=width,
         launch=launch,
         before_step=update,
         outputs=outputs,
@@ -270,16 +285,18 @@ def _prepare_baseline_stage(
         backend=prepared.backend,
         result_boxes=[box],
         validate_reference=_reference_validator(
-            "baseline", stage, prepared.fixture
+            "baseline", stage, width, prepared.fixture
         ),
     )
 
 
 def _prepare_mono_stage(
     stage: str,
+    width: int,
     rank: int,
     world: int,
     peer_group,
+    controlled_package=None,
 ) -> GraphFixture:
     from tp8_logical_case import (
         build_k1_case,
@@ -291,22 +308,38 @@ def _prepare_mono_stage(
 
     device = torch.device("cuda", rank)
     case = (
-        build_k1_case(8, rank, device)
+        build_k1_case(width, rank, device)
         if stage == "k1"
         else build_kattn_case(
-            8,
+            width,
             rank,
             2047 if stage == "kattn_window" else 0,
             device,
         )
         if stage in ("kattn_full", "kattn_window")
-        else build_k2_case(8, rank, world, device)
+        else build_k2_case(width, rank, world, device)
         if stage == "k2"
-        else build_k3_case(8, rank, world, device)
+        else build_k3_case(width, rank, world, device)
     )
+    if controlled_package is not None:
+        if stage != "k3":
+            raise ContractError("controlled package is legal only for K3")
+        case.xin.copy_(
+            torch.tensor(controlled_package.xin, dtype=case.xin.dtype, device=device)
+        )
+        case.ids.copy_(
+            torch.tensor(controlled_package.ids, dtype=case.ids.dtype, device=device)
+        )
+        case.scores.copy_(
+            torch.tensor(
+                controlled_package.scores,
+                dtype=case.scores.dtype,
+                device=device,
+            )
+        )
     prepared = prepare_mono(
         stage,
-        8,
+        width,
         rank,
         window=stage == "kattn_window",
         peer_group=peer_group,
@@ -322,15 +355,15 @@ def _prepare_mono_stage(
     def before_step(step: int) -> None:
         update_case(step)
         if stage in ("kattn_full", "kattn_window"):
-            buffers.q[:8].copy_(case.q)
-            buffers.g[:8].copy_(case.gate)
+            buffers.q[:width].copy_(case.q)
+            buffers.g[:width].copy_(case.gate)
         elif stage == "k2":
-            buffers.o[:8].copy_(case.o)
-            buffers.g[:8].copy_(case.gate)
+            buffers.o[:width].copy_(case.o)
+            buffers.g[:width].copy_(case.gate)
         elif stage == "k3":
-            buffers.xin[:8].copy_(case.xin)
-            buffers.ids[:8].copy_(case.ids)
-            buffers.scores[:8].copy_(case.scores)
+            buffers.xin[:width].copy_(case.xin)
+            buffers.ids[:width].copy_(case.ids)
+            buffers.scores[:width].copy_(case.scores)
         prepared.before_each()
 
     def addresses() -> dict[str, int]:
@@ -348,6 +381,7 @@ def _prepare_mono_stage(
     return GraphFixture(
         implementation="mono",
         stage=stage,
+        width=width,
         launch=prepared.launch,
         before_step=before_step,
         outputs=prepared.outputs,
@@ -357,7 +391,7 @@ def _prepare_mono_stage(
         operator="muse_spark_monokernel",
         backend="sgl_amd_mono_gfx1250",
         result_boxes=[],
-        validate_reference=_reference_validator("mono", stage, case),
+        validate_reference=_reference_validator("mono", stage, width, case),
     )
 
 
@@ -371,10 +405,14 @@ def _layer_stage_parts(stage: str) -> tuple[str, ...]:
 
 def _prepare_baseline_layer(
     stage: str,
+    width: int,
     rank: int,
     world: int,
 ) -> GraphFixture:
-    parts = [_prepare_baseline_stage(name, rank, world) for name in _layer_stage_parts(stage)]
+    parts = [
+        _prepare_baseline_stage(name, width, rank, world)
+        for name in _layer_stage_parts(stage)
+    ]
 
     def launch() -> None:
         for part in parts:
@@ -409,6 +447,7 @@ def _prepare_baseline_layer(
     return GraphFixture(
         implementation="baseline",
         stage=stage,
+        width=width,
         launch=launch,
         before_step=before_step,
         outputs=outputs,
@@ -424,6 +463,7 @@ def _prepare_baseline_layer(
 
 def _prepare_mono_layer(
     stage: str,
+    width: int,
     rank: int,
     world: int,
     peer_group,
@@ -433,7 +473,7 @@ def _prepare_mono_layer(
     fixture_stage = stage.rsplit("_", 1)[0]
     prepared = prepare_mono(
         fixture_stage,
-        8,
+        width,
         rank,
         window=stage.endswith("_swa"),
         peer_group=peer_group,
@@ -445,11 +485,11 @@ def _prepare_mono_layer(
     buffers = prepared.protocol["buffers"]
     layer = prepared.protocol["layer"]
     dynamic = {
-        "q": buffers.q[:8],
-        "k": buffers.k[:8],
-        "v": buffers.v[:8],
-        "gate": buffers.g[:8],
-        "residual": buffers.res[:8],
+        "q": buffers.q[:width],
+        "k": buffers.k[:width],
+        "v": buffers.v[:width],
+        "gate": buffers.g[:width],
+        "residual": buffers.res[:width],
         "cache_k": layer.k_cache,
         "cache_v": layer.v_cache,
     }
@@ -459,9 +499,9 @@ def _prepare_mono_layer(
         for name, value in dynamic.items():
             value.copy_(base[name])
         delta = step * 2.0**-8
-        buffers.q[:8].add_(delta)
-        buffers.g[:8].sub_(delta)
-        buffers.res[:8].add_(delta)
+        buffers.q[:width].add_(delta)
+        buffers.g[:width].sub_(delta)
+        buffers.res[:width].add_(delta)
         if step:
             layer.k_cache.reshape(-1)[:256].copy_(
                 base["cache_k"].reshape(-1)[256:512]
@@ -480,6 +520,7 @@ def _prepare_mono_layer(
     return GraphFixture(
         implementation="mono",
         stage=stage,
+        width=width,
         launch=prepared.launch,
         before_step=before_step,
         outputs=prepared.outputs,
@@ -496,22 +537,33 @@ def _prepare_mono_layer(
 def prepare_graph_fixture(
     implementation: str,
     stage: str,
+    width: int,
     rank: int,
     world: int,
     peer_group,
+    controlled_package=None,
 ) -> GraphFixture:
     if stage not in STAGES:
         raise ContractError(f"unsupported graph stage {stage}")
     if stage.startswith("layer_"):
         return (
-            _prepare_baseline_layer(stage, rank, world)
+            _prepare_baseline_layer(stage, width, rank, world)
             if implementation == "baseline"
-            else _prepare_mono_layer(stage, rank, world, peer_group)
+            else _prepare_mono_layer(stage, width, rank, world, peer_group)
         )
     return (
-        _prepare_baseline_stage(stage, rank, world)
+        _prepare_baseline_stage(
+            stage, width, rank, world, controlled_package=controlled_package
+        )
         if implementation == "baseline"
-        else _prepare_mono_stage(stage, rank, world, peer_group)
+        else _prepare_mono_stage(
+            stage,
+            width,
+            rank,
+            world,
+            peer_group,
+            controlled_package=controlled_package,
+        )
     )
 
 
@@ -560,16 +612,30 @@ def run_graph_case(
     *,
     implementation: str,
     stage: str,
+    width: int,
     rank: int,
     world: int,
     peer_group,
     replays: int = 3,
+    controlled_package=None,
 ) -> dict[str, Any]:
     graph_fixture = prepare_graph_fixture(
-        implementation, stage, rank, world, peer_group
+        implementation,
+        stage,
+        width,
+        rank,
+        world,
+        peer_group,
+        controlled_package,
     )
     eager_fixture = prepare_graph_fixture(
-        implementation, stage, rank, world, peer_group
+        implementation,
+        stage,
+        width,
+        rank,
+        world,
+        peer_group,
+        controlled_package,
     )
 
     def barrier() -> None:
@@ -727,7 +793,7 @@ def run_graph_case(
             ),
             "implementation": implementation,
             "stage": stage,
-            "width": 8,
+            "width": width,
             "rank": rank,
             "active_npes": world,
             "logical_npes": CONTRACT.logical_tp,

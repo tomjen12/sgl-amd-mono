@@ -359,6 +359,7 @@ def render_performance_log(report: dict, artifact_path: str) -> str:
                 "kattn_k2_full",
                 "kattn_k2_window",
                 "k3",
+                "controlled_k3",
                 "layer_v1_full",
                 "layer_v1_swa",
                 "layer_v2_full",
@@ -397,6 +398,7 @@ def render_performance_log(report: dict, artifact_path: str) -> str:
     runtime_parity = metadata.get(
         "runtime_graph_dispatch_parity", "NOT_RECORDED"
     )
+    runtime_parity_scope = metadata.get("runtime_graph_dispatch_scope")
     unexpected_fallback = metadata.get("unexpected_fallback", "unknown")
     if isinstance(unexpected_fallback, bool):
         unexpected_fallback = str(unexpected_fallback).lower()
@@ -405,25 +407,54 @@ def render_performance_log(report: dict, artifact_path: str) -> str:
         "TP8 Synthetic Baseline vs Mono (4 active GPUs, logical TP8/EP8)",
         f"Updated: {report['created_at']}",
         "",
-        "CONFIGURATION",
-        "=============",
-        f"workload={report['workload']}",
-        f"widths={metadata.get('widths')} warmup={metadata.get('warmup')} "
-        f"iterations={metadata.get('iterations')} profile={metadata.get('profile')}",
-        "active_ranks=4 logical_tp=8 logical_ep=8 resident_blocks=96",
-        "pooler=sharded",
+        "設定",
+        "====",
+        f"工作負載={report['workload']}",
+        f"寬度={metadata.get('widths')} warmup={metadata.get('warmup')} "
+        f"量測次數={metadata.get('iterations')} profiler={metadata.get('profile')}",
+        "實體ranks=4 logical_tp=8 logical_ep=8 resident_blocks=96",
+        "Pooler=sharded",
         "",
-        "This is a four-active-rank synthetic result. It is not real eight-GPU",
-        "TP8/EP8 latency and is not comparable to TP4 runtime performance.",
+        "這是四張實體GPU的synthetic結果，不是真正八張GPU的TP8/EP8 latency，",
+        "也不能直接和TP4 runtime效能比較。",
         "",
-        "VALIDATION",
-        "==========",
-        f"runtime_graph_dispatch_parity={runtime_parity}",
-        f"unexpected_fallback={unexpected_fallback}",
-        f"graph_baseline_cases={len(graph_direct)}",
-        f"graph_mono_cases={len(graph_direct)}",
-        f"samples_per_case={sample_count}",
-        f"official_rank0_samples={official_samples}",
+        "驗證摘要",
+        "========",
+        "Runtime Graph dispatch parity="
+        f"{runtime_parity}"
+        f"{f' ({runtime_parity_scope})' if runtime_parity_scope else ''}",
+        f"非預期fallback={unexpected_fallback}",
+        f"Graph Baseline cases={len(graph_direct)}",
+        f"Graph Mono cases={len(graph_direct)}",
+        f"每個case樣本數={sample_count}",
+        f"正式Rank 0樣本總數={official_samples}",
+        "",
+        "這些數字已通過的驗證",
+        "====================",
+        "- Baseline與Mono的Width 8/16 CUDA Graph capture及multi-step replay，",
+        "  均通過Graph-vs-Eager、記憶體位址穩定、kernel順序及launch count驗證；",
+        "  涵蓋K1、K-attn Full/SWA、K2、K3及Layer V1/V2。",
+        "- Width 8/16主要MXFP4執行correctness通過。K-attn Mono Full/SWA及",
+        "  Baseline SWA通過各自precision-aware PyTorch reference；跨backend",
+        "  公平比較使用K-attn+K2 semantic boundary。",
+        "- Workload維持logical TP8/EP8 shape、W8 specialization、8個peer slots、",
+        "  sharded Pooler及每個active rank 32個local experts；logical ranks 4-7",
+        "  使用shadow ranks且數值貢獻為零。",
+        "- Width 8 Baseline Graph dispatch已和production runtime trace比對；",
+        "  Width 16通過UT kernel family、順序、launch count及無fallback驗證，",
+        "  但尚未取得Width 16 production runtime trace。",
+        "- Profiler涵蓋的四卡路徑已通過mailbox epoch/tag rollover、stale/sentinel、",
+        "  allocation重用及missing-rank fail-closed驗證。",
+        "- Latency為50次warmup後50次Rank 0 Graph replay的平均，只計算allowlist",
+        "  內的GPU kernel duration。",
+        "",
+        "限制與尚未完成的驗證",
+        "====================",
+        "- Reduce/gather/mailbox只跨四張實體GPU；這些數字不代表真正八卡通訊latency。",
+        "- Width 16 expert_boundary routing stress在zero_local_pick通過後發生",
+        "  HSA page-not-present fault，極端routing安全性尚未完成。",
+        "- Baseline Full strict PyTorch mismatch及independent whole-layer strict",
+        "  residual驗證仍為deferred，且沒有放寬tolerance。",
         "",
         "DIRECT STAGE RESULTS (rank 0 latency)",
         "=====================================",
@@ -433,6 +464,36 @@ def render_performance_log(report: dict, artifact_path: str) -> str:
         header,
         "-" * len(header),
     ]
+    if metadata.get("width16_ut_graph_dispatch"):
+        lines.insert(
+            lines.index(f"非預期fallback={unexpected_fallback}"),
+            "Width 16 UT Graph dispatch="
+            f"{metadata['width16_ut_graph_dispatch']}",
+        )
+    controlled_cases = metadata.get("controlled_routing_cases", [])
+    if controlled_cases:
+        controlled_lines = [
+            "- Controlled K3 Width 8/16的Baseline與Mono直接讀取GB300 reference",
+            "  package內相同的logical xin/global IDs/scores，沒有local fallback；",
+            "  CUDA Graph correctness、Baseline-vs-Mono parity及50+50 profiling通過。",
+        ]
+        for item in controlled_cases:
+            hashes = item["canonical_hashes"]
+            controlled_lines.extend(
+                (
+                    f"  W{item['width']} IDs hash={hashes['global_ids_hash']}",
+                    f"  W{item['width']} scores hash={hashes['scores_hash']}",
+                )
+            )
+        controlled_lines.extend(
+            (
+                "- Controlled K3目前是synthetic logical-TP8 diagnostic；尚缺MI455",
+                "  production-runtime TP8 ownership mapping，因此routing_equivalent=false。",
+                "",
+            )
+        )
+        index = lines.index("限制與尚未完成的驗證")
+        lines[index:index] = controlled_lines
 
     def append_rows(selected: list[dict]) -> None:
         for row in selected:
@@ -468,43 +529,60 @@ def render_performance_log(report: dict, artifact_path: str) -> str:
         )
         append_rows(derived_rows)
 
-    by_stage = {
-        row["stage"]: row
-        for row in graph_direct
-        if row.get("status") == "PASS"
-    }
-    priority_stages = (
-        "layer_v1_swa",
-        "k2",
-        "k3",
-        "kattn_window",
-    )
-    if all(stage in by_stage for stage in priority_stages):
+    priority_header_written = False
+    for width in sorted({int(row["width"]) for row in graph_direct}):
+        by_stage = {
+            row["stage"]: row
+            for row in graph_direct
+            if row.get("status") == "PASS" and int(row["width"]) == width
+        }
+        required = ("k2", "k3", "kattn_full", "kattn_window")
+        layer_rows = [
+            row for stage, row in by_stage.items() if stage.startswith("layer_")
+        ]
+        if not all(stage in by_stage for stage in required) or not layer_rows:
+            continue
+        if not priority_header_written:
+            lines.extend(
+                (
+                    "",
+                    "INITIAL OPTIMIZATION PRIORITY",
+                    "=============================",
+                )
+            )
+            priority_header_written = True
+        worst_layer = max(layer_rows, key=lambda row: row["gap_us"])
+        worst_attention = max(
+            (by_stage["kattn_full"], by_stage["kattn_window"]),
+            key=lambda row: row["gap_us"],
+        )
+        diagnostics = sorted(
+            (by_stage["k2"], by_stage["k3"]),
+            key=lambda row: row["gap_us"],
+            reverse=True,
+        )
         lines.extend(
             (
-                "",
-                "INITIAL OPTIMIZATION PRIORITY",
-                "=============================",
-                "1. Layer V1 SWA: recover the "
-                f"{by_stage['layer_v1_swa']['gap_us']:.3f} us regression "
-                "without regressing V2.",
-                "2. K2 diagnostic path: investigate the "
-                f"{by_stage['k2']['gap_us']:.3f} us standalone gap.",
-                "3. K3 diagnostic path: investigate the "
-                f"{by_stage['k3']['gap_us']:.3f} us standalone gap.",
-                "4. K-attn SWA: investigate the "
-                f"{by_stage['kattn_window']['gap_us']:.3f} us standalone gap.",
+                f"Width {width}:",
+                f"1. {worst_layer['stage']}: investigate the "
+                f"{worst_layer['gap_us']:.3f} us whole-layer regression.",
+                f"2. {diagnostics[0]['stage'].upper()} diagnostic path: "
+                f"investigate the {diagnostics[0]['gap_us']:.3f} us standalone gap.",
+                f"3. {diagnostics[1]['stage'].upper()} diagnostic path: "
+                f"investigate the {diagnostics[1]['gap_us']:.3f} us standalone gap.",
+                f"4. {worst_attention['stage']}: investigate the "
+                f"{worst_attention['gap_us']:.3f} us standalone gap.",
             )
         )
         if "layer_v2_full" in by_stage and "layer_v2_swa" in by_stage:
             lines.extend(
                 (
-                    "",
                     "Layer V2 speedup is "
                     f"{by_stage['layer_v2_full']['speedup']:.3f}x Full and "
                     f"{by_stage['layer_v2_swa']['speedup']:.3f}x SWA. "
                     "Standalone K2/K3 are diagnostic",
                     "proxies; they must not be added to predict fused Layer latency.",
+                    "",
                 )
             )
 
