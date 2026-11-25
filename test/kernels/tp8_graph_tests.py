@@ -37,6 +37,7 @@ class GraphFixture:
     close: Callable[[], None]
     launch_count: int
     operator: str
+    backend: str
     result_boxes: list[dict[str, Any]]
     validate_reference: Callable[[dict[str, torch.Tensor]], dict[str, Any]] | None
 
@@ -266,6 +267,7 @@ def _prepare_baseline_stage(
         close=lambda: None,
         launch_count=prepared.launch_count,
         operator=prepared.operator,
+        backend=prepared.backend,
         result_boxes=[box],
         validate_reference=_reference_validator(
             "baseline", stage, prepared.fixture
@@ -353,6 +355,7 @@ def _prepare_mono_stage(
         close=prepared.close,
         launch_count=1,
         operator="muse_spark_monokernel",
+        backend="sgl_amd_mono_gfx1250",
         result_boxes=[],
         validate_reference=_reference_validator("mono", stage, case),
     )
@@ -413,6 +416,7 @@ def _prepare_baseline_layer(
         close=lambda: [part.close() for part in parts],
         launch_count=sum(part.launch_count for part in parts),
         operator="+".join(part.operator for part in parts),
+        backend="+".join(part.backend for part in parts),
         result_boxes=[box for part in parts for box in part.result_boxes],
         validate_reference=None,
     )
@@ -483,6 +487,7 @@ def _prepare_mono_layer(
         close=prepared.close,
         launch_count=1,
         operator="muse_spark_fused_layer",
+        backend="sgl_amd_mono_gfx1250",
         result_boxes=[],
         validate_reference=None,
     )

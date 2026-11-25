@@ -258,6 +258,7 @@ def _read_samples(path: Path) -> list:
                 iteration=int(row["iteration"]),
                 launch_count=int(row["launch_count"]),
                 total_us=float(row["total_us"]),
+                execution=row.get("execution", "eager"),
             )
             for row in csv.DictReader(handle)
         ]
@@ -491,6 +492,246 @@ def _run_mono_benchmark(
                 "profile": args.profile,
             },
             dispatch_valid=bool(baseline_samples),
+        )
+        performance_log = render_performance_log(
+            report, str(args.output_dir)
+        )
+        (args.output_dir / "performance.log").write_text(
+            performance_log + "\n"
+        )
+        repository_root = Path(__file__).resolve().parents[5]
+        (repository_root / "TP8_4GPU_SYNTHETIC_PERFORMANCE.log").write_text(
+            performance_log + "\n"
+        )
+    dist.destroy_process_group(peer_group)
+
+
+def _run_graph_benchmark(
+    args: argparse.Namespace,
+    widths: tuple[int, ...],
+    rank: int,
+    world: int,
+) -> None:
+    """Profile pure stage kernels inside CUDA Graph replay."""
+    from tp8_baseline_dispatch import EXPECTED, validate_dispatch
+    from tp8_graph_tests import (
+        STAGES,
+        _capture,
+        _layer_stage_parts,
+        prepare_graph_fixture,
+    )
+    from tp8_synthetic_profiler import (
+        capture_dispatch,
+        profile_kernel_iterations,
+    )
+    from tp8_synthetic_report import (
+        Sample,
+        render_performance_log,
+        write_reports,
+    )
+
+    if widths != (8,):
+        raise ContractError(f"Graph benchmark is Width 8 only, got {widths}")
+    stages = (
+        STAGES
+        if args.stage == "all"
+        else ("kattn_full", "kattn_window")
+        if args.stage == "kattn"
+        else (
+            "layer_v1_full",
+            "layer_v1_swa",
+            "layer_v2_full",
+            "layer_v2_swa",
+        )
+        if args.stage == "layer"
+        else (args.stage,)
+    )
+    implementations = (
+        ("baseline", "mono") if args.impl == "both" else (args.impl,)
+    )
+    peer_group = dist.new_group(backend="gloo")
+
+    def control_barrier() -> None:
+        dist.monitored_barrier(
+            group=peer_group,
+            timeout=timedelta(seconds=120),
+            wait_all_ranks=True,
+        )
+
+    def validate_baseline_names(
+        stage: str,
+        names: list[str],
+        operator: str,
+        backend: str,
+    ) -> list[dict]:
+        if not stage.startswith("layer_"):
+            return [
+                validate_dispatch(
+                    stage,
+                    operator=operator,
+                    backend=backend,
+                    kernel_names=names,
+                    active_npes=world,
+                )
+            ]
+        evidence = []
+        offset = 0
+        for part in _layer_stage_parts(stage):
+            expected = EXPECTED[part]
+            launch_count = sum(
+                0
+                if item.classification == "collective" and world == 1
+                else item.count
+                for item in expected.kernels
+            )
+            part_names = names[offset : offset + launch_count]
+            evidence.append(
+                validate_dispatch(
+                    part,
+                    operator=expected.operator,
+                    backend=expected.backend,
+                    kernel_names=part_names,
+                    active_npes=world,
+                )
+            )
+            offset += launch_count
+        if offset != len(names):
+            raise ContractError(
+                f"{stage}: consumed {offset} Baseline Graph kernels, got {len(names)}"
+            )
+        return evidence
+
+    local_samples: list[Sample] = []
+    local_dispatch: list[dict] = []
+    try:
+        for implementation in implementations:
+            for stage in stages:
+                fixture = prepare_graph_fixture(
+                    implementation, stage, rank, world, peer_group
+                )
+                try:
+                    # Materialize result storage before capture.
+                    fixture.before_step(0)
+                    control_barrier()
+                    fixture.launch()
+                    torch.cuda.synchronize()
+                    graph = _capture(fixture, control_barrier)
+                    step = 1
+
+                    def before_each() -> None:
+                        nonlocal step
+                        fixture.before_step(step)
+                        step += 1
+                        control_barrier()
+
+                    names = capture_dispatch(
+                        graph.replay,
+                        args.output_dir
+                        / "traces"
+                        / f"graph-{implementation}-{stage}-w8-rank{rank}.json",
+                        before_each=before_each,
+                        record=rank == 0,
+                    )
+                    names_box: list[list[str] | None] = [
+                        names if rank == 0 else None
+                    ]
+                    dist.broadcast_object_list(
+                        names_box, src=0, group=peer_group
+                    )
+                    names = names_box[0]
+                    if names is None:
+                        raise ContractError(
+                            "rank 0 did not publish Graph kernel names"
+                        )
+                    if len(names) != fixture.launch_count:
+                        raise ContractError(
+                            f"{implementation} {stage}: Graph replay launched "
+                            f"{len(names)} kernels, expected {fixture.launch_count}"
+                        )
+                    dispatch_evidence = (
+                        validate_baseline_names(
+                            stage, names, fixture.operator, fixture.backend
+                        )
+                        if implementation == "baseline"
+                        else []
+                    )
+                    local_dispatch.append(
+                        {
+                            "implementation": implementation,
+                            "execution": "graph",
+                            "stage": stage,
+                            "width": 8,
+                            "rank": rank,
+                            "operator": fixture.operator,
+                            "backend": fixture.backend,
+                            "kernel_names": names,
+                            "launch_count": len(names),
+                            "baseline_dispatch_evidence": dispatch_evidence,
+                            "unexpected_fallback": False,
+                        }
+                    )
+                    control_barrier()
+                    timings = profile_kernel_iterations(
+                        graph.replay,
+                        args.output_dir
+                        / "traces"
+                        / (
+                            f"profile{args.iterations}-graph-{implementation}-"
+                            f"{stage}-w8-rank{rank}.json"
+                        ),
+                        kernel_names=names,
+                        warmup=args.warmup,
+                        iterations=args.iterations,
+                        before_each=before_each,
+                        record=rank == 0,
+                    )
+                    local_samples.extend(
+                        Sample(
+                            run_id="tp8-synthetic",
+                            stage=stage,
+                            width=8,
+                            rank=rank,
+                            implementation=implementation,
+                            execution="graph",
+                            iteration=index,
+                            launch_count=fixture.launch_count,
+                            total_us=value,
+                        )
+                        for index, value in enumerate(timings)
+                    )
+                    control_barrier()
+                finally:
+                    fixture.close()
+    finally:
+        pass
+    control_barrier()
+    if rank == 0:
+        existing = _read_samples(args.output_dir / "raw.csv")
+        _write_json(
+            args.output_dir / "graph_dispatch.json",
+            {
+                "status": "passed",
+                "width": 8,
+                "active_npes": world,
+                "logical_npes": CONTRACT.logical_tp,
+                "dispatches": local_dispatch,
+            },
+        )
+        report = write_reports(
+            args.output_dir,
+            [*existing, *local_samples],
+            metadata={
+                "widths": list(widths),
+                "warmup": args.warmup,
+                "iterations": args.iterations,
+                "profile": args.profile,
+                "executions": (
+                    ["eager", "graph"]
+                    if args.execution == "both"
+                    else ["graph"]
+                ),
+            },
+            dispatch_valid=True,
         )
         performance_log = render_performance_log(
             report, str(args.output_dir)
@@ -1194,6 +1435,12 @@ def _args() -> argparse.Namespace:
     parser.add_argument(
         "--profile", choices=("none", "torch"), default="none"
     )
+    parser.add_argument(
+        "--execution",
+        choices=("eager", "graph", "both"),
+        default="eager",
+        help="benchmark execution mode; non-benchmark modes ignore this option",
+    )
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--active-gpus", type=int, choices=(1, 2, 4), default=4)
@@ -1700,6 +1947,7 @@ def main() -> int:
                     "stage": args.stage,
                     "implementation": args.impl,
                     "profile": args.profile,
+                    "execution": args.execution,
                     "warmup": args.warmup,
                     "iterations": args.iterations,
                     "widths": list(widths),
@@ -1778,10 +2026,13 @@ def main() -> int:
         elif args.mode == "graph":
             _run_graph_tests(args, widths, rank, world)
         elif args.mode == "benchmark":
-            if args.impl in ("baseline", "both"):
-                _run_baseline_benchmark(args, widths, rank, world)
-            if args.impl in ("mono", "both"):
-                _run_mono_benchmark(args, widths, rank, world)
+            if args.execution in ("eager", "both"):
+                if args.impl in ("baseline", "both"):
+                    _run_baseline_benchmark(args, widths, rank, world)
+                if args.impl in ("mono", "both"):
+                    _run_mono_benchmark(args, widths, rank, world)
+            if args.execution in ("graph", "both"):
+                _run_graph_benchmark(args, widths, rank, world)
         if rank == 0:
             if args.mode == "check":
                 print(

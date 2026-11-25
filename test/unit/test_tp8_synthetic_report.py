@@ -67,6 +67,26 @@ def test_inconsistent_launch_count_is_rejected():
         summarize(samples)
 
 
+def test_summary_separates_eager_and_graph():
+    eager = _samples()
+    graph = [
+        Sample(
+            **{
+                **sample.__dict__,
+                "execution": "graph",
+                "total_us": sample.total_us - 1.0,
+            }
+        )
+        for sample in eager
+    ]
+    per_rank, paired = summarize([*eager, *graph])
+    assert len(per_rank) == 16
+    assert {row["execution"] for row in paired} == {"eager", "graph"}
+    graph_row = next(row for row in paired if row["execution"] == "graph")
+    assert graph_row["baseline_mean_us"] == 9.5
+    assert graph_row["mono_mean_us"] == 7.5
+
+
 def test_reports_and_log_are_written(tmp_path):
     report = write_reports(
         tmp_path,
